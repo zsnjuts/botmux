@@ -8,7 +8,7 @@ describe('schedule CLI session scope propagation', () => {
     expect(cliSource).toContain("scope?: 'thread' | 'chat';");
     expect(cliSource).toMatch(/function detectCurrentSession[\s\S]*?scope: s\.scope,/);
     expect(cliSource).toMatch(/async function detectAuthenticatedCurrentSession[\s\S]*?resolveCurrentTurnProvenance[\s\S]*?attestManagedOrigin[\s\S]*?provenance\.callerOpenId !== s\.ownerOpenId[\s\S]*?loadBotsJson\(\)\.find[\s\S]*?readAllowedUsersResolveCache[\s\S]*?resolvedAllowedUsers\.has\(provenance\.callerOpenId\)[\s\S]*?ownerOpenId: provenance\.callerOpenId,[\s\S]*?ownerUnionId,/);
-    expect(cliSource).toMatch(/const fresh = await detectAuthenticatedCurrentSession\(\)[\s\S]*?schedule creator provenance changed before write/);
+    expect(cliSource).toMatch(/const fresh = controllerBoundChild[\s\S]*?detectAuthenticatedCurrentSession\(\)[\s\S]*?schedule creator provenance changed before write/);
     expect(cliSource).toMatch(/turnId: provenance\.turnId,[\s\S]*?fresh\.turnId !== authenticatedCur\.turnId/);
     expect(cliSource).toContain('current turn caller does not match the session owner');
     expect(cliSource).toContain('cannot load bot config for');
@@ -58,5 +58,20 @@ describe('schedule CLI session scope propagation', () => {
     expect(cliSource).toMatch(/const explicitTaskId = argValue\(rest, '--id'\)/);
     expect(cliSource).toMatch(/explicitTaskId !== undefined && !\/\^\[0-9a-f\]\{8\}\$\/\.test\(explicitTaskId\)/);
     expect(cliSource).toMatch(/task = scheduler\.addTask\(\{[\s\S]*?id: explicitTaskId,[\s\S]*?\bname,/);
+  });
+
+  it('keeps ordinary schedule ownership unchanged and narrowly gates controller-bound children', () => {
+    expect(cliSource).toContain("controllerBoundChild = rest.includes('--controller-bound-child')");
+    expect(cliSource).toContain('? await detectControllerBoundScheduleSession()');
+    expect(cliSource).toContain(': await detectAuthenticatedCurrentSession()');
+    expect(cliSource).toContain("controllerBoundChild && parsed.kind !== 'once'");
+    expect(cliSource).toContain("executionPosition !== 'topic'");
+    expect(cliSource).toContain('chatId !== authenticatedCur.chatId');
+    expect(cliSource).toContain('rootMessageId !== authenticatedCur.rootMessageId');
+    expect(cliSource).toContain('workingDir !== authenticatedCur.workingDir');
+    expect(cliSource).toContain('delayMs > 5 * 60_000');
+    expect(cliSource).toContain('fresh.workerGeneration !== authenticatedCur.workerGeneration');
+    expect(cliSource).toContain('fresh.authorizerOpenId !== authenticatedCur.authorizerOpenId');
+    expect(cliSource).not.toContain("argValue(rest, '--owner");
   });
 });

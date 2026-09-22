@@ -37,6 +37,9 @@ export interface ManagedOriginAttestation {
   /** Daemon owning the live session; never taken from the child request body. */
   larkAppId?: string;
   dispatchAttempt?: number;
+  workerGeneration?: number;
+  controllerOpenId?: string;
+  controllerUnionId?: string;
   requiresCodexAppLedger: boolean;
 }
 
@@ -177,12 +180,28 @@ function validateProof(input: {
       ? proof.dispatchAttempt
       : null;
   if (dispatchAttempt === null) return undefined;
+  const controllerFieldsPresent = proof.workerGeneration !== undefined
+    || proof.controllerOpenId !== undefined
+    || proof.controllerUnionId !== undefined;
+  if (controllerFieldsPresent && (
+    typeof proof.workerGeneration !== 'number'
+      || !Number.isSafeInteger(proof.workerGeneration) || proof.workerGeneration <= 0
+    || typeof proof.controllerOpenId !== 'string'
+      || !/^ou_[A-Za-z0-9]+$/.test(proof.controllerOpenId)
+    || typeof proof.controllerUnionId !== 'string'
+      || !/^on_[A-Za-z0-9]+$/.test(proof.controllerUnionId)
+  )) return undefined;
   return {
     sessionId: input.context.sessionId,
     turnId: proof.turnId,
     ...(typeof proof.callerOpenId === 'string' ? { callerOpenId: proof.callerOpenId } : {}),
     ...(typeof proof.larkAppId === 'string' ? { larkAppId: proof.larkAppId } : {}),
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(controllerFieldsPresent ? {
+      workerGeneration: proof.workerGeneration as number,
+      controllerOpenId: proof.controllerOpenId as string,
+      controllerUnionId: proof.controllerUnionId as string,
+    } : {}),
     requiresCodexAppLedger: proof.requiresCodexAppLedger,
   };
 }

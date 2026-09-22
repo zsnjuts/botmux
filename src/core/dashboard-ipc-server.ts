@@ -85,6 +85,12 @@ import {
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
+import {
+  CONTROLLER_BOUND_SCHEDULE_AUTHORITY_ROUTE,
+  CONTROLLER_BOUND_SCHEDULE_AUTHORITY_SCHEMA,
+  resolveDaemonControllerBoundScheduleAuthority,
+  resolveControllerBoundScheduleAuthorityFromAttestedTurn,
+} from './controller-bound-schedule-authority.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
@@ -848,6 +854,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // and its private worker IPC state. It intentionally accepts no file/env
   // capability because those are writable by an unconfined same-UID Agent.
   if (method === 'POST' && pathname === CURRENT_ACTOR_ROUTE) return true;
+  if (method === 'POST' && pathname === CONTROLLER_BOUND_SCHEDULE_AUTHORITY_ROUTE) return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host
@@ -1039,6 +1046,12 @@ async function handleManagedOriginAttestation(
   if (!codexDecision.ok) {
     return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
   }
+  const controllerBound = resolveControllerBoundScheduleAuthorityFromAttestedTurn({
+    ds,
+    turnId: liveTurnId,
+    generation: ds.workerGeneration ?? -1,
+    callerOpenId: origin.callerOpenId ?? '',
+  });
   const outstanding = managedOriginOutstandingProofs.get(sessionId) ?? 0;
   if (outstanding >= MANAGED_ORIGIN_ATTEST_MAX_OUTSTANDING_PER_SESSION) {
     return jsonRes(res, 429, { ok: false, error: 'too_many_attestations' });
@@ -1059,6 +1072,11 @@ async function handleManagedOriginAttestation(
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
+        ...(controllerBound.ok ? {
+          workerGeneration: controllerBound.document.authority.workerGeneration,
+          controllerOpenId: controllerBound.document.authority.controllerOpenId,
+          controllerUnionId: controllerBound.document.authority.controllerUnionId,
+        } : {}),
         requiresCodexAppLedger: codexDecision.requiresLedger,
         issuedAtMs: Date.now(),
       },
@@ -1137,6 +1155,49 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     ? jsonRes(res, 200, result.document)
     : jsonRes(res, 403, {
         schema: 'botmux.current-actor.v2',
+        status: 'blocked',
+        error: result.error,
+      });
+});
+
+ipcRoute('POST', CONTROLLER_BOUND_SCHEDULE_AUTHORITY_ROUTE, async (req, res) => {
+  let body: { sessionId?: unknown };
+  try {
+    body = await readBoundedJsonBody(req, 512, 1_000);
+  } catch (err) {
+    if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+    }
+    return jsonRes(res, err instanceof IpcBodyTooLargeError ? 413 : 400, {
+      schema: CONTROLLER_BOUND_SCHEDULE_AUTHORITY_SCHEMA,
+      status: 'blocked',
+      error: 'controller_bound_schedule_authority_unverified',
+    });
+  }
+  const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
+    ? body.sessionId
+    : '';
+  const peer = resolveLoopbackPeerProcesses({
+    remoteAddress: req.socket.remoteAddress,
+    remotePort: req.socket.remotePort,
+    localPort: req.socket.localPort,
+  });
+  if (!sessionId || !peer.ok) {
+    return jsonRes(res, 403, {
+      schema: CONTROLLER_BOUND_SCHEDULE_AUTHORITY_SCHEMA,
+      status: 'blocked',
+      error: 'controller_bound_schedule_authority_unverified',
+    });
+  }
+  const result = resolveDaemonControllerBoundScheduleAuthority({
+    sessionId,
+    peer: peer.peer,
+    findSession: findActiveBySessionId,
+  });
+  return result.ok
+    ? jsonRes(res, 200, result.document)
+    : jsonRes(res, 403, {
+        schema: CONTROLLER_BOUND_SCHEDULE_AUTHORITY_SCHEMA,
         status: 'blocked',
         error: result.error,
       });

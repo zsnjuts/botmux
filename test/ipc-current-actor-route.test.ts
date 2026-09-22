@@ -20,10 +20,17 @@ afterEach(async () => {
 
 function activeSession(): any {
   return {
-    session: { sessionId: 's-actor', status: 'active' },
+    session: {
+      sessionId: 's-actor',
+      status: 'active',
+      workerGeneration: 7,
+      ownerOpenId: 'ou_controller',
+      ownerUnionId: 'on_controller',
+    },
     chatId: 'oc_chat',
     larkAppId: 'cli_app',
     workerGeneration: 7,
+    ownerOpenId: 'ou_controller',
     worker: { pid: process.pid, killed: false },
     localProcessAttestation: {
       backendType: 'pty',
@@ -37,6 +44,20 @@ function activeSession(): any {
       turnId: 'om_turn',
       callerOpenId: 'ou_current',
       preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`],
+    },
+    activeInteractiveTurn: {
+      turnId: 'om_turn',
+      caller: {
+        requestUserOpenId: 'ou_current',
+        requestLarkAppId: 'cli_app',
+        senderType: 'user',
+      },
+      controller: {
+        requestUserOpenId: 'ou_controller',
+        requestUserUnionId: 'on_controller',
+        requestLarkAppId: 'cli_app',
+        senderType: 'user',
+      },
     },
     initConfig: { apiOnly: false },
   };
@@ -109,5 +130,54 @@ describe('POST /api/current-actor', () => {
       }),
     });
     expect(rejected.status).toBe(403);
+  });
+});
+
+describe('POST /api/controller-bound-schedule-authority', () => {
+  it.skipIf(process.platform !== 'linux')('returns caller plus stable controller only to the exact live turn process', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(activeSession());
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const response = await fetch(
+      `http://127.0.0.1:${ipc.port}/api/controller-bound-schedule-authority`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-actor' }),
+      },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      schema: 'botmux.controller-bound-schedule-authority.v1',
+      status: 'verified',
+      authority: {
+        sessionId: 's-actor',
+        turnId: 'om_turn',
+        workerGeneration: 7,
+        larkAppId: 'cli_app',
+        callerOpenId: 'ou_current',
+        controllerOpenId: 'ou_controller',
+        controllerUnionId: 'on_controller',
+      },
+    });
+  });
+
+  it.skipIf(process.platform !== 'linux')('fails closed when the active authority controller differs from the stable owner', async () => {
+    const ds = activeSession();
+    ds.activeInteractiveTurn.controller.requestUserOpenId = 'ou_other';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const response = await fetch(
+      `http://127.0.0.1:${ipc.port}/api/controller-bound-schedule-authority`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-actor' }),
+      },
+    );
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({
+      status: 'blocked',
+      error: 'controller_bound_schedule_authority_unverified',
+    });
   });
 });

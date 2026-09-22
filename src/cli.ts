@@ -6777,6 +6777,8 @@ function findAncestorSessionId(): string | null {
 interface CurrentSession {
   sessionId: string;
   turnId?: string;
+  workerGeneration?: number;
+  authorizerOpenId?: string;
   chatId: string;
   rootMessageId: string;
   workingDir?: string;
@@ -6785,6 +6787,79 @@ interface CurrentSession {
   scope?: 'thread' | 'chat';
   ownerOpenId?: string;
   ownerUnionId?: string;
+}
+
+async function detectControllerBoundScheduleSession(): Promise<CurrentSession> {
+  const dataDir = resolveDataDir();
+  const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir });
+  let authority: {
+    sessionId: string; turnId: string; workerGeneration: number; larkAppId: string;
+    callerOpenId: string; controllerOpenId: string; controllerUnionId: string;
+  };
+  if (isolated?.originChannelId) {
+    const attested = await attestManagedOrigin({
+      context: {
+        sessionId: isolated.sessionId,
+        channelId: isolated.originChannelId,
+        capability: isolated.capability,
+        dataDir,
+        ...(isolated.larkAppId ? { larkAppId: isolated.larkAppId } : {}),
+        ...(isolated.ipcPortFallback !== undefined
+          ? { ipcPortFallback: isolated.ipcPortFallback }
+          : {}),
+      },
+      resolveIpcPort: appId => {
+        try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+        catch { return undefined; }
+      },
+    });
+    if (!attested.callerOpenId || !attested.larkAppId
+      || !attested.workerGeneration || !attested.controllerOpenId
+      || !attested.controllerUnionId) {
+      throw new Error('controller-bound child schedule authority is unavailable');
+    }
+    authority = {
+      sessionId: attested.sessionId,
+      turnId: attested.turnId,
+      workerGeneration: attested.workerGeneration,
+      larkAppId: attested.larkAppId,
+      callerOpenId: attested.callerOpenId,
+      controllerOpenId: attested.controllerOpenId,
+      controllerUnionId: attested.controllerUnionId,
+    };
+  } else {
+    const { resolveBotmuxAncestorContext } = await import('./cli/current-actor.js');
+    const { resolveControllerBoundScheduleAuthority } = await import(
+      './cli/controller-bound-schedule-authority.js'
+    );
+    const ancestor = resolveBotmuxAncestorContext();
+    authority = (await resolveControllerBoundScheduleAuthority({
+      ipcPort: ancestor.ipcPort,
+      sessionId: ancestor.sessionId,
+    })).authority;
+  }
+  const s = loadSessions().get(authority.sessionId);
+  if (!s || s.status !== 'active'
+    || s.larkAppId !== authority.larkAppId
+    || s.workerGeneration !== authority.workerGeneration
+    || s.ownerOpenId !== authority.controllerOpenId
+    || s.ownerUnionId !== authority.controllerUnionId) {
+    throw new Error('controller-bound child schedule session changed before use');
+  }
+  return {
+    sessionId: s.sessionId,
+    turnId: authority.turnId,
+    workerGeneration: authority.workerGeneration,
+    authorizerOpenId: authority.callerOpenId,
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    workingDir: s.workingDir,
+    larkAppId: s.larkAppId,
+    chatType: s.chatType,
+    scope: s.scope,
+    ownerOpenId: authority.controllerOpenId,
+    ownerUnionId: authority.controllerUnionId,
+  };
 }
 
 /** Detect current session info from ancestor marker + session files. */
@@ -7449,7 +7524,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
+    const controllerBoundChild = rest.includes('--controller-bound-child');
+    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active', '--controller-bound-child']);
     if (!rawSchedule) {
       console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
       process.exit(1);
@@ -7462,7 +7538,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
 
     const cur = detectCurrentSession();
-    let authenticatedCur = await detectAuthenticatedCurrentSession();
+    let authenticatedCur = controllerBoundChild
+      ? await detectControllerBoundScheduleSession()
+      : await detectAuthenticatedCurrentSession();
     const explicitTaskId = argValue(rest, '--id');
     if (rest.includes('--id') && !explicitTaskId) {
       console.error('--id 需要一个 8 位小写十六进制任务 ID。');
@@ -7565,6 +7643,34 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error(`无法解析 schedule "${rawSchedule}": ${err.message}`);
       process.exit(1);
     }
+    if (controllerBoundChild && parsed.kind !== 'once') {
+      console.error('--controller-bound-child 只允许创建一次性子任务。');
+      process.exit(1);
+    }
+    if (controllerBoundChild && (!authenticatedCur || authenticatedCur.larkAppId !== larkAppId)) {
+      console.error('--controller-bound-child 只能写入当前会话所属 bot。');
+      process.exit(1);
+    }
+    if (controllerBoundChild && authenticatedCur) {
+      const runAt = parsed.kind === 'once' && parsed.runAt
+        ? Date.parse(parsed.runAt)
+        : Number.NaN;
+      const delayMs = runAt - Date.now();
+      if (executionPosition !== 'topic'
+        || chatId !== authenticatedCur.chatId
+        || rootMessageId !== authenticatedCur.rootMessageId
+        || workingDir !== authenticatedCur.workingDir
+        || silent
+        || wantsFollowActive
+        || wantsNewTopic
+        || wantsTopLevel
+        || !Number.isFinite(delayMs)
+        || delayMs < 15_000
+        || delayMs > 5 * 60_000) {
+        console.error('--controller-bound-child 只允许在当前会话同一话题和工作目录创建 15 秒至 5 分钟内执行的非静默一次性子任务。');
+        process.exit(1);
+      }
+    }
 
     let task;
     try {
@@ -7573,10 +7679,14 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       // a later schedule write. If the first lookup was ownerless, do not
       // opportunistically gain an identity at this later point.
       if (authenticatedCur) {
-        const fresh = await detectAuthenticatedCurrentSession();
+        const fresh = controllerBoundChild
+          ? await detectControllerBoundScheduleSession()
+          : await detectAuthenticatedCurrentSession();
         if (!fresh
           || fresh.sessionId !== authenticatedCur.sessionId
           || fresh.turnId !== authenticatedCur.turnId
+          || fresh.workerGeneration !== authenticatedCur.workerGeneration
+          || fresh.authorizerOpenId !== authenticatedCur.authorizerOpenId
           || fresh.larkAppId !== authenticatedCur.larkAppId
           || fresh.ownerOpenId !== authenticatedCur.ownerOpenId
           || fresh.ownerUnionId !== authenticatedCur.ownerUnionId) {
@@ -7597,9 +7707,11 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         // originating (e.g. adopted) topic.
         rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
         larkAppId,
-        creatorChatId: cur?.chatId,
-        creatorRootMessageId: cur?.rootMessageId,
-        creatorLarkAppId: cur?.larkAppId,
+        creatorChatId: controllerBoundChild ? authenticatedCur?.chatId : cur?.chatId,
+        creatorRootMessageId: controllerBoundChild
+          ? authenticatedCur?.rootMessageId
+          : cur?.rootMessageId,
+        creatorLarkAppId: controllerBoundChild ? authenticatedCur?.larkAppId : cur?.larkAppId,
         // Stamp the creator (sandboxed session owner) so the task's scheduled
         // turns can authenticate workflow commands as them. The daemon
         // re-checks the owner is still allowed at every run mutation.
@@ -7614,7 +7726,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         ownerUnionId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
           ? authenticatedCur.ownerUnionId
           : undefined,
-        chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
+        chatType: (controllerBoundChild ? authenticatedCur?.chatType : cur?.chatType) === 'p2p'
+          ? 'p2p'
+          : 'topic_group',
         scope,
         executionPosition,
         topicTitle,

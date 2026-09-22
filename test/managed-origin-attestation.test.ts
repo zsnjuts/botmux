@@ -58,6 +58,9 @@ describe('managed-origin host proof sidecar', () => {
             callerOpenId: 'ou_current',
             larkAppId: 'cli_app',
             dispatchAttempt: 4,
+            workerGeneration: 7,
+            controllerOpenId: 'ou_controller',
+            controllerUnionId: 'on_controller',
             requiresCodexAppLedger: true,
             issuedAtMs: Date.now(),
           },
@@ -74,8 +77,47 @@ describe('managed-origin host proof sidecar', () => {
       callerOpenId: 'ou_current',
       larkAppId: 'cli_app',
       dispatchAttempt: 4,
+      workerGeneration: 7,
+      controllerOpenId: 'ou_controller',
+      controllerUnionId: 'on_controller',
       requiresCodexAppLedger: true,
     });
+  });
+
+  it('rejects partial controller identity proof fields', async () => {
+    const dataDir = makeRoot();
+    const nonce = 'ce'.repeat(32);
+    let now = 10_000;
+    await expect(attestManagedOrigin({
+      context: {
+        dataDir,
+        sessionId: 'session-a',
+        channelId: CHANNEL,
+        capability: 'ab'.repeat(32),
+        ipcPortFallback: 4321,
+      },
+      nonce,
+      timeoutMs: 2,
+      now: () => now,
+      wait: async delay => { now += delay; },
+      fetchImpl: async () => {
+        writeManagedOriginAttestationProof({
+          dataDir,
+          proof: {
+            domain: MANAGED_ORIGIN_PROOF_DOMAIN,
+            version: 1,
+            nonce,
+            channelId: CHANNEL,
+            sessionId: 'session-a',
+            turnId: 'om_turn',
+            workerGeneration: 7,
+            requiresCodexAppLedger: false,
+            issuedAtMs: now,
+          },
+        });
+        return new Response(null, { status: 200 });
+      },
+    })).rejects.toBeInstanceOf(ManagedOriginAttestationError);
   });
 
   it('rejects expired proof bytes even when HTTP returns 200', async () => {
