@@ -267,6 +267,50 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
+  it('forwards the exact TAE TraeX runtime config without widening to arbitrary prefix keys', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX_TAE_BYTEDCLI: '/opt/tiger/run/bin/bytedcli',
+      BOTMUX_TAE_CONTROL_PROFILE: 'botmux-tae-control',
+      BOTMUX_TAE_SITE: 'boe',
+      BOTMUX_TAE_REGION: 'boe',
+      BOTMUX_TAE_AUTH_SITE: 'cn',
+      BOTMUX_TAE_SANDBOX_ID: 'sandbox-id',
+      BOTMUX_TAE_PSM: 'bytedance.sandbox.infra_buddy',
+      BOTMUX_TAE_SESSION_TTL_SECONDS: '86400',
+      BOTMUX_TAE_SESSION_RESUMABLE: 'false',
+      BOTMUX_TAE_TRAEX_BIN: '/root/.local/bin/traecli',
+      BOTMUX_TAE_TRAEX_INSTALL_URL: 'https://downloads.example.invalid/traex_install.sh',
+      BOTMUX_TAE_REMOTE_PROFILE_ROOT: '/root/.trae-botmux/profiles',
+      BOTMUX_TAE_HTTP_TIMEOUT_MS: '3900000',
+      BOTMUX_TAE_BOOTSTRAP_TIMEOUT_MS: '600000',
+      BOTMUX_TAE_TURN_TIMEOUT_MS: '3600000',
+      // Bootstrap-only identity pin: start-botmux-tce removes this before the
+      // daemon starts, and the generic prefix must not accidentally expose it.
+      BOTMUX_TAE_CONTROL_EXPECTED_ACCESS_KEY_ID: 'sa_must_not_reach_pane',
+      BOTMUX_TAE_FUTURE_SECRET: 'must-not-be-prefix-forwarded',
+    });
+
+    expect(out).toEqual(expect.arrayContaining([
+      'BOTMUX_TAE_BYTEDCLI=/opt/tiger/run/bin/bytedcli',
+      'BOTMUX_TAE_CONTROL_PROFILE=botmux-tae-control',
+      'BOTMUX_TAE_SITE=boe',
+      'BOTMUX_TAE_REGION=boe',
+      'BOTMUX_TAE_AUTH_SITE=cn',
+      'BOTMUX_TAE_SANDBOX_ID=sandbox-id',
+      'BOTMUX_TAE_PSM=bytedance.sandbox.infra_buddy',
+      'BOTMUX_TAE_SESSION_TTL_SECONDS=86400',
+      'BOTMUX_TAE_SESSION_RESUMABLE=false',
+      'BOTMUX_TAE_TRAEX_BIN=/root/.local/bin/traecli',
+      'BOTMUX_TAE_TRAEX_INSTALL_URL=https://downloads.example.invalid/traex_install.sh',
+      'BOTMUX_TAE_REMOTE_PROFILE_ROOT=/root/.trae-botmux/profiles',
+      'BOTMUX_TAE_HTTP_TIMEOUT_MS=3900000',
+      'BOTMUX_TAE_BOOTSTRAP_TIMEOUT_MS=600000',
+      'BOTMUX_TAE_TURN_TIMEOUT_MS=3600000',
+    ]));
+    expect(out.some(value => value.startsWith('BOTMUX_TAE_CONTROL_EXPECTED_ACCESS_KEY_ID='))).toBe(false);
+    expect(out.some(value => value.startsWith('BOTMUX_TAE_FUTURE_SECRET='))).toBe(false);
+  });
+
   it('forwards only a Codex App bootstrap path and strips the retired shared-secret env', () => {
     const retiredSharedSecret = 'A'.repeat(43);
     const bootstrapPath = '/private/bot-home/control.bootstrap';

@@ -437,6 +437,30 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // command that `botmux statusline` chains to after persisting the snapshot.
   // Not a credential — it is what the user already put in their settings.json.
   'BOTMUX_STATUSLINE_CHAIN',
+  // TAE TraeX is a local control runner whose process is hosted inside a
+  // persistent tmux pane. TCE supplies these non-secret runtime selectors to
+  // the daemon, but tmuxEnv() deliberately strips every BOTMUX_* key from the
+  // tmux client environment. They therefore need the same explicit per-pane
+  // transport as the other adapter runtime settings; otherwise the runner
+  // exits before pipe-pane can attach because its control profile / Sandbox
+  // target are missing. Keep this list exact: the service-account secret stays
+  // in bytedcli's isolated profile/environment and must never be introduced as
+  // a BOTMUX_TAE_* value.
+  'BOTMUX_TAE_BYTEDCLI',
+  'BOTMUX_TAE_CONTROL_PROFILE',
+  'BOTMUX_TAE_SITE',
+  'BOTMUX_TAE_REGION',
+  'BOTMUX_TAE_AUTH_SITE',
+  'BOTMUX_TAE_SANDBOX_ID',
+  'BOTMUX_TAE_PSM',
+  'BOTMUX_TAE_SESSION_TTL_SECONDS',
+  'BOTMUX_TAE_SESSION_RESUMABLE',
+  'BOTMUX_TAE_TRAEX_BIN',
+  'BOTMUX_TAE_TRAEX_INSTALL_URL',
+  'BOTMUX_TAE_REMOTE_PROFILE_ROOT',
+  'BOTMUX_TAE_HTTP_TIMEOUT_MS',
+  'BOTMUX_TAE_BOOTSTRAP_TIMEOUT_MS',
+  'BOTMUX_TAE_TURN_TIMEOUT_MS',
   // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
   // the pane; the runner consumes+unlinks the file before app-server starts.
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
