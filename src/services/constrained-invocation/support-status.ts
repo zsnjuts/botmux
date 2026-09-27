@@ -29,6 +29,7 @@ export const modelOnlyAssessments: Readonly<Record<CliId, ModelOnlyAssessment>> 
   mira: { group: 'remote-agent', status: 'interface_gap', reason: 'remote_loop_control_unproven', detail: '当前接入是云端 chat/completion；tool_list 只体现检索配置，尚无证据证明可禁用整个服务端工具与 Agent loop。' },
   mir: { group: 'native-print', status: 'verification_required', reason: 'native_bridge_isolation_unverified', detail: '现有 print runner 依赖原生本地 MCP bridge；缺少 mircli，未验证关闭 bridge 和宿主工具后仍可推理。' },
   traex: { group: 'trae-app-server', status: 'verification_required', reason: 'native_tool_isolation_unverified', detail: '已确认原生 app-server 和工具禁用选项；TRAE_HOME、认证和工具目录与 Codex 不同，尚未证明完整空工具调用。' },
+  'tae-traex': { group: 'remote-agent', status: 'interface_gap', reason: 'remote_loop_control_unproven', detail: 'TAE runner 执行完整 TraeX Agent loop；当前目标是逐轮个人鉴权与 Session 隔离，不提供 model-only 契约。' },
   pi: { group: 'native-print', status: 'implemented', reason: null, detail: '原生 --no-tools、禁用扩展与上下文、print/json；原生合成服务测试通过，拒绝可执行凭证 helper。' },
   copilot: { group: 'native-print', status: 'verification_required', reason: 'native_auth_isolation_unverified', detail: '原生帮助有 available-tools；OAuth 优先存入系统凭证库，文件回退混在配置中，尚未证明专用 Bot 认证不会回退宿主身份。' },
   'oh-my-pi': { group: 'native-print', status: 'verification_required', reason: 'mixed_auth_database_isolation_unverified', detail: '原生 --no-tools 可用，但认证、设置等共存于 agent.db 并支持 auth broker；不能复制整个数据库或直接套用 Pi auth.json。' },

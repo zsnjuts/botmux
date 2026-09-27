@@ -52,6 +52,8 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
   // 插位会让老脚本静默选错 CLI。
   '31': 'mimocode',
+  // TAE 控制 runner；序号必须继续追加，避免旧 setup 脚本选错 CLI。
+  '32': 'tae-traex',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -79,6 +81,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'mira': 'Mira',
   'seed': 'Seed',
   'traex': 'TRAE',
+  'tae-traex': 'TAE TraeX',
   'pi': 'Pi',
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',

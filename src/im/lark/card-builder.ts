@@ -300,6 +300,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'mira': 'Mira',
   'mir': 'Mir CLI',
   'traex': 'TRAE',
+  'tae-traex': 'TAE TraeX',
   'pi': 'Pi',
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',

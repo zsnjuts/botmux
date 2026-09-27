@@ -23,6 +23,7 @@ import { createHermesAdapter } from './hermes.js';
 import { createMiraAdapter } from './mira.js';
 import { createMirAdapter } from './mir.js';
 import { createTraexAdapter } from './traex.js';
+import { createTaeTraexAdapter } from './tae-traex.js';
 import { createPiAdapter } from './pi.js';
 import { createCopilotAdapter } from './copilot.js';
 import { createOhMyPiAdapter } from './oh-my-pi.js';
@@ -68,6 +69,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // second-stage dependency.
   mir: 'mircli',
   traex: 'traex',
+  'tae-traex': 'botmux-tae-traex-runner',
   pi: 'pi',
   copilot: 'copilot',
   'oh-my-pi': 'omp',
@@ -229,7 +231,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createTaeTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -253,6 +255,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'mira': return createMiraAdapter(pathOverride);
     case 'mir': return createMirAdapter(pathOverride);
     case 'traex': return createTraexAdapter(pathOverride);
+    case 'tae-traex': return createTaeTraexAdapter(pathOverride);
     case 'pi': return createPiAdapter(pathOverride);
     case 'copilot': return createCopilotAdapter(pathOverride);
     case 'oh-my-pi': return createOhMyPiAdapter(pathOverride);
