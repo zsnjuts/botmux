@@ -443,6 +443,7 @@ import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
+import { normalizeTaeTraexFailureMarker } from './adapters/cli/tae-traex.js';
 import {
   CODEX_APP_ACTIVE_WRITER_EXIT_CODE,
   normalizeCodexAppLifecycleEvent,
@@ -10057,11 +10058,11 @@ function handleVisibleStartupInteraction(data: string): boolean {
   return true;
 }
 
-// Mira/Mir/dsh send terminal OSC control messages. Codex App deliberately
+// Mira/Mir/dsh/tae-traex send terminal OSC control messages. Codex App deliberately
 // does not (PR #597): its signed Unix-socket channel is independent of the
 // terminal/backend rendering (including Herdr and Zellij), so it is no longer
 // in the terminal-OSC decode set.
-const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);
+const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'tae-traex']);
 const appRunnerControlDecoder = new RunnerControlDecoder();
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
@@ -10369,6 +10370,46 @@ async function handleTrustedCodexAppMarker(
     return true;
   }
 
+  if (kind === 'failure' && lastInitConfig?.cliId === 'tae-traex') {
+    const failure = normalizeTaeTraexFailureMarker(payload);
+    if (!failure) {
+      log('TAE TraeX rejected malformed failure marker');
+      return false;
+    }
+    const identity = resolveCodexAppFinalTurnIdentity(
+      failure,
+      currentBotmuxTurnId,
+      `tae-traex-${Date.now()}`,
+    );
+    if (!identity.ok) {
+      log(
+        `TAE TraeX rejected failure marker with mismatched turn `
+        + `(marker=${identity.markerTurnId.substring(0, 12)}, `
+        + `current=${identity.currentBotmuxTurnId?.substring(0, 12) ?? '-'})`,
+      );
+      return false;
+    }
+    const turnId = identity.turnId;
+    const dispatchAttempt = currentBotmuxDispatchAttempt;
+    send({
+      type: 'final_output',
+      content: failure.content,
+      lastUuid: turnId,
+      turnId,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      turnFailed: true,
+    });
+    emitTurnTerminal(
+      turnId,
+      failure.status,
+      failure.errorCode,
+      dispatchAttempt,
+      undefined,
+      failure.retryable,
+    );
+    return true;
+  }
+
   if (kind === 'final' && typeof payload.content === 'string') {
     const finalContent = payload.content;
     // Blocking 1 N-final expansion: a `steer_superseded` disposition marks one of
@@ -10452,8 +10493,8 @@ async function handleTrustedCodexAppMarker(
       // exactly one extra logical slot but keeps awaiting=true / never publishes
       // ready; only the real final clears awaiting. See the post-commit block.
     } else {
-      // Mira/Mir retain their terminal OSC control path and do not use the
-      // Codex App serial dispatch FIFO.
+      // Mira/Mir/dsh/tae-traex retain their terminal OSC control path and do
+      // not use the Codex App serial dispatch FIFO.
       const identity = resolveCodexAppFinalTurnIdentity(
         payload,
         currentBotmuxTurnId,

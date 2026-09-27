@@ -377,13 +377,13 @@ describe('worker app-runner control-channel wiring', () => {
     expect(marker).toContain('content: (suppressDelivery || isSuperseded) ? \'\' : deliverableContent,');
   });
 
-  it('enables OSC decoding for dsh and routes final frames to the generic path', () => {
+  it('enables OSC decoding for dsh and tae-traex and routes final frames to the generic path', () => {
     // The worker only decodes runner OSC frames for cliIds in this set.
-    expect(workerSource).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);");
-    // dsh finals go through the generic (non-codex-app) settlement path.
+    expect(workerSource).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'tae-traex']);");
+    // dsh and tae-traex finals go through the generic (non-codex-app) settlement path.
     const markerStart = workerSource.indexOf('if (kind === \'final\' && typeof payload.content === \'string\')');
     expect(markerStart).toBeGreaterThan(-1);
-    const genericPath = workerSource.indexOf('// Mira/Mir retain their terminal OSC control path', markerStart);
+    const genericPath = workerSource.indexOf('// Mira/Mir/dsh/tae-traex retain their terminal OSC control path', markerStart);
     expect(genericPath).toBeGreaterThan(markerStart);
   });
 
@@ -403,5 +403,40 @@ describe('worker app-runner control-channel wiring', () => {
     expect(markers).toHaveLength(1);
     expect(markers[0].kind).toBe('final');
     expect((markers[0].payload as { content: string }).content).toBe(content);
+  });
+
+  it('settles a validated tae-traex failure as visible failed output', () => {
+    const markerStart = workerSource.indexOf("if (kind === 'failure' && lastInitConfig?.cliId === 'tae-traex')");
+    const markerEnd = workerSource.indexOf("if (kind === 'final'", markerStart);
+    const branch = workerSource.slice(markerStart, markerEnd);
+    expect(markerStart).toBeGreaterThan(-1);
+    expect(branch).toContain('normalizeTaeTraexFailureMarker(payload)');
+    expect(branch).toContain('resolveCodexAppFinalTurnIdentity(');
+    expect(branch).toContain('turnFailed: true');
+    expect(branch).toContain('failure.status');
+    expect(branch).toContain('failure.errorCode');
+    expect(branch).toContain('failure.retryable');
+  });
+
+  it('decodes a tae-traex failure OSC frame without leaking control bytes to display', () => {
+    const decoder = new RunnerControlDecoder();
+    const markers: Array<{ kind: string; payload: unknown }> = [];
+    const payload = {
+      turnId: 'turn-auth',
+      content: '需要个人授权',
+      status: 'failed',
+      errorCode: 'tae_traex_auth_required',
+      retryable: false,
+    };
+    const frame = `${RUNNER_CONTROL_PREFIX}failure:${Buffer.from(JSON.stringify(payload)).toString('base64')}${RUNNER_CONTROL_END}`;
+    const display = decoder.push(frame, true, body => {
+      const colon = body.indexOf(':');
+      markers.push({
+        kind: body.slice(0, colon),
+        payload: JSON.parse(Buffer.from(body.slice(colon + 1), 'base64').toString('utf8')),
+      });
+    });
+    expect(display).toBe('');
+    expect(markers).toEqual([{ kind: 'failure', payload }]);
   });
 });

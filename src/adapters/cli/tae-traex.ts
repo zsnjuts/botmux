@@ -6,6 +6,40 @@ import type { TrustedCaller } from '../../types.js';
 
 export const TAE_TRAEX_RUNNER_MARKER = '::botmux-tae-traex:';
 
+const TAE_TRAEX_FAILURE_STATUS_BY_CODE = {
+  tae_traex_auth_required: 'failed',
+  tae_traex_turn_failed: 'failed',
+  tae_traex_turn_ambiguous: 'ambiguous',
+  tae_traex_runner_failed: 'failed',
+} as const;
+
+export interface TaeTraexFailureMarker {
+  turnId: string;
+  content: string;
+  status: 'failed' | 'ambiguous';
+  errorCode: keyof typeof TAE_TRAEX_FAILURE_STATUS_BY_CODE;
+  retryable: false;
+}
+
+/** Validate the only failure records the trusted TAE runner may emit.
+ * Keep the code/status pairing closed so arbitrary PTY content can never
+ * choose daemon retry policy or settle an unrelated turn. */
+export function normalizeTaeTraexFailureMarker(
+  value: unknown,
+): TaeTraexFailureMarker | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const turnId = typeof raw.turnId === 'string' ? raw.turnId.trim() : '';
+  const content = typeof raw.content === 'string' ? raw.content.trim() : '';
+  if (!turnId || !content || raw.retryable !== false) return undefined;
+  if (typeof raw.errorCode !== 'string'
+      || !(raw.errorCode in TAE_TRAEX_FAILURE_STATUS_BY_CODE)) return undefined;
+  const errorCode = raw.errorCode as keyof typeof TAE_TRAEX_FAILURE_STATUS_BY_CODE;
+  const status = TAE_TRAEX_FAILURE_STATUS_BY_CODE[errorCode];
+  if (raw.status !== status) return undefined;
+  return { turnId, content, status, errorCode, retryable: false };
+}
+
 const MISSING_TURN_ID = 'TAE TraeX runner requires an authenticated BotMux turn id';
 const MISSING_ACTOR = 'TAE TraeX runner requires a daemon-authenticated human caller';
 

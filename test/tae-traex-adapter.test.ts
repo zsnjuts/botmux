@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   createTaeTraexAdapter,
+  normalizeTaeTraexFailureMarker,
   TAE_TRAEX_RUNNER_MARKER,
 } from '../src/adapters/cli/tae-traex.js';
 import { RUNNER_INPUT_CHUNK_BYTES } from '../src/adapters/cli/runner-input.js';
@@ -40,6 +41,39 @@ function caller(openId: string): WriteInputContext {
 }
 
 describe('tae-traex adapter authority framing', () => {
+  it('accepts only closed failure code and status pairs', () => {
+    expect(normalizeTaeTraexFailureMarker({
+      turnId: ' turn-auth ',
+      content: ' 需要个人授权 ',
+      status: 'failed',
+      errorCode: 'tae_traex_auth_required',
+      retryable: false,
+    })).toEqual({
+      turnId: 'turn-auth',
+      content: '需要个人授权',
+      status: 'failed',
+      errorCode: 'tae_traex_auth_required',
+      retryable: false,
+    });
+    expect(normalizeTaeTraexFailureMarker({
+      turnId: 'turn-unknown',
+      content: '结果不确定',
+      status: 'ambiguous',
+      errorCode: 'tae_traex_turn_ambiguous',
+      retryable: false,
+    })?.status).toBe('ambiguous');
+
+    for (const invalid of [
+      { turnId: '', content: 'x', status: 'failed', errorCode: 'tae_traex_turn_failed', retryable: false },
+      { turnId: 'turn', content: '', status: 'failed', errorCode: 'tae_traex_turn_failed', retryable: false },
+      { turnId: 'turn', content: 'x', status: 'failed', errorCode: 'unknown', retryable: false },
+      { turnId: 'turn', content: 'x', status: 'failed', errorCode: 'tae_traex_turn_ambiguous', retryable: false },
+      { turnId: 'turn', content: 'x', status: 'failed', errorCode: 'tae_traex_turn_failed', retryable: true },
+    ]) {
+      expect(normalizeTaeTraexFailureMarker(invalid)).toBeUndefined();
+    }
+  });
+
   it('keeps A -> B -> A actor authority on each independent frame', async () => {
     const writes: string[] = [];
     const pty: PtyHandle = { write: data => { writes.push(data); return true; } };
