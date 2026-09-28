@@ -15741,7 +15741,14 @@ async function spawnCli(
   // never less. Mirrors what the riff path already does via mergedEnv.
   if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
   else delete childEnv.BOTMUX_API_ONLY;
-  childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  // Freeze the daemon-resolved routing scope into the CLI process itself.
+  // Shared tmux servers scrub ambient BOTMUX_* values, so exposing this only
+  // through shellSubprocessEnv is insufficient for CLIs such as tae-traex
+  // that consume the value directly at startup.
+  const childRootIsMessage = cfg.rootMessageId?.startsWith('om_') === true;
+  childEnv.BOTMUX_SESSION_SCOPE = childRootIsMessage ? 'thread' : 'chat';
+  if (childRootIsMessage) childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  else delete childEnv.BOTMUX_ROOT_MESSAGE_ID;
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
   // send` renders the role-name footer without reading bots.json (deny-by-

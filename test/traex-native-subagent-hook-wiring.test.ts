@@ -104,6 +104,7 @@ async function stopChild(child: ChildProcess): Promise<void> {
 function makeHarness(options: {
   cliId: 'traex' | 'codex';
   backendType: 'pty' | 'tmux';
+  rootMessageId?: string;
   resume?: boolean;
   cliSessionId?: string;
   codexRpcInput?: boolean;
@@ -183,7 +184,7 @@ if (argv[0] === 'app-server') {
     sessionId,
     chatId: 'oc_hook_test',
     chatType: 'group',
-    rootMessageId: 'om_hook_root',
+    rootMessageId: options.rootMessageId ?? 'om_hook_root',
     workingDir,
     cliId: options.cliId,
     cliPathOverride: fakeCli,
@@ -227,6 +228,7 @@ function expectAuthenticatedSessionEnv(record: LaunchRecord, sessionId: string):
     BOTMUX_CHAT_ID: 'oc_hook_test',
     BOTMUX_LARK_APP_ID: 'app_hook_test',
     BOTMUX_ROOT_MESSAGE_ID: 'om_hook_root',
+    BOTMUX_SESSION_SCOPE: 'thread',
     BOTMUX_OWNER_OPEN_ID: 'ou_hook_owner',
     __OWNER_OPEN_ID: 'ou_hook_owner',
     LARK_APP_ID: null,
@@ -334,6 +336,22 @@ describe('TRAE native subagent hook worker launches', () => {
     expect(appServer!.env.BOTMUX_SESSION_SCOPE).toBe('thread');
     expectHookFilesUnchanged(harness);
   }, 25_000);
+
+  it.skipIf(!tmuxAvailable)('injects chat scope and omits a non-message routing anchor from a persistent pane', async () => {
+    const harness = makeHarness({
+      cliId: 'traex',
+      backendType: 'tmux',
+      rootMessageId: 'oc_hook_test',
+    });
+    await waitFor(harness, () => (
+      harness.messages.some(message => message.type === 'ready')
+      && nonProbeLaunches(harness).length === 1
+    ), 'chat-scoped Trae worker ready and CLI launch capture');
+
+    const [launch] = nonProbeLaunches(harness);
+    expect(launch.env.BOTMUX_SESSION_SCOPE).toBe('chat');
+    expect(launch.env.BOTMUX_ROOT_MESSAGE_ID).toBeNull();
+  }, 20_000);
 
   it.skipIf(directPtyUnavailableInBun)(`keeps a non-Trae worker launch free of the Trae hook (${DIRECT_PTY_BUN_SKIP_REASON})`, async () => {
     const harness = makeHarness({ cliId: 'codex', backendType: 'pty' });

@@ -542,8 +542,8 @@ describe('scrubSessionTurnMarkerEnv()', () => {
     // criterion, NOT derived from BOTMUX_INJECTED_ENV_KEYS — that list is the
     // pane TRANSPORT whitelist and mixes in ambient config. Both directions
     // must hold: capabilities that ARE transported, and routing keys that are
-    // NOT (BOTMUX_SESSION_SCOPE / BOTMUX_SEND_RELAY reach children outside
-    // the pane injection list).
+    // NOT (`BOTMUX_SEND_RELAY` reaches children outside the pane injection
+    // list).
     for (const key of [
       'BOTMUX_MCP_GATEWAY_SOCKET',
       'BOTMUX_MCP_GATEWAY_REQUIRED',
