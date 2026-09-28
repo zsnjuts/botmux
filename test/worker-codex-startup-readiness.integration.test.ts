@@ -97,7 +97,7 @@ setInterval(() => {}, 1000);
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: dataDir, cliId: 'codex', cliPathOverride: fakeCli,
-      backendType,
+      backendType, launchShell: '/bin/sh',
       prompt: 'only-this-startup-prompt', turnId: 'om_test', larkAppId: 'app_test', larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
     await waitFor(() => existsSync(loadingFile));

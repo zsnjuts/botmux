@@ -677,15 +677,24 @@ describe('late bare-shell launch recovery', () => {
   });
 
   it('generation-fences PTY data before it can feed the active idle detector', () => {
-    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 3400);
-    const onData = wiring.indexOf('observedBackend.onData((data) =>');
-    const fence = wiring.indexOf('if (backend !== observedBackend) return;', onData);
-    const feed = wiring.indexOf('onPtyData(data)', fence);
+    const wiringStart = workerSrc.indexOf('const observedBackend = backend;');
+    const wiringEnd = workerSrc.indexOf('if (observedBackend instanceof HerdrBackend)', wiringStart);
+    const wiring = workerSrc.slice(wiringStart, wiringEnd);
+    const earlyOnData = wiring.indexOf('observedBackend.onData((data) =>');
+    const earlyFence = wiring.indexOf('if (backend !== observedBackend) return;', earlyOnData);
+    const earlyFeed = wiring.indexOf('onPtyData(data)', earlyFence);
+    const normalOnData = wiring.indexOf('observedBackend.onData((data) =>', earlyOnData + 1);
+    const normalFence = wiring.indexOf('if (backend !== observedBackend) return;', normalOnData);
+    const normalFeed = wiring.indexOf('onPtyData(data)', normalFence);
     const ptyReady = wiring.indexOf('markPromptReadyFromPty(observedBackend)');
 
-    expect(onData).toBeGreaterThanOrEqual(0);
-    expect(fence).toBeGreaterThan(onData);
-    expect(feed).toBeGreaterThan(fence);
+    expect(wiring).toContain("const needsEarlyPtyObserver = lastInitConfig?.cliId === 'tae-traex';");
+    expect(earlyOnData).toBeGreaterThanOrEqual(0);
+    expect(earlyFence).toBeGreaterThan(earlyOnData);
+    expect(earlyFeed).toBeGreaterThan(earlyFence);
+    expect(normalOnData).toBeGreaterThan(earlyOnData);
+    expect(normalFence).toBeGreaterThan(normalOnData);
+    expect(normalFeed).toBeGreaterThan(normalFence);
     expect(ptyReady).toBeGreaterThanOrEqual(0);
   });
 

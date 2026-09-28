@@ -671,6 +671,30 @@ export class TmuxBackend implements SessionBackend {
   getAttachInfo() {
     return { type: 'tmux' as const, sessionName: this.sessionName };
   }
+
+  /** Capture the authoritative pane contents, including ANSI attributes.
+   *
+   * A very fast child can render before node-pty's attach client has an output
+   * subscriber. The pane grid still retains that one-shot startup prompt, so
+   * worker readiness recovery can inspect it without asking the child to
+   * redraw or injecting any input.
+   */
+  captureCurrentScreen(): string {
+    try {
+      return execFileSync(
+        'tmux',
+        ['capture-pane', '-e', '-p', '-t', this.cmdTarget],
+        {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 3000,
+          env: tmuxEnv(),
+        },
+      );
+    } catch {
+      return '';
+    }
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

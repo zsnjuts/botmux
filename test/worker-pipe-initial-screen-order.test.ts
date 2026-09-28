@@ -399,11 +399,13 @@ describe('worker pipe initial screen ordering', () => {
     const injectIdx = source.indexOf('childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;');
     const spawnIdx = source.indexOf('backend.spawn(spawnBin, spawnArgs');
     const finalizeIdx = source.indexOf('finalizeCodexAppControlGeneration(', spawnIdx);
-    // The master merge refactored the post-spawn PTY listener into the
-    // setupBackendHandlers `observedBackend.onData((data) => …)` form (with the
-    // backend!==observedBackend generation fence); the bare `backend.onData(
-    // onPtyData)` now only appears in the earlier adopt early-return paths.
-    const onDataIdx = source.indexOf('observedBackend.onData((data)', spawnIdx);
+    // Only the quiet TAE runner needs a raw observer immediately after spawn;
+    // its bytes stay buffered until the generation proof has been finalized.
+    // Repainting interactive CLIs keep the established post-setup listener.
+    const earlyGateIdx = source.indexOf("const needsEarlyPtyObserver = lastInitConfig?.cliId === 'tae-traex';", spawnIdx);
+    const earlyOnDataIdx = source.indexOf('observedBackend.onData((data)', earlyGateIdx);
+    const replayIdx = source.indexOf('ptyObserverReady = true;', finalizeIdx);
+    const normalOnDataIdx = source.indexOf('observedBackend.onData((data)', earlyOnDataIdx + 1);
     const finalizeStart = source.indexOf('function finalizeCodexAppControlGeneration(');
     const finalizeEnd = source.indexOf('function rejectCodexAppControlMarker', finalizeStart);
     const finalize = source.slice(finalizeStart, finalizeEnd);
@@ -412,8 +414,12 @@ describe('worker pipe initial screen ordering', () => {
     expect(candidateIdx).toBeGreaterThan(prepareIdx);
     expect(injectIdx).toBeGreaterThan(candidateIdx);
     expect(spawnIdx).toBeGreaterThan(injectIdx);
+    expect(earlyGateIdx).toBeGreaterThan(spawnIdx);
+    expect(earlyOnDataIdx).toBeGreaterThan(earlyGateIdx);
+    expect(earlyOnDataIdx).toBeLessThan(finalizeIdx);
     expect(finalizeIdx).toBeGreaterThan(spawnIdx);
-    expect(onDataIdx).toBeGreaterThan(finalizeIdx);
+    expect(replayIdx).toBeGreaterThan(finalizeIdx);
+    expect(normalOnDataIdx).toBeGreaterThan(replayIdx);
     expect(finalize).toContain("codexAppControlProven && codexAppControlStateValue?.status === 'active'");
     expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'tae-traex']);");
     expect(source).not.toContain('CODEX_APP_CONTROL_NONCE_ENV');
@@ -562,23 +568,21 @@ describe('worker pipe initial screen ordering', () => {
     expect(proof).not.toContain('30_000');
   });
 
-  it('kills legacy/no-public-key reattach and fail-closes candidate setup before PTY listeners attach', () => {
+  it('kills legacy/no-public-key reattach and fail-closes candidate setup before buffered PTY data is trusted', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const preflightIdx = source.indexOf('shouldColdStartCodexAppReattach({');
     const preflightKillIdx = source.indexOf('killPersistentSession(', preflightIdx);
     const prepareIdx = source.indexOf('prepareCodexAppControlGeneration(', preflightIdx);
     const finalizeIdx = source.indexOf('finalizeCodexAppControlGeneration(', prepareIdx);
     const failureKillIdx = source.indexOf('killPersistentSession(', finalizeIdx);
-    // Post-merge the PTY listener is the setupBackendHandlers
-    // `observedBackend.onData((data) => …)` form (was `backend.onData(onPtyData)`).
-    const onDataIdx = source.indexOf('observedBackend.onData((data)', finalizeIdx);
+    const replayIdx = source.indexOf('ptyObserverReady = true;', finalizeIdx);
 
     expect(preflightIdx).toBeGreaterThan(-1);
     expect(preflightKillIdx).toBeGreaterThan(preflightIdx);
     expect(preflightKillIdx).toBeLessThan(prepareIdx);
     expect(finalizeIdx).toBeGreaterThan(prepareIdx);
     expect(failureKillIdx).toBeGreaterThan(finalizeIdx);
-    expect(failureKillIdx).toBeLessThan(onDataIdx);
+    expect(failureKillIdx).toBeLessThan(replayIdx);
   });
 
   it('keys overlapping authoritative screen settles by the idle-edge revision', () => {
@@ -591,7 +595,7 @@ describe('worker pipe initial screen ordering', () => {
     // stale anchor silently slices an empty string instead of failing loudly.
     const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
     expect(idleStart).toBeGreaterThan(-1);
-    const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
+    const idleEnd = source.indexOf('ptyObserverReady = true;', idleStart);
     expect(idleEnd).toBeGreaterThan(idleStart);
     const idle = source.slice(idleStart, idleEnd);
 

@@ -11891,13 +11891,42 @@ function scheduleSubmitFailureNotify(
     dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     const reason = action.kind === 'notify-hard-failure' ? action.reason : failureReason;
+    const notice = t('worker.submit_impossible', { cliName: cliName(), reason, preview });
     log(`writeInput: submit impossible — notifying user immediately. reason="${reason}" preview="${preview}"`);
+    // TAE TraeX has no local model/transcript fallback when its authority
+    // envelope is rejected before the runner receives a byte. Treat that as a
+    // real failed turn, using the same final_output + terminal pair emitted by
+    // the trusted runner's failure OSC. A generic user_notify is auxiliary UI
+    // and may be intentionally suppressed for managed/bot-triggered turns,
+    // which previously left the visible card at “启动中…” forever even though
+    // the worker had already rejected the input.
+    if (lastInitConfig?.cliId === 'tae-traex' && turnIdentity?.turnId) {
+      send({
+        type: 'final_output',
+        content: notice,
+        lastUuid: turnIdentity.turnId,
+        turnId: turnIdentity.turnId,
+        ...(turnIdentity.dispatchAttempt !== undefined
+          ? { dispatchAttempt: turnIdentity.dispatchAttempt }
+          : {}),
+        turnFailed: true,
+      });
+      emitTurnTerminal(
+        turnIdentity.turnId,
+        durableTerminalStatus,
+        `submit_impossible:${reason}`,
+        turnIdentity.dispatchAttempt,
+        undefined,
+        false,
+      );
+      return;
+    }
     emitDurableTerminal(`submit_impossible:${reason}`);
     if (turnIdentity?.dispatchAttempt === undefined) {
       send({
         type: 'user_notify',
         turnId: turnIdentity?.turnId ?? currentBotmuxTurnId,
-        message: t('worker.submit_impossible', { cliName: cliName(), reason, preview }),
+        message: notice,
       });
     }
     return;
@@ -16952,6 +16981,26 @@ async function spawnCli(
   } finally {
     delete childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV];
   }
+  const observedBackend = backend;
+  // TAE TraeX is a quiet line protocol whose one-shot ready prompt can be
+  // emitted before the normal post-setup PTY subscription. Attach early only
+  // for that adapter and buffer until provenance + readiness setup completes.
+  // Other interactive CLIs retain the established post-setup subscription
+  // order: subscribing tmux pipe-pane before their startup plumbing is ready
+  // changes redraw/idle timing and can strand Codex resume screens.
+  const needsEarlyPtyObserver = lastInitConfig?.cliId === 'tae-traex';
+  let earlyPtyOutput = '';
+  let ptyObserverReady = false;
+  if (needsEarlyPtyObserver) {
+    observedBackend.onData((data) => {
+      if (backend !== observedBackend) return;
+      if (!ptyObserverReady) {
+        earlyPtyOutput = (earlyPtyOutput + data).slice(-MAX_SCROLLBACK);
+        return;
+      }
+      onPtyData(data);
+    });
+  }
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
   if (actuallyReattachedPersistent) lastSpawnArgvDurableInitialPrompt = false;
@@ -17462,7 +17511,6 @@ async function spawnCli(
   // markPromptReady(): that call may synchronously flush a type-ahead turn and
   // advance bridge attribution. Both screen-idle and authoritative Herdr status
   // must preserve this ordering.
-  const observedBackend = backend;
   const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
     if (bridgeJsonlPath) {
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
@@ -17520,10 +17568,33 @@ async function spawnCli(
     });
   }
 
-  observedBackend.onData((data) => {
-    if (backend !== observedBackend) return;
-    onPtyData(data);
-  });
+  if (needsEarlyPtyObserver) {
+    // The callback was attached immediately after backend.spawn() so the
+    // runner's one-shot ready prompt could not fall through the subscription
+    // gap. The detector is now fully wired; replay the bounded startup bytes
+    // before accepting new data.
+    ptyObserverReady = true;
+    if (earlyPtyOutput) {
+      const buffered = earlyPtyOutput;
+      earlyPtyOutput = '';
+      onPtyData(buffered);
+    }
+  } else {
+    // Preserve the mature listener timing for repainting interactive CLIs.
+    observedBackend.onData((data) => {
+      if (backend !== observedBackend) return;
+      onPtyData(data);
+    });
+  }
+  // The TAE runner is intentionally a quiet line protocol, not a repainting
+  // TUI: it prints its ready prompt once and then blocks on stdin. If that
+  // write completed before the tmux attach PTY subscribed, no later redraw can
+  // rescue readiness. Read the pane's authoritative grid once after the idle
+  // detector is armed; the normal readyPattern + quiescence path still decides
+  // when to flush, so this is evidence recovery rather than a readiness bypass.
+  if (needsEarlyPtyObserver) {
+    seedBackendScreen('tae-traex startup', observedBackend);
+  }
   if (observedBackend instanceof HerdrBackend) {
     observedBackend.onAgentStatus((status) => {
       if (backend !== observedBackend) return;
