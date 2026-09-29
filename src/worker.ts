@@ -15451,6 +15451,12 @@ async function spawnCli(
     }
   }
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  if (cfg.cliId === 'tae-traex' && cfg.botDeveloperOpenId?.startsWith('ou_')) {
+    // This value comes from the daemon's resolved target-app owner, not the
+    // session owner and not model-controlled input. Pin it after per-bot env so
+    // a stale app-scoped deployment value cannot override the current Bot owner.
+    perBotInjectEnv.BOTMUX_TAE_BOT_ACTOR_DEFAULT_OPEN_ID = cfg.botDeveloperOpenId;
+  }
   const cliExtra = cliAdapter.allowExtraArgs === false
     ? ''
     : (process.env.CLI_EXTRA_ARGS ?? '').trim();
@@ -15636,6 +15642,9 @@ async function spawnCli(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  if (cfg.cliId === 'tae-traex' && cfg.botDeveloperOpenId?.startsWith('ou_')) {
+    childEnv.BOTMUX_TAE_BOT_ACTOR_DEFAULT_OPEN_ID = cfg.botDeveloperOpenId;
+  }
   childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;

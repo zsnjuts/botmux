@@ -52,14 +52,16 @@ function runnerReceivedContent(input: string, expected: string): boolean {
   return false;
 }
 
-function startWorker(trustedCaller: TrustedCaller) {
+function startWorker(trustedCaller: TrustedCaller, botDeveloperOpenId?: string) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-tae-traex-startup-'));
   roots.add(root);
   const dataDir = join(root, 'data');
   const inputFile = join(root, 'input.log');
+  const envFile = join(root, 'env.log');
   const fakeRunner = join(root, 'fake-tae-traex-runner');
   writeFileSync(fakeRunner, `#!/usr/bin/env node
 const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(envFile)}, process.env.BOTMUX_TAE_BOT_ACTOR_DEFAULT_OPEN_ID || '');
 process.stdin.setRawMode?.(true);
 process.stdin.on('data', chunk => fs.appendFileSync(${JSON.stringify(inputFile)}, chunk));
 process.stdout.write('[tae-traex:ready] › ');
@@ -107,6 +109,7 @@ setInterval(() => {}, 1_000);
     prompt: 'TAE_STARTUP_MARKER',
     turnId: 'om_tae_startup',
     trustedCaller,
+    ...(botDeveloperOpenId ? { botDeveloperOpenId } : {}),
     larkAppId: 'app_test',
     larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
@@ -115,6 +118,7 @@ setInterval(() => {}, 1_000);
     messages,
     logs,
     input: () => existsSync(inputFile) ? readFileSync(inputFile, 'utf8') : '',
+    developerOpenId: () => existsSync(envFile) ? readFileSync(envFile, 'utf8') : '',
     pane: () => {
       try {
         return execFileSync('tmux', ['capture-pane', '-e', '-p', '-t', 'bmx-sid-tae-'], {
@@ -145,10 +149,11 @@ describe.skipIf(!tmuxAvailable)('TAE TraeX worker startup', () => {
       requestUserOpenId: 'ou_peer_bot',
       requestLarkAppId: 'app_test',
       senderType: 'bot',
-    });
+    }, 'ou_developer');
 
     await waitFor(() => worker.pane().includes('[tae-traex:ready]'), worker.logs);
     await waitFor(() => runnerReceivedContent(worker.input(), 'TAE_STARTUP_MARKER'), worker.logs);
+    await waitFor(() => worker.developerOpenId() === 'ou_developer', worker.logs);
     expect(worker.messages).not.toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'final_output',

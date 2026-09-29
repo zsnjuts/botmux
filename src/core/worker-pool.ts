@@ -12001,6 +12001,9 @@ export function forkWorker(
   // Send init config — use per-bot settings
   const runtimeIdentity = runtimeBuildIdentity();
   const feedbackPolicy = resolveFeedbackPolicyForDelivery({ dataDir: config.session.dataDir, larkAppId: ds.larkAppId, chatId: ds.chatId, bot: botCfg });
+  const botDeveloperOpenId = agentCfg.cliId === 'tae-traex'
+    ? getOwnerOpenId(ds.larkAppId)
+    : undefined;
   ds.feedbackPolicy = feedbackPolicy;
   if (!ds.session.terminalCardEpoch) {
     ds.session.terminalCardEpoch = randomUUID();
@@ -12130,6 +12133,7 @@ export function forkWorker(
     forkSession: ds.session.pendingForkSession === true,
     cliSessionId: ds.session.cliSessionId,
     ownerOpenId: ds.ownerOpenId,
+    ...(botDeveloperOpenId ? { botDeveloperOpenId } : {}),
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     // Freeze on the session transport capability: a no-transport session
