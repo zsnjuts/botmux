@@ -140,7 +140,7 @@ describe.skipIf(!tmuxAvailable)('TAE TraeX worker startup', () => {
     expect(worker.logs.join('')).not.toContain('First prompt hard timeout');
   }, 15_000);
 
-  it('settles a non-human preflight rejection through visible failed final output', async () => {
+  it('forwards bot caller authority to the runner for explicit inheritance policy', async () => {
     const worker = startWorker({
       requestUserOpenId: 'ou_peer_bot',
       requestLarkAppId: 'app_test',
@@ -148,20 +148,13 @@ describe.skipIf(!tmuxAvailable)('TAE TraeX worker startup', () => {
     });
 
     await waitFor(() => worker.pane().includes('[tae-traex:ready]'), worker.logs);
-    await waitFor(() => worker.messages.some(message =>
-      message.type === 'final_output' && message.turnId === 'om_tae_startup'), worker.logs);
-    expect(worker.messages).toEqual(expect.arrayContaining([
+    await waitFor(() => runnerReceivedContent(worker.input(), 'TAE_STARTUP_MARKER'), worker.logs);
+    expect(worker.messages).not.toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'final_output',
         turnId: 'om_tae_startup',
         turnFailed: true,
       }),
-      expect.objectContaining({
-        type: 'turn_terminal',
-        turnId: 'om_tae_startup',
-        status: 'failed',
-      }),
     ]));
-    expect(worker.input()).not.toContain('TAE_STARTUP_MARKER');
   }, 15_000);
 });

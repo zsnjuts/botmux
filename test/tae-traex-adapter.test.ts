@@ -15,7 +15,7 @@ interface DecodedFrame {
   trustedCaller: {
     requestUserOpenId: string;
     requestLarkAppId: string;
-    senderType: 'user';
+    senderType: 'user' | 'bot';
   };
 }
 
@@ -111,10 +111,26 @@ describe('tae-traex adapter authority framing', () => {
     expect(decodeFrame(writes[0]!).trustedCaller.requestUserOpenId).toBe('ou_authenticated');
   });
 
+  it('forwards an authenticated bot caller without rewriting it as a human', async () => {
+    const writes: string[] = [];
+    const pty: PtyHandle = { write: data => { writes.push(data); return true; } };
+    const adapter = createTaeTraexAdapter('/opt/botmux-tae-traex-runner');
+    const context = caller('ou_peer_bot');
+    context.trustedCaller = { ...context.trustedCaller!, senderType: 'bot' };
+
+    const result = await adapter.writeInput(pty, 'bot follow-up', context);
+
+    expect(result).toEqual({ submitted: true, submissionDisposition: 'submitted' });
+    expect(decodeFrame(writes[0]!).trustedCaller).toMatchObject({
+      requestUserOpenId: 'ou_peer_bot',
+      requestLarkAppId: 'cli_bot_app',
+      senderType: 'bot',
+    });
+  });
+
   it.each([
     ['missing context', undefined],
     ['missing turn id', { ...caller('ou_a'), turnId: undefined }],
-    ['bot sender', { ...caller('ou_a'), trustedCaller: { ...caller('ou_a').trustedCaller, senderType: 'bot' } }],
     ['missing open id', { ...caller('ou_a'), trustedCaller: { ...caller('ou_a').trustedCaller, requestUserOpenId: undefined } }],
     ['missing app id', { ...caller('ou_a'), trustedCaller: { ...caller('ou_a').trustedCaller, requestLarkAppId: undefined } }],
   ] as const)('fails closed for %s without writing a frame', async (_label, context) => {

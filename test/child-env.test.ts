@@ -773,6 +773,17 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
   });
 
+  it('carries explicit TAE bot inheritance policy into the owning pane', () => {
+    for (const key of [
+      'BOTMUX_TAE_REMOTE_RUNTIME_ROOT',
+      'BOTMUX_TAE_BOT_ACTOR_POLICY',
+      'BOTMUX_TAE_BOT_ACTOR_ALLOWED_OPEN_IDS',
+      'BOTMUX_TAE_BOT_ACTOR_LEASE_SECONDS',
+    ]) {
+      expect(BOTMUX_INJECTED_ENV_KEYS, key).toContain(key);
+    }
+  });
+
   it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {
     // BOTMUX_INJECTED_ENV_KEYS also drives the pane `unset` clause and
     // scrubTmuxServerGlobalEnv(), so a standard, user-ownable variable listed

@@ -41,14 +41,14 @@ export function normalizeTaeTraexFailureMarker(
 }
 
 const MISSING_TURN_ID = 'TAE TraeX runner requires an authenticated BotMux turn id';
-const MISSING_ACTOR = 'TAE TraeX runner requires a daemon-authenticated human caller';
+const MISSING_CALLER = 'TAE TraeX runner requires a daemon-authenticated caller';
 
 export interface TaeTraexTurnAuthority {
   turnId: string;
   trustedCaller: TrustedCaller & {
     requestUserOpenId: string;
     requestLarkAppId: string;
-    senderType: 'user';
+    senderType: 'user' | 'bot';
   };
 }
 
@@ -57,8 +57,8 @@ export interface TaeTraexTurnAuthority {
  *
  * The prompt's <sender> block is untrusted model input. Only the daemon-created
  * WriteInputContext may select the per-user TraeX profile, and any missing or
- * non-human caller fails closed instead of falling back to the session owner,
- * deployment account, or previous turn's actor.
+ * caller is forwarded with its immutable sender type. The runner owns the
+ * opt-in bot inheritance policy; BotMux must not rewrite a bot into a human.
  */
 export function taeTraexTurnAuthority(
   context: WriteInputContext | undefined,
@@ -69,8 +69,9 @@ export function taeTraexTurnAuthority(
   const caller = context?.trustedCaller;
   const requestUserOpenId = caller?.requestUserOpenId?.trim();
   const requestLarkAppId = caller?.requestLarkAppId?.trim();
-  if (caller?.senderType !== 'user' || !requestUserOpenId || !requestLarkAppId) {
-    return { failureReason: MISSING_ACTOR };
+  if ((caller?.senderType !== 'user' && caller?.senderType !== 'bot')
+      || !requestUserOpenId || !requestLarkAppId) {
+    return { failureReason: MISSING_CALLER };
   }
 
   return {
@@ -79,7 +80,7 @@ export function taeTraexTurnAuthority(
       ...caller,
       requestUserOpenId,
       requestLarkAppId,
-      senderType: 'user',
+      senderType: caller.senderType,
     },
   };
 }
