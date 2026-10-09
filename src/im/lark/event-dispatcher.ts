@@ -98,7 +98,11 @@ import {
 import type {
   DurableInboxPrimaryDispatchContext,
 } from '../../services/durable-inbox-primary-consumer.js';
-import type { DurableLarkCanonicalHandlerResult } from '../../services/durable-lark-canonical-dispatch.js';
+import type {
+  DurableLarkCanonicalHandlerContext,
+  DurableLarkCanonicalHandlerResult,
+  DurableLarkPostAdmissionOutput,
+} from '../../services/durable-lark-canonical-dispatch.js';
 import {
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
@@ -2619,6 +2623,8 @@ export interface RoutingContext {
    *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
    *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
   ingressAdmission?: { admitted: boolean };
+  /** Durable-primary only: queue one provider effect behind fenced Session admission. */
+  queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
 }
 
 interface PendingForwardTopicPayload {
@@ -4012,7 +4018,7 @@ export interface LarkEventDispatcherRuntime {
   close(): void;
   processDurableMessage(
     message: DurableLarkMessageClaim,
-    context: DurableInboxPrimaryDispatchContext,
+    context: DurableLarkCanonicalHandlerContext,
   ): Promise<DurableLarkCanonicalHandlerResult>;
 }
 
@@ -4039,7 +4045,7 @@ export interface LarkEventDispatcherRuntimeOptions {
 
 interface PrimaryProcessContext {
   message: DurableLarkMessageClaim;
-  context: DurableInboxPrimaryDispatchContext;
+  context: DurableLarkCanonicalHandlerContext;
 }
 
 /** Build routing once; leadership decides whether this replica connects WS. */
@@ -5194,6 +5200,17 @@ export function createLarkEventDispatcherRuntime(
         substituteTrigger,
         messageListener,
         forwardSeedData: pairedForwardSeed?.payload.data,
+        ...(
+          primary
+          && typeof (primary.context as Partial<DurableLarkCanonicalHandlerContext>)
+            .queuePostAdmissionOutput === 'function'
+            ? {
+                queuePostAdmissionOutput: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).queuePostAdmissionOutput,
+              }
+            : {}
+        ),
       };
       if (explicitlyMentionedThisBot) {
         const before = await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
