@@ -7082,7 +7082,9 @@ async function prepareLiveRemoteWorkerClose(
       ok: false,
       error: backendType === 'riff'
         ? 'riff_worker_close_failed'
-        : 'remote_runner_close_reconciliation_required',
+        : result.recovery === 'retryable'
+          ? 'remote_runner_worker_close_failed'
+          : 'remote_runner_close_reconciliation_required',
       retryable: backendType === 'riff' || mayRestore,
       ...(result.recovery ? { recovery: result.recovery } : {}),
       ...(taskId ? { taskId } : {}),
