@@ -26,6 +26,7 @@ import {
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
 import {
+  globalConfigPath,
   readGlobalConfig,
   repoPickerScanOptions,
   isMultiTopicOrchestrationEnabled,
@@ -130,6 +131,16 @@ import {
 } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import { requestDurableSessionControl } from './services/durable-session-control-request.js';
+import {
+  createDurableGroupContextRecallFacade,
+  readDurableGroupContextRecalls,
+  recordDurableGroupContextRecall,
+} from './services/durable-group-context-recall.js';
+import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  runDurableConfigMutation,
+  setDurableConfigCoordinator,
+} from './services/durable-config-mutation.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import {
   durableDirectSessionControlEvent,
@@ -28767,6 +28778,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
     ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
     : undefined;
+  const durableGroupContextRecallFacade = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableGroupContextRecallFacade({
+        store: durableCoordinationRuntime.store,
+        ownerId: `group-context-recall:${getDaemonBootId()}`,
+      })
+    : undefined;
+  const durableConfigCoordinator = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableConfigCoordinator({
+        store: durableCoordinationRuntime.store,
+        ownerId: `config-daemon:${getDaemonBootId()}`,
+      })
+    : undefined;
+  setDurableConfigCoordinator(durableConfigCoordinator);
   durableSessionShadowFacade = durableSessionFacade;
   const durableInboxShadowConsumer = durableCoordinationRuntime?.mode === 'shadow'
     ? startDurableInboxShadowConsumer({
@@ -29067,7 +29091,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     scheduleAuthorityStore = null;
     scheduler.setScheduleAuthorityUnavailable(error);
   }
-  void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
+  void runDurableConfigMutation({
+    scope: 'global',
+    path: globalConfigPath(),
+    mutation: () => migrateOverloadAlertAtStartup(
+      botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })),
+    ),
+  }).catch(error => logger.warn(
+    `[durable-config] overload alert migration skipped: ${error instanceof Error ? error.message : String(error)}`,
+  ));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
@@ -30443,6 +30475,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
               return primaryRuntime.ingress.enqueueClusterControlBeforeAck(input);
             },
+            persistPrimaryGroupContextRecall: async input => {
+              if (!primaryRuntime || !durableGroupContextRecallFacade) {
+                throw new Error('durable primary recall runtime is not ready');
+              }
+              await recordDurableGroupContextRecall({
+                facade: durableGroupContextRecallFacade,
+                ...input,
+              });
+            },
+            readPrimaryGroupContextRecalls: input => readDurableGroupContextRecalls({
+              store: durableCoordinationRuntime.store,
+              ...input,
+            }),
             authorizePrimaryControl: async data =>
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
             readPrimarySession: async stableKey => {
@@ -31697,6 +31742,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
     setDurableSessionListHandler(null);
+    setDurableConfigCoordinator(undefined);
     await durableInboxShadowConsumer?.stop(remainingBudget());
     const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
     if (durableSessionStop?.kind === 'timed_out') {
@@ -31708,6 +31754,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
+    }
+    const durableRecallStop = await durableGroupContextRecallFacade?.stop(remainingBudget());
+    if (durableRecallStop?.kind === 'timed_out') {
+      logger.warn(
+        `[durable-recall] facade stop timed out `
+        + `(pending=${durableRecallStop.pendingSessionKeys.length}, `
+        + `unreleased=${durableRecallStop.unreleasedSessionKeys.length})`,
+      );
     }
 
     // Flush any pending identity-cache writes before exit. The cache uses a
@@ -31770,10 +31824,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
     setDurableSessionListHandler(null);
+    setDurableConfigCoordinator(undefined);
     for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();
     durableSessionFacade?.terminate();
+    durableGroupContextRecallFacade?.terminate();
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }
