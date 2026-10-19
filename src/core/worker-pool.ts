@@ -12430,6 +12430,9 @@ export type ForkResumeOrTurnId = boolean | string | {
   remoteResumeMode?: 'reattach' | 'rebuild';
   turnId?: string;
   dispatchAttempt?: number;
+  /** The opening prompt is a claimed durable-primary Inbox row and must ACK
+   * only after the adapter/provider proves submission. */
+  durablePrimaryInbox?: true;
   /** The payload is an exact retained activation journal. Do not re-read the
    * live clean-input feature flag on retry/replay. */
   codexAppInputGateFrozen?: boolean;
@@ -12687,10 +12690,14 @@ export function forkWorker(
       const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.dispatchAttempt
         : undefined;
+      const gatedDurablePrimaryInbox = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.durablePrimaryInbox
+        : undefined;
       sendWorkerInput(ds, promptInput, gatedTurnId, {
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
           : {}),
+        ...(gatedDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
         ...(gatedPrompt.codexAppSteerable === true
           ? { codexAppSteerable: true as const }
           : {}),
@@ -12715,6 +12722,9 @@ export function forkWorker(
       const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.dispatchAttempt
         : undefined;
+      const gatedDurablePrimaryInbox = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.durablePrimaryInbox
+        : undefined;
       const gatedAtMostOnce = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.atMostOnce
         : undefined;
@@ -12726,6 +12736,7 @@ export function forkWorker(
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
           : {}),
+        ...(gatedDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
         // R6-B3 (transfer-gate sibling): sendWorkerInput reads steer
         // authorization from OPTS, not the payload. A steerable opening/refork
         // rerouted through the transfer gate must carry the flag here too, or it
@@ -12811,6 +12822,7 @@ export function forkWorker(
   let remoteResumeMode: 'reattach' | 'rebuild' | undefined;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
+  let initDurablePrimaryInbox: true | undefined;
   let restartAttemptId: string | undefined;
   let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
   let initAtMostOnce: boolean | undefined;
@@ -12823,6 +12835,7 @@ export function forkWorker(
     remoteResumeMode = resumeOrTurnId.remoteResumeMode;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
+    initDurablePrimaryInbox = resumeOrTurnId.durablePrimaryInbox;
     restartAttemptId = resumeOrTurnId.restartAttemptId;
     initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
     initAtMostOnce = resumeOrTurnId.atMostOnce;
@@ -12894,6 +12907,7 @@ export function forkWorker(
     }
     const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
       ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+      ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
       // R6-B3: sendWorkerInput reads steer authorization from OPTS (not the
       // payload), so the direct-route double-fork (protected ownership, no
       // activation gate — e.g. only an unsettled ledger) must pass it through
@@ -13010,6 +13024,7 @@ export function forkWorker(
           if (prompt.length > 0) {
             const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
               ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+              ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
               ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
               ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
               ...(initAtMostOnce ? { atMostOnce: true as const } : {}),
@@ -13787,6 +13802,7 @@ export function forkWorker(
     turnId: initAttributionTurnId,
     ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
     dispatchAttempt: initDispatchAttempt,
+    ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     // R4-B1: COPY the frozen steer authorization onto the first-turn init so the
     // worker can fold follow-ups into this opening turn (canSteer requires the

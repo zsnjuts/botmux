@@ -18987,7 +18987,12 @@ function scheduleQueuedActivationTailReleaseRetry(
 async function admitFollowerBehindOpening(
   ds: DaemonSession,
   reservation: QueuedActivationTailReservation,
-  follower: { userPrompt: string; turnId: string; build: () => Promise<CliTurnPayload> },
+  follower: {
+    userPrompt: string;
+    turnId: string;
+    dispatchAttempt?: number;
+    build: () => Promise<CliTurnPayload>;
+  },
 ): Promise<void> {
   await runSessionTurn(ds.session.sessionId, async () => {
     const cliInput = await follower.build();
@@ -18995,6 +19000,9 @@ async function admitFollowerBehindOpening(
       userPrompt: follower.userPrompt,
       cliInput,
       turnId: follower.turnId,
+      ...(follower.dispatchAttempt !== undefined
+        ? { dispatchAttempt: follower.dispatchAttempt }
+        : {}),
     }, reservation);
     if (!ds.initialStartPending && !releaseQueuedActivationReservationNow(ds)) {
       scheduleQueuedActivationTailReleaseRetry(ds);
@@ -22770,6 +22778,8 @@ function recordDurablePrimaryInputCommit(
   }
 }
 
+export const __testOnly_recordDurablePrimaryInputCommit = recordDurablePrimaryInputCommit;
+
 function waitForDurablePrimaryInputCommit(
   ds: DaemonSession,
   turnId: string,
@@ -25794,13 +25804,27 @@ async function handleThreadReplyAdmitted(
   // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
   // retry must be a pure claim-state transition.
   if (ds && ctx.durablePrimaryDispatch) {
-    const disposition = durablePrimaryExistingTurnDisposition(ds, parsed.messageId);
+    const disposition = durablePrimaryExistingTurnDisposition({
+      session: ds.session,
+      worker: ds.worker,
+      cliReady: ds.cliReady,
+      activeInteractiveTurn: ds.activeInteractiveTurn,
+      // Durable queued-activation state is recovery INPUT, not proof that a
+      // live handler already owns this dead worker's generation. Let the cold
+      // path below replay that exact journal. Only a pending repository choice
+      // or another handler's live claim token blocks this refork boundary.
+      workerStartBlocker: ds.pendingRepo === true
+        ? 'pending-repo'
+        : ds.initialStartPending === true && ds.initialStartClaimToken !== undefined
+          ? 'in-flight-claim'
+          : undefined,
+    }, parsed.messageId);
     if (disposition === 'committed') {
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       markSessionActivity(ds, Date.now(), {
         human: parsed.senderType === 'user' && !isForeignBot,
       });
-      fillNativeTopicId(ds.session, scope, parsed.threadId);
+      const nativeTopicChanged = fillNativeTopicId(ds.session, scope, parsed.threadId);
       if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
       ds.session.quoteTargetSenderOpenId = callerOpenId;
       ds.session.quoteTargetSenderIsBot = isForeignBot;
@@ -25828,7 +25852,15 @@ async function handleThreadReplyAdmitted(
         sourceMessageId: parsed.messageId,
       });
       if (callerOpenId) ds.session.lastCallerOpenId = callerOpenId;
+      publishLastInputFromBotPatch(ds);
+      if (ds.session.vcMeetingReceiver) {
+        ds.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
+        if (ctx.vcMeetingImTurnOrigin) {
+          rememberVcMeetingImTurnOrigin(ds.session, ctx.vcMeetingImTurnOrigin);
+        }
+      }
       sessionStore.updateSession(ds.session);
+      if (nativeTopicChanged) publishNativeTopicLinkPatch(ds);
       markIngressAdmitted(ctx);
       logger.info(
         `[${tag(ds)}] Reused durable-primary provider submit proof for `
@@ -26910,6 +26942,9 @@ async function handleThreadReplyAdmitted(
       await admitFollowerBehindOpening(ds, tailReservation, {
         userPrompt: promptContent,
         turnId: parsed.messageId,
+        ...(ctx.durablePrimaryDispatch
+          ? { dispatchAttempt: ctx.durablePrimaryDispatch.attempt }
+          : {}),
         build: async () => {
           const stagedSender = await getThreadSender();
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
@@ -27225,6 +27260,12 @@ async function handleThreadReplyAdmitted(
           turnId: queuedHasDurableTail
             ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
             : parsed.messageId,
+          ...(!queuedHasDurableTail && ctx.durablePrimaryDispatch
+            ? {
+                dispatchAttempt: ctx.durablePrimaryDispatch.attempt,
+                durablePrimaryInbox: true as const,
+              }
+            : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true } : {}),
           ...(wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId
@@ -27285,6 +27326,24 @@ async function handleThreadReplyAdmitted(
         threadTrustedCaller,
         queuedHasDurableTail ? undefined : stripCrossPrincipalAsToken(parsed.content).text,
       );
+    }
+    if (ctx.durablePrimaryDispatch && !queuedHasDurableTail) {
+      try {
+        await waitForDurablePrimaryInputCommit(
+          ds,
+          parsed.messageId,
+          ctx.durablePrimaryDispatch.signal,
+        );
+      } catch (error) {
+        if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
+        retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending after worker refork');
+        logger.warn(
+          `[${tag(ds)}] Durable-primary reforked turn ${parsed.messageId.slice(0, 12)} `
+          + `will retry after provider submit receipt wait failed: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
     }
     // Record the input as the session's last real CLI turn ONLY after the fork
     // succeeded. Recording before the fork (the old order) persisted lastCliInput

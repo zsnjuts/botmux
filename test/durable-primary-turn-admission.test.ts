@@ -14,11 +14,33 @@ function state(overrides: Record<string, unknown> = {}) {
 }
 
 describe('durable primary existing-turn admission', () => {
-  it('retries before the worker is ready or while another turn owns the session', () => {
+  it('lets a dead worker reach cold refork but retries an in-flight start', () => {
     expect(durablePrimaryExistingTurnDisposition(
       state({ worker: null }),
       'om_next',
+    )).toBe('ready');
+    expect(durablePrimaryExistingTurnDisposition(
+      state({ worker: { killed: true } }),
+      'om_next',
+    )).toBe('ready');
+    expect(durablePrimaryExistingTurnDisposition(
+      state({ worker: null, workerStartBlocker: 'in-flight-claim' }),
+      'om_next',
     )).toBe('retry');
+    expect(durablePrimaryExistingTurnDisposition(
+      state({ worker: null, workerStartBlocker: 'pending-repo' }),
+      'om_next',
+    )).toBe('retry');
+  });
+
+  it('does not treat a durable queued-activation journal as a live start conflict', () => {
+    expect(durablePrimaryExistingTurnDisposition(
+      state({ worker: null }),
+      'om_queued_recovery',
+    )).toBe('ready');
+  });
+
+  it('retries before a live worker is ready or while another turn owns the session', () => {
     expect(durablePrimaryExistingTurnDisposition(
       state({ cliReady: false }),
       'om_next',
