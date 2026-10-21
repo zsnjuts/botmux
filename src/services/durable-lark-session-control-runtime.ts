@@ -6,7 +6,10 @@ import type { Session } from '../types.js';
 import type { DurableCoordinationStore, DurableJson } from './durable-coordination.js';
 import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
 import { durableLarkSessionControlPartition } from './durable-lark-session-control.js';
-import type { DurableSessionControlDispatchOptions } from './durable-session-control-dispatch.js';
+import type {
+  DurableSessionControlDispatchOptions,
+  DurableSessionControlReconcileResult,
+} from './durable-session-control-dispatch.js';
 import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
 import {
@@ -592,7 +595,7 @@ export function createDurableLarkSessionControlRuntime(
             error: `resume result requires reconciliation: ${resumed.error}`,
           };
         },
-        reconcile: async signal => {
+        reconcile: async (signal): Promise<DurableSessionControlReconcileResult> => {
           if (control.action === 'toggle_display') {
             const reconciled = observed();
             return reconciled
