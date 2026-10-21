@@ -31161,6 +31161,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               cardVisibility: 'public',
             }),
             resumeSession: sessionId => resumeSession(sessionId, activeSessions),
+            handlePresentationControl: data => botEventHandlers.handleCardAction(
+              data,
+              cfg.larkAppId,
+            ),
             buildClosedCard: ds => buildClosedSessionCard(ds, localeForBot(cfg.larkAppId)),
             buildActiveCard: ds => buildStreamingCardJson(
               ds,
