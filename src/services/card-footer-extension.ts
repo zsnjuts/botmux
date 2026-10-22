@@ -161,9 +161,13 @@ export const runCardFooterExtensionCommand: CardFooterExtensionRunner = (command
     child.stderr?.resume();
     child.on('error', (error) => finish(error));
     // 从 exit 结算（不等 close）：setsid 逃逸者持管时 close 可能永远不来。
+    // Bun/GitHub runner 偶尔会先派发 exit、再派发已在管道里的最后一段
+    // stdout data；延后一轮结算，既不等 close，也避免把合法尾部输出截成空串。
     child.on('exit', (code, signal) => {
-      if (code === 0) finish(null, stdout);
-      else finish(new Error(`cardFooterExtension command exited with ${code ?? signal}`));
+      setTimeout(() => {
+        if (code === 0) finish(null, stdout);
+        else finish(new Error(`cardFooterExtension command exited with ${code ?? signal}`));
+      }, 0);
     });
 
     timer = setTimeout(() => {

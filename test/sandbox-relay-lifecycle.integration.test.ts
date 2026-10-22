@@ -349,7 +349,10 @@ async function expectPaneRelayServed(lab: Lab, logs: () => string): Promise<void
   const response = lab.response(id)!;
   expect(response.stderr ?? '', JSON.stringify(response)).not.toMatch(/relay rejected|relay: bad json/);
   expect(typeof response.code).toBe('number');
-  expect(existsSync(join(lab.outbox, `${id}.req.json`))).toBe(false);
+  await vi.waitFor(
+    () => expect(existsSync(join(lab.outbox, `${id}.req.json`)), logs()).toBe(false),
+    { timeout: 5_000 },
+  );
 }
 
 async function workerExit(started: { worker: ChildProcess; logs: () => string }): Promise<void> {
