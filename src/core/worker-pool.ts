@@ -7652,7 +7652,10 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
     if (ds.remoteCloseState?.requestId !== wakeRequestId
         || ds.remoteCloseState.phase !== 'preparing') return false;
     ds.remoteCloseState = undefined;
-    const accepted = forkImpl(ds, '', true, {
+    const accepted = forkImpl(ds, '', {
+      resume: true,
+      remoteResumeMode: 'close-control',
+    }, {
       // A close request must not leave a delayed wake callback behind after it
       // has already returned failure. This also disables marginal-memory
       // reclaim/re-entry, which shares the same explicit no-defer gate.
@@ -13180,7 +13183,7 @@ export type ForkResumeOrTurnId = boolean | string | {
   resume?: boolean;
   /** Explicit close reactivation asks a Remote Runner provider to replace the
    * cancelled remote generation instead of reattaching it. */
-  remoteResumeMode?: 'reattach' | 'rebuild';
+  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control';
   turnId?: string;
   dispatchAttempt?: number;
   /** The opening prompt is a claimed durable-primary Inbox row and must ACK
@@ -13578,7 +13581,7 @@ export function forkWorker(
     && promptInput !== null
     && promptInput.codexAppSteerable === true;
   let resume = false;
-  let remoteResumeMode: 'reattach' | 'rebuild' | undefined;
+  let remoteResumeMode: 'reattach' | 'rebuild' | 'close-control' | undefined;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
   let initDurablePrimaryInbox: true | undefined;

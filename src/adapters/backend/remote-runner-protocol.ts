@@ -273,8 +273,10 @@ export type RemoteRunnerCommand =
       cwd: string;
       state: RemoteRunnerBackendState;
       /** `rebuild` means the prior remote resource was explicitly cancelled;
-       * the provider must create a new generation before reporting ready. */
-      resumeMode?: 'reattach' | 'rebuild';
+       * the provider must create a new generation before reporting ready.
+       * `close-control` means the provider is only being rehydrated to run
+       * `cancel`; it must not accept a model turn from that startup. */
+      resumeMode?: 'reattach' | 'rebuild' | 'close-control';
       model?: string;
       modelBackendVariant?: 'standard' | 'max';
       reasoningEffort?: string;
