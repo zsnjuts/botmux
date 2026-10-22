@@ -207,13 +207,13 @@ export function createDurableLarkSessionControlRuntime(
     const session = parseDurablePrimarySessionRecord(canonical).session;
     if (!session || session.larkAppId !== options.larkAppId
         || session.sessionId !== sessionId
-        || session.streamCardId !== cardMessageId
         || (actionType === 'close' && session.status !== 'active')
         || (actionType === 'resume' && session.status !== 'closed')
         || (actionType === 'toggle_display'
           && (session.status !== 'active'
             || (value?.target_display_mode !== 'hidden'
-              && value?.target_display_mode !== 'screenshot')))) return false;
+              && value?.target_display_mode !== 'screenshot')))
+        || (actionType !== 'toggle_display' && session.streamCardId !== cardMessageId)) return false;
     return actionType === 'toggle_display'
       ? true
       : options.canOperate(session.chatId, operatorOpenId);
@@ -284,7 +284,9 @@ export function createDurableLarkSessionControlRuntime(
     if (control.action === 'toggle_display' && canonicalSession.status !== 'active') {
       return { kind: 'ignored', reason: 'canonical Session is not active' };
     }
-    if (source === 'lark-card' && canonicalSession.streamCardId !== control.cardMessageId) {
+    if (source === 'lark-card'
+        && control.action !== 'toggle_display'
+        && canonicalSession.streamCardId !== control.cardMessageId) {
       return {
         kind: 'ignored',
         reason: `${control.action} card no longer owns the canonical Session lifecycle`,
@@ -374,7 +376,7 @@ export function createDurableLarkSessionControlRuntime(
         ? { targetDisplayMode: record(value)?.target_display_mode }
         : {}),
     } as unknown as DurableJson;
-    const effectiveCardMessageId = source === 'lark-card'
+    const effectiveCardMessageId = source === 'lark-card' && control.action !== 'toggle_display'
       ? control.cardMessageId
       : canonicalSession.streamCardId;
     const closeCard = control.action === 'close'

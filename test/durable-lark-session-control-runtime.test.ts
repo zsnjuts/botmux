@@ -498,6 +498,68 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
+  it('routes display controls from a superseded card to the current canonical stream card', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-display-current-card-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const persisted = session({ streamCardId: 'om_new_card' });
+    const active = {
+      session: persisted,
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      streamCardId: 'om_new_card',
+      displayMode: 'hidden',
+    } as DaemonSession;
+    await admitDurableLarkSession({ facade, message: message(), session: persisted });
+    const handlePresentationControl = vi.fn(async () => {
+      active.displayMode = 'screenshot';
+      return { config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content: 'screen' }] };
+    });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [active],
+      findActiveSession: () => active,
+      listPersistedSessions: () => [persisted],
+      getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not called' }),
+      handlePresentationControl,
+      buildClosedCard: () => 'closed',
+      buildActiveCard: ds => JSON.stringify({ mode: ds.displayMode }),
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = displayControl();
+    expect(input.control.cardMessageId).toBe('om_card');
+    expect(await runtime.authorizeBeforeAck(input.data)).toBe(true);
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(handlePresentationControl).toHaveBeenCalledOnce();
+    const digest = createHash('sha256').update(input.control.operationId).digest('hex');
+    expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
+      .toMatchObject({
+        target: { kind: 'update', messageId: 'om_new_card' },
+        msgType: 'interactive',
+      });
+    await facade.stop();
+    await store.close();
+  });
+
   it('drops stale cross-replica display controls after fast owner handoff retries', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-stale-display-'));
     tempDirs.push(dir);
