@@ -291,7 +291,15 @@ export function createDurableLarkSessionControlRuntime(
     let live = options.findActiveSession(control.sessionId);
     let persisted = options.getPersistedSession(control.sessionId);
     if (control.action === 'toggle_display' && !live) {
-      throw new Error('active presentation target is owned by another replica');
+      if (context.claim.attempts <= 2) {
+        throw new DurableSessionControlOwnerHandoffError(
+          'active presentation target is owned by another replica',
+        );
+      }
+      return {
+        kind: 'ignored',
+        reason: 'stale presentation control no longer has a local active target',
+      };
     }
     if (control.action === 'close' && canonicalSession.status === 'active') {
       if (!live) {

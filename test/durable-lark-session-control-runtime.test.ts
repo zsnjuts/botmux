@@ -443,6 +443,52 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
+  it('drops stale cross-replica display controls after fast owner handoff retries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-stale-display-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    await admitDurableLarkSession({ facade, message: message(), session: session() });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not called' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = displayControl();
+
+    await expect(runtime.resolve(input.control, {
+      claim: { ...input.claim, attempts: 1 },
+      signal: new AbortController().signal,
+    })).rejects.toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    await expect(runtime.resolve(input.control, {
+      claim: { ...input.claim, attempts: 2 },
+      signal: new AbortController().signal,
+    })).rejects.toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    await expect(runtime.resolve(input.control, {
+      claim: { ...input.claim, attempts: 3 },
+      signal: new AbortController().signal,
+    })).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'stale presentation control no longer has a local active target',
+    });
+    await facade.stop();
+    await store.close();
+  });
+
   it('materializes a canonical closed Session on a fresh replica before resolving resume', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-canonical-resume-'));
     tempDirs.push(dir);
