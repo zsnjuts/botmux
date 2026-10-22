@@ -4733,6 +4733,9 @@ export function createLarkEventDispatcherRuntime(
     if (typeof primary.context.queuePostAdmissionOutput === 'function') {
       ctx.queuePostAdmissionOutput = primary.context.queuePostAdmissionOutput;
     }
+    if (typeof primary.context.queuePostAdmissionControl === 'function') {
+      ctx.queuePostAdmissionControl = primary.context.queuePostAdmissionControl;
+    }
   };
 
   const assertPrimaryRouteOwner = async (
