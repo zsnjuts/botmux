@@ -3636,7 +3636,14 @@ export type DurableActiveSessionTakeoverResult =
       activeSessionId?: string;
     };
 
-function activeCanonicalTakeoverUnsupportedReason(session: Session): string | undefined {
+interface DurableActiveSessionTakeoverOptions {
+  remoteResumeMode?: 'reattach' | 'close-control';
+}
+
+function activeCanonicalTakeoverUnsupportedReason(
+  session: Session,
+  opts: DurableActiveSessionTakeoverOptions = {},
+): string | undefined {
   if (session.status !== 'active') return 'canonical Session is not active';
   if (!session.larkAppId) return 'canonical Session has no Lark application identity';
   if (session.backendType !== 'remote-runner' && session.cliId !== 'remote-runner') {
@@ -3652,7 +3659,8 @@ function activeCanonicalTakeoverUnsupportedReason(session: Session): string | un
   } catch {
     return 'canonical Session application is not configured on this replica';
   }
-  if (!requiredCapabilities?.includes('turn_recovery')) {
+  if (opts.remoteResumeMode !== 'close-control'
+      && !requiredCapabilities?.includes('turn_recovery')) {
     return 'Remote Runner turn_recovery is not required on this replica';
   }
   if (session.title?.startsWith('Adopt:') || session.adoptedFrom) {
@@ -3678,8 +3686,9 @@ function activeCanonicalTakeoverUnsupportedReason(session: Session): string | un
 export async function takeOverDurableActiveRemoteSession(
   canonical: Session,
   activeSessions: Map<string, DaemonSession>,
+  opts: DurableActiveSessionTakeoverOptions = {},
 ): Promise<DurableActiveSessionTakeoverResult> {
-  const unsupported = activeCanonicalTakeoverUnsupportedReason(canonical);
+  const unsupported = activeCanonicalTakeoverUnsupportedReason(canonical, opts);
   if (unsupported) return { ok: false, error: 'unsupported_session', detail: unsupported };
   const expectedAppId = canonical.larkAppId!;
   const expectedSessionId = canonical.sessionId;
@@ -3805,7 +3814,10 @@ export async function takeOverDurableActiveRemoteSession(
     let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
     let started = false;
     try {
-      started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'reattach' }, {
+      started = forkWorker(ds, '', {
+        resume: true,
+        remoteResumeMode: opts.remoteResumeMode ?? 'reattach',
+      }, {
         deferDuringDeviceIsolation: false,
         onAdmission: value => { admission = value; },
       });

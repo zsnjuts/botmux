@@ -60,6 +60,7 @@ export interface DurableLarkSessionControlRuntimeOptions {
   takeOverActiveSession?(
     sessionKey: string,
     canonical: Session,
+    options?: { remoteResumeMode?: 'reattach' | 'close-control' },
   ): Promise<Session | { kind: 'retry'; reason: string } | undefined>;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
@@ -320,7 +321,12 @@ export function createDurableLarkSessionControlRuntime(
         // While the old owner is still live this remains retryable; once its
         // lease expires, any replica can materialize and apply the control.
         if (persisted?.status !== 'closed') {
-          const takeover = await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+          const takeoverOptions = control.action === 'close' && remote
+            ? { remoteResumeMode: 'close-control' as const }
+            : undefined;
+          const takeover = takeoverOptions
+            ? await options.takeOverActiveSession?.(canonicalKey, canonicalSession, takeoverOptions)
+            : await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
           if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
             throw new DurableSessionControlOwnerHandoffError(takeover.reason);
           }

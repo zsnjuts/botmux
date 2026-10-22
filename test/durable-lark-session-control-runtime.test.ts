@@ -1196,6 +1196,85 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
+  it('uses close-control mode when taking over a non-local Remote Runner for close', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-remote-close-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    const canonical = session({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'tae-traex',
+        generation: 1,
+        remoteSessionId: 'remote-session-1',
+        providerState: {
+          sessionKey: 'bmx1-' + 'a'.repeat(40),
+          runtimeSubpath: 'clusters/default/sessions/bmx1-' + 'a'.repeat(40),
+        },
+      },
+    });
+    let persisted: Session | undefined;
+    let active: DaemonSession | undefined;
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'takeover-owner' });
+    const takeOverActiveSession = vi.fn(async (_sessionKey: string, session: Session) => {
+      persisted = structuredClone(session);
+      active = {
+        session: persisted,
+        larkAppId: 'cli_test',
+        chatId: 'oc_chat',
+        streamCardId: 'om_card',
+      } as DaemonSession;
+      return persisted;
+    });
+    const closeSession = vi.fn(async () => {
+      persisted = { ...persisted!, status: 'closed', closedAt: '2026-10-09T00:02:00.000Z' };
+      active = undefined;
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false };
+    });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => active ? [active] : [],
+      findActiveSession: () => active,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
+      takeOverActiveSession,
+      canOperate: () => true,
+      closeSession,
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+
+    const input = directControl('trusted-host', 'close');
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(takeOverActiveSession).toHaveBeenCalledWith(
+      'om_root::cli_test',
+      expect.objectContaining({ sessionId: 'session-1', status: 'active' }),
+      { remoteResumeMode: 'close-control' },
+    );
+    expect(closeSession).toHaveBeenCalledWith('session-1');
+    await facade.stop();
+    await store.close();
+  });
+
   it('classifies an occupied active-session takeover as an owner handoff', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-owner-handoff-'));
     tempDirs.push(dir);
