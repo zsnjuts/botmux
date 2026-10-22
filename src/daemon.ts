@@ -31065,6 +31065,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const takeOverPrimarySession = async (
           stableKey: string,
           canonical: Session,
+          options?: { remoteResumeMode?: 'reattach' | 'close-control' },
         ): Promise<Session | { kind: 'retry'; reason: string } | undefined> => {
           if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
           try {
@@ -31090,6 +31091,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const takeover = await takeOverDurableActiveRemoteSession(
               claimed.session,
               activeSessions,
+              options,
             );
             if (!takeover.ok) {
               throw new Error(
@@ -31177,8 +31179,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               }
               return materialized;
             },
-            takeOverActiveSession: async (stableKey, canonical) => {
-              return takeOverPrimarySession(stableKey, canonical);
+            takeOverActiveSession: async (stableKey, canonical, options) => {
+              return takeOverPrimarySession(stableKey, canonical, options);
             },
             canOperate: (chatId, operatorOpenId) =>
               canOperate(cfg.larkAppId, chatId, operatorOpenId),
