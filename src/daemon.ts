@@ -382,6 +382,7 @@ import {
   hasQueuedActivationAdmissionGate,
   sendWorkerSessionInput,
   killWorker,
+  detachWorkerForTransfer,
   retireWorkerProcessOnly,
   retiringWorkersForSession,
   reapOrphanWorkers,
@@ -798,6 +799,7 @@ import {
   DAEMON_COT_SETTLE_MS,
   DAEMON_SHUTDOWN_MAX_MS,
   DAEMON_WORKER_EXIT_GRACE_MS,
+  REMOTE_SHUTDOWN_MODE,
 } from './core/shutdown-budgets.js';
 import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
 import {
@@ -29564,6 +29566,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (botIndex !== undefined) {
     cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
   }
+  if (REMOTE_SHUTDOWN_MODE === 'handoff') {
+    if (durableCoordinationRuntime?.mode !== 'primary') {
+      throw new Error('BOTMUX_REMOTE_SHUTDOWN_MODE=handoff requires durable coordination primary mode');
+    }
+    const usesRemoteRunner = cfg.backendType === 'remote-runner' || cfg.cliId === 'remote-runner';
+    if (usesRemoteRunner && !cfg.remoteRunner?.requiredCapabilities?.includes('turn_recovery')) {
+      throw new Error('BOTMUX_REMOTE_SHUTDOWN_MODE=handoff requires remoteRunner turn_recovery');
+    }
+  }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
   // Host-executed schedule conditions are authority material. Create and
@@ -32044,6 +32055,81 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // participant workerless.
     const remoteCandidates = initialShutdownFleet.sessions
       .filter(ds => shutdownBackendDisposition(ds) === 'remote-drain-detach');
+    const remoteRetiredWorkers: ChildProcess[] = [];
+    let currentShutdownSessions = initialShutdownFleet.sessions;
+    if (REMOTE_SHUTDOWN_MODE === 'handoff') {
+      // Primary + turn_recovery already make the remote turn durable. Retire
+      // only this Pod's observer and release the route lease so a successor can
+      // reattach immediately instead of waiting for the active turn to finish.
+      const coordinationStore = durableCoordinationRuntime?.store;
+      if (!coordinationStore) {
+        throw new Error('Remote shutdown handoff has no durable coordination store');
+      }
+      const handoffPlans = remoteCandidates.map(ds => {
+        const runtime = durablePrimaryRuntimeByApp.get(ds.larkAppId);
+        if (!runtime) {
+          throw new Error(`Remote shutdown handoff has no primary runtime for ${ds.larkAppId}`);
+        }
+        const canonicalKey = sessionKey(storedSessionAnchorId(ds.session), ds.larkAppId);
+        const operationId = [
+          'trusted-host.session-control',
+          ds.larkAppId,
+          ds.session.sessionId,
+          runtime.session.ownerId,
+          'handoff',
+        ].join(':');
+        return { ds, runtime, canonicalKey, operationId };
+      });
+      for (const { ds, runtime, operationId } of handoffPlans) {
+        const inserted = await coordinationStore.enqueueInbox(
+          durableDirectSessionControlEvent({
+            source: 'trusted-host',
+            larkAppId: ds.larkAppId,
+            operationId,
+            action: 'handoff',
+            sessionId: ds.session.sessionId,
+            rootId: storedSessionAnchorId(ds.session),
+            cardMessageId: ds.streamCardId ?? ds.session.streamCardId,
+            retiringOwnerId: runtime.session.ownerId,
+          }),
+        );
+        if (inserted.kind === 'conflict') {
+          throw new Error(`Remote shutdown handoff event conflicts for ${ds.session.sessionId}`);
+        }
+      }
+      const controlRuntimes = [...new Set(handoffPlans.map(({ runtime }) => runtime))];
+      for (const runtime of controlRuntimes) {
+        const stopped = await runtime.control?.stop(
+          Math.min(1_000, Math.max(0, shutdownDeadlineMs - Date.now())),
+        );
+        if (stopped?.kind === 'timed_out') {
+          logger.warn(
+            `[durable-primary] control consumer stop timed out before remote handoff `
+            + `(inFlight=${stopped.inFlight})`,
+          );
+        }
+      }
+      const handoffs = await Promise.all(handoffPlans.map(async ({ ds, runtime, canonicalKey }) => {
+        const worker = ds.worker;
+        const detached = await detachWorkerForTransfer(ds);
+        if (!detached) {
+          // The detach helper hard-retires an uncertain worker before returning
+          // false. Keep shutdown moving so recovery comes from durable provider
+          // state rather than from this retiring Pod.
+          retireWorkerProcessOnly(ds, 'remote_shutdown_handoff_detach_failed');
+          logger.warn(
+            `[${ds.session.sessionId.slice(0, 8)}] Remote shutdown handoff used hard retirement`,
+          );
+        }
+        const released = await runtime.session.releaseLease(canonicalKey);
+        logger.info(
+          `[${ds.session.sessionId.slice(0, 8)}] Remote shutdown handoff released route lease=`
+          + `${released}`,
+        );
+        return worker;
+      }));
+      remoteRetiredWorkers.push(...handoffs.filter((worker): worker is ChildProcess => !!worker));
+    } else {
     const remotePrepareResults = await prepareRemoteFleetForShutdown(remoteCandidates, {
       deadlineMs: shutdownDeadlineMs,
     });
@@ -32126,6 +32212,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       );
       return;
     }
+    currentShutdownSessions = currentShutdownFleet.sessions;
     const currentRemoteOwners = currentShutdownFleet.sessions
       .filter(ds => shutdownBackendDisposition(ds) === 'remote-drain-detach');
     const remotePreparedOwners = new Set(remotePrepared.map(entry => entry.ds));
@@ -32147,12 +32234,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // Validate-all above, then commit-all synchronously with no await or
     // callback boundary between peers.
-    const remoteRetiredWorkers: ChildProcess[] = [];
     for (const { ds, result } of remotePrepared) {
       if (!commitPreparedRemoteShutdown(ds, result)) {
         throw new Error(`Remote shutdown commit invariant lost for ${ds.session.sessionId}`);
       }
       if (result.worker) remoteRetiredWorkers.push(result.worker);
+    }
     }
 
     scheduler.stopScheduler();
@@ -32170,7 +32257,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // missed here (SIGKILL, power loss, or a session added after this point).
     try {
       await waitAllWithin(
-        currentShutdownFleet.sessions.flatMap(ds => [
+        currentShutdownSessions.flatMap(ds => [
           settleCotMessageForShutdown(ds).catch(() => { /* cosmetic */ }),
           settleTurnReplyCards(ds).catch(() => { /* cosmetic */ }),
         ]),
@@ -32262,7 +32349,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // riffRetiredWorkers -> remoteRetiredWorkers (it now carries mojo too), while
     // master renamed the local helper trackWorkerExit -> trackWorker.
     for (const worker of remoteRetiredWorkers) trackWorker(worker);
-    for (const ds of currentShutdownFleet.sessions) {
+    for (const ds of currentShutdownSessions) {
       const w = ds.worker;
       if (!w) continue;
       // Track EVERY non-null worker (both concerns) unconditionally. `killed`

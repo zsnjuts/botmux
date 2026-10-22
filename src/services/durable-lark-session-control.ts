@@ -7,10 +7,10 @@ import {
 
 export const DURABLE_LARK_SESSION_CONTROL_VERSION = 1 as const;
 
-export type DurableLarkSessionControlAction = 'close' | 'resume' | 'toggle_display';
+export type DurableLarkSessionControlAction = 'close' | 'resume' | 'toggle_display' | 'handoff';
 export type DurableLifecycleSessionControlAction = Extract<
   DurableLarkSessionControlAction,
-  'close' | 'resume'
+  'close' | 'resume' | 'handoff'
 >;
 export type DurableSessionControlSource = 'lark-card' | 'lark-command' | 'trusted-host';
 
@@ -32,6 +32,7 @@ export interface DurableLarkSessionControlClaim {
   rootId: string;
   operatorOpenId: string;
   cardMessageId: string;
+  retiringOwnerId?: string;
   attempts: number;
   data: DurableJson;
 }
@@ -47,6 +48,7 @@ interface DurableDirectSessionControlEnvelope {
   rootId: string;
   operatorOpenId: string;
   cardMessageId: string;
+  retiringOwnerId?: string;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -191,6 +193,7 @@ export function durableDirectSessionControlEvent(input: {
   rootId: string;
   operatorOpenId?: string;
   cardMessageId?: string;
+  retiringOwnerId?: string;
   now?: number;
 }): DurableInboxEvent {
   const now = input.now ?? Date.now();
@@ -216,6 +219,12 @@ export function durableDirectSessionControlEvent(input: {
   const cardMessageId = input.cardMessageId
     ? bounded(input.cardMessageId, 'cardMessageId', 256)
     : 'none';
+  const retiringOwnerId = input.action === 'handoff'
+    ? bounded(input.retiringOwnerId, 'retiringOwnerId', 256)
+    : undefined;
+  if (input.action === 'handoff' && input.source !== 'trusted-host') {
+    throw new Error('durable handoff requires a trusted host source');
+  }
   const payload: DurableDirectSessionControlEnvelope = {
     version: DURABLE_LARK_SESSION_CONTROL_VERSION,
     type: 'botmux.session.control',
@@ -227,6 +236,7 @@ export function durableDirectSessionControlEvent(input: {
     rootId,
     operatorOpenId,
     cardMessageId,
+    ...(retiringOwnerId ? { retiringOwnerId } : {}),
   };
   const event: DurableInboxEvent = {
     eventId: operationId,
@@ -265,16 +275,21 @@ export function parseDurableSessionControlClaim(
   const larkAppId = bounded(payload.larkAppId, 'larkAppId', 256);
   const operationId = bounded(payload.operationId, 'operationId', 1_024);
   const action = payload.action;
-  if (!larkAppId.startsWith('cli_') || (action !== 'close' && action !== 'resume')) {
+  if (!larkAppId.startsWith('cli_')
+      || (action !== 'close' && action !== 'resume' && action !== 'handoff')) {
     throw new Error(`durable session control ${claim.event.eventId} has an invalid identity`);
   }
   const sessionId = bounded(payload.sessionId, 'sessionId', 256);
   const rootId = bounded(payload.rootId, 'rootId', 512);
   const operatorOpenId = bounded(payload.operatorOpenId, 'operatorOpenId', 256);
   const cardMessageId = bounded(payload.cardMessageId, 'cardMessageId', 256);
+  const retiringOwnerId = action === 'handoff'
+    ? bounded(payload.retiringOwnerId, 'retiringOwnerId', 256)
+    : undefined;
   if ((!rootId.startsWith('om_') && !rootId.startsWith('oc_'))
       || (source === 'lark-command' && !operatorOpenId.startsWith('ou_'))
       || (source === 'trusted-host' && operatorOpenId !== 'trusted-host')
+      || (action === 'handoff' && source !== 'trusted-host')
       || claim.event.eventId !== operationId
       || claim.event.partitionKey !== durableLarkSessionControlPartition(larkAppId, sessionId)) {
     throw new Error(`durable session control ${claim.event.eventId} has a mismatched identity`);
@@ -289,6 +304,7 @@ export function parseDurableSessionControlClaim(
     rootId,
     operatorOpenId,
     cardMessageId,
+    ...(retiringOwnerId ? { retiringOwnerId } : {}),
     attempts: claim.attempts,
     data: payload as unknown as DurableJson,
   };
