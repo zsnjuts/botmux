@@ -277,6 +277,9 @@ export function createDurableLarkSessionControlRuntime(
     if (control.action === 'resume' && canonicalSession.status !== 'closed') {
       return { kind: 'ignored', reason: 'canonical Session is no longer closed' };
     }
+    if (control.action === 'handoff' && canonicalSession.status !== 'active') {
+      return { kind: 'ignored', reason: 'canonical Session is no longer active' };
+    }
     if (control.action === 'close' && canonicalSession.status !== 'active'
         && canonicalSession.status !== 'closed') {
       return { kind: 'ignored', reason: 'canonical Session cannot be closed' };
@@ -296,6 +299,12 @@ export function createDurableLarkSessionControlRuntime(
         && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
       return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
     }
+    if (control.action === 'handoff'
+        && options.facade().ownerId === control.retiringOwnerId) {
+      throw new DurableSessionControlOwnerHandoffError(
+        'retiring Session owner cannot consume its own handoff request',
+      );
+    }
     if (control.action !== 'toggle_display'
         && (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom)) {
       return { kind: 'ignored', reason: 'adopted Sessions do not support durable lifecycle control' };
@@ -303,6 +312,12 @@ export function createDurableLarkSessionControlRuntime(
 
     let live = options.findActiveSession(control.sessionId);
     let persisted = options.getPersistedSession(control.sessionId);
+    const handoffBaselineState = control.action === 'handoff'
+      ? normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState)
+      : undefined;
+    if (control.action === 'handoff' && !handoffBaselineState) {
+      return { kind: 'ignored', reason: 'canonical Session is not backed by a Remote Runner' };
+    }
     if (control.action === 'toggle_display' && !live) {
       if (context.claim.attempts <= 2) {
         throw new DurableSessionControlOwnerHandoffError(
@@ -372,6 +387,9 @@ export function createDurableLarkSessionControlRuntime(
       rootId: control.rootId,
       operatorOpenId: control.operatorOpenId,
       cardMessageId: control.cardMessageId,
+      ...(control.action === 'handoff'
+        ? { retiringOwnerId: control.retiringOwnerId }
+        : {}),
       ...(control.action === 'toggle_display'
         ? { targetDisplayMode: record(value)?.target_display_mode }
         : {}),
@@ -475,6 +493,31 @@ export function createDurableLarkSessionControlRuntime(
           },
         };
       }
+      if (control.action === 'handoff' && current.status === 'active') {
+        const active = options.findActiveSession(control.sessionId);
+        const recoveredState = normalizeRemoteRunnerBackendState(
+          active?.session.remoteBackendState,
+        );
+        if (!active
+            || !handoffBaselineState
+            || !recoveredState
+            || recoveredState.provider !== handoffBaselineState.provider
+            || recoveredState.generation < handoffBaselineState.generation
+            || !recoveredState.remoteSessionId
+            || (options.isResumeReady && !options.isResumeReady(active))) return undefined;
+        return {
+          result: result('active', undefined, {
+            retiringOwnerId: control.retiringOwnerId,
+            generation: recoveredState.generation,
+          }),
+          evidence: {
+            source: 'active-session',
+            status: 'active',
+            recovery: 'ready',
+            generation: recoveredState.generation,
+          },
+        };
+      }
       return undefined;
     };
 
@@ -512,6 +555,36 @@ export function createDurableLarkSessionControlRuntime(
       }
     };
 
+    const waitForHandoffReadiness = async (
+      signal: AbortSignal,
+    ): Promise<
+      | { kind: 'completed'; result: DurableJson }
+      | { kind: 'ambiguous'; error: string }
+    > => {
+      const deadline = now() + resumeReadinessTimeoutMs;
+      let stableSince: number | undefined;
+      for (;;) {
+        if (signal.aborted) throw signal.reason;
+        const recovered = observed();
+        if (recovered) {
+          stableSince ??= now();
+          if (now() - stableSince >= resumeReadinessStabilityMs) {
+            return { kind: 'completed', result: recovered.result };
+          }
+        } else {
+          stableSince = undefined;
+        }
+        const remaining = deadline - now();
+        if (remaining <= 0) {
+          return {
+            kind: 'ambiguous',
+            error: 'remote handoff recovery readiness timed out',
+          };
+        }
+        await wait(Math.min(resumeReadinessPollMs, remaining), signal);
+      }
+    };
+
     return {
       kind: 'target',
       target: {
@@ -538,6 +611,26 @@ export function createDurableLarkSessionControlRuntime(
               kind: 'completed',
               result: result('active', cardJson, { displayMode: target }),
             };
+          }
+          if (control.action === 'handoff') {
+            const takeover = await options.takeOverActiveSession?.(
+              canonicalKey,
+              canonicalSession,
+              { remoteResumeMode: 'reattach' },
+            );
+            if (!takeover) {
+              return { kind: 'not_applied', error: 'remote handoff takeover is unavailable' };
+            }
+            if ('kind' in takeover && takeover.kind === 'retry') {
+              return { kind: 'not_applied', error: takeover.reason };
+            }
+            live = options.findActiveSession(control.sessionId);
+            persisted = options.getPersistedSession(control.sessionId);
+            if (!live || live.session.sessionId !== canonicalSession.sessionId
+                || persisted?.status !== 'active') {
+              return { kind: 'not_applied', error: 'remote handoff did not materialize locally' };
+            }
+            return waitForHandoffReadiness(signal);
           }
           if (control.action === 'close') {
             const closed = await options.closeSession(control.sessionId);
@@ -638,6 +731,18 @@ export function createDurableLarkSessionControlRuntime(
               ? { kind: 'completed', ...reconciled }
               : { kind: 'unknown', error: 'backend cannot yet prove the lifecycle outcome' };
           }
+          if (control.action === 'handoff') {
+            const reconciled = observed();
+            if (reconciled) return { kind: 'completed', ...reconciled };
+            const active = options.findActiveSession(control.sessionId);
+            return active
+              ? { kind: 'unknown', error: 'remote handoff worker is not ready' }
+              : {
+                  kind: 'not_applied',
+                  error: 'remote handoff has no local active Session',
+                  evidence: { source: 'active-session', status: 'absent' },
+                };
+          }
           const reconciled = await waitForResumeReadiness(signal);
           if (reconciled.kind !== 'completed') {
             return { kind: 'unknown', error: reconciled.error };
@@ -671,6 +776,7 @@ export function createDurableLarkSessionControlRuntime(
               || (control.action === 'resume'
                 && status !== 'active'
                 && !(status === 'closed' && parsed.applied === false))
+              || (control.action === 'handoff' && status !== 'active')
               || (control.action === 'toggle_display'
                 && (status !== 'active'
                   || (parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
@@ -691,7 +797,8 @@ export function createDurableLarkSessionControlRuntime(
           if (committed.kind !== 'committed') {
             throw new Error(`canonical control commit failed: ${committed.kind}`);
           }
-          if (control.action === 'resume' && status === 'active') {
+          if ((control.action === 'resume' || control.action === 'handoff')
+              && status === 'active') {
             const active = options.findActiveSession(control.sessionId);
             if (active?.session.sessionId === control.sessionId) {
               // Remote resume keeps automatic worker cards silent until the

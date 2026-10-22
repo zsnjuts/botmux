@@ -266,8 +266,9 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 ## 关闭与进程退出
 
 - 显式关闭使用两阶段流程：BotMux 先发送 `cancel`，收到 `status: closed` 后持久化关闭，再提交本地 worker 退出。取消结果未知时会保持会话和写入门禁，不会伪装成已关闭。
-- Daemon 正常退出使用 `detach`：provider 应等待当前 turn 收敛并返回 `status: detached`，不得取消可恢复的远端状态。
-- 默认最多等待 active remote turn 12 秒。运行长任务的部署可以设置 provider-neutral 的 `BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS`（12,000 到 86,400,000 毫秒）；BotMux 会把同一 drain deadline 传给 Remote Runner backend，并同步派生 daemon、fleet supervisor 和 CLI 的外层等待预算，避免普通 provider operation timeout 或任一外层 supervisor 提前截断 active turn。provider 发出 `final` 只表示模型执行完成，daemon 还会在提交 detach 前等待对应的用户可见最终回复完成投递；这段固定 20 秒的 delivery drain 预算同样包含在全部外层预算中，避免 worker 退出后首个发送尝试才发现原 generation 已失效。该配置只控制正常退出的 active-turn 等待时间，不改变 turn 自身超时，也不会把取消作为超时后的兜底行为。进程编排层的 termination grace 必须大于派生出的 fleet hard-stop 预算。
+- `BOTMUX_REMOTE_SHUTDOWN_MODE` 默认是 `drain`。该模式下 Daemon 正常退出使用 `detach`：provider 应等待当前 turn 收敛并返回 `status: detached`，不得取消可恢复的远端状态。
+- `handoff` 模式只允许与 durable coordination `primary` 及 `turn_recovery` capability 同时使用。Daemon 先停止新准入，为每个 Remote Runner Session 持久化一个受信 handoff control，再停止本副本的 control consumer、detach 本地 worker/observer 并释放 canonical Session route lease。继任副本通过 control lane 主动取得 lease 并 reattach 同一 remote generation，不需要等待下一条用户消息；它在 `recoveredTurn` 和 worker readiness 都成立后才结算 handoff 并恢复输出。该模式不取消远端 turn，也不等待其完成，适合多副本滚动替换；缺少任一 fencing/recovery 前提时启动失败，而不是退回可能丢 turn 的快速退出。
+- `drain` 模式默认最多等待 active remote turn 12 秒。运行长任务的部署可以设置 provider-neutral 的 `BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS`（12,000 到 86,400,000 毫秒）；BotMux 会把同一 drain deadline 传给 Remote Runner backend，并同步派生 daemon、fleet supervisor 和 CLI 的外层等待预算，避免普通 provider operation timeout 或任一外层 supervisor 提前截断 active turn。provider 发出 `final` 只表示模型执行完成，daemon 还会在提交 detach 前等待对应的用户可见最终回复完成投递；这段固定 20 秒的 delivery drain 预算同样包含在全部外层预算中，避免 worker 退出后首个发送尝试才发现原 generation 已失效。该配置只控制 `drain` 的 active-turn 等待时间，不改变 turn 自身超时，也不会把取消作为超时后的兜底行为。进程编排层的 termination grace 必须大于派生出的 fleet hard-stop 预算。
 - 如果 shutdown 在持久化阶段失败，BotMux 使用 `reattach` 回滚已经确认的 `detach`；回滚没有得到
   `status: ready` 时继续保持写入门禁，不把未知状态伪装成已恢复。
 - 当前 worker 不存在时，BotMux 不会猜测 provider 的控制面 API，也不会直接把仍为 active 的记录改成 closed；应先恢复同一 provider worker，再执行显式关闭。

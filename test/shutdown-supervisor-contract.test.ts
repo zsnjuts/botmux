@@ -6,6 +6,7 @@ import {
   DAEMON_SHUTDOWN_OVERHEAD_MS,
   DAEMON_WORKER_EXIT_GRACE_MS,
   DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS,
+  DEFAULT_REMOTE_SHUTDOWN_MODE,
   DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
   deriveShutdownBudgets,
   FLEET_DAEMON_EXIT_WAIT_MS,
@@ -13,18 +14,21 @@ import {
   FLEET_SUCCESSOR_SETTLE_MS,
   MAX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
   MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  parseRemoteShutdownMode,
   parseRemoteShutdownDrainTimeoutMs,
   REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
   REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
   REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_MODE,
 } from '../src/core/shutdown-budgets.js';
 import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from '../src/core/fleet-supervisor-policy.js';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
 // Contract for the built-in fleet supervisor (pm2-retired). The fleet lifecycle
 // (start/stop/restart/status/logs/start-bot/stop-bot) runs under the supervisor;
@@ -74,6 +78,45 @@ describe('graceful shutdown supervisor contract', () => {
       expect(() => parseRemoteShutdownDrainTimeoutMs(value), value).toThrow();
     }
     expect(() => parseRemoteShutdownDrainTimeoutMs('86400001')).toThrow();
+  });
+
+  it('keeps remote shutdown drain as the default and strictly parses handoff mode', () => {
+    expect(REMOTE_SHUTDOWN_MODE).toBe(DEFAULT_REMOTE_SHUTDOWN_MODE);
+    expect(parseRemoteShutdownMode(undefined)).toBe('drain');
+    expect(parseRemoteShutdownMode('drain')).toBe('drain');
+    expect(parseRemoteShutdownMode('handoff')).toBe('handoff');
+    for (const value of ['', 'fast', ' handoff', 'handoff ', 'DRAIN']) {
+      expect(() => parseRemoteShutdownMode(value), value).toThrow();
+    }
+  });
+
+  // 源码结构护栏(K3)：daemon shutdown 闭包没有行为 seam；这里守的是 active turn
+  // 滚动发布的数据安全顺序，避免先 detach/release 再持久化唤醒事件造成无人接管。
+  it('persists peer wakeup, stops the retiring consumer, then detaches and releases', () => {
+    const handoff = daemon.indexOf("REMOTE_SHUTDOWN_MODE === 'handoff'");
+    const enqueue = daemon.indexOf('coordinationStore.enqueueInbox(', handoff);
+    const controlStop = daemon.indexOf('runtime.control?.stop(', enqueue);
+    const detach = daemon.indexOf('detachWorkerForTransfer(ds)', controlStop);
+    const release = daemon.indexOf('runtime.session.releaseLease(canonicalKey)', detach);
+    const runtimeStop = daemon.indexOf('runtime.stop(remainingBudget())', release);
+    expect(handoff).toBeGreaterThan(0);
+    expect(enqueue).toBeGreaterThan(handoff);
+    expect(controlStop).toBeGreaterThan(enqueue);
+    expect(detach).toBeGreaterThan(controlStop);
+    expect(release).toBeGreaterThan(detach);
+    expect(runtimeStop).toBeGreaterThan(release);
+  });
+
+  // 源码结构护栏(K3)：startup guard 位于 daemon 闭包内；这里防止 handoff 在缺少
+  // distributed fencing 或 turn recovery 时静默启动并造成 active turn 丢失。
+  it('fails closed when handoff lacks primary coordination or turn recovery', () => {
+    const guard = daemon.indexOf("REMOTE_SHUTDOWN_MODE === 'handoff'");
+    expect(daemon.slice(guard, guard + 1_200)).toContain(
+      'BOTMUX_REMOTE_SHUTDOWN_MODE=handoff requires durable coordination primary mode',
+    );
+    expect(daemon.slice(guard, guard + 1_200)).toContain(
+      'BOTMUX_REMOTE_SHUTDOWN_MODE=handoff requires remoteRunner turn_recovery',
+    );
   });
 
   it('derives every outer wait budget from a widened remote drain', () => {

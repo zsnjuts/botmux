@@ -100,6 +100,45 @@ describe('durable Lark session control envelope', () => {
     },
   );
 
+  it('accepts handoff only from a trusted host with the retiring owner identity', () => {
+    const event = durableDirectSessionControlEvent({
+      source: 'trusted-host',
+      larkAppId: 'cli_test',
+      operationId: 'trusted-host.session-control:cli_test:session-1:owner-1:handoff',
+      action: 'handoff',
+      sessionId: 'session-1',
+      rootId: 'om_root',
+      cardMessageId: 'om_card',
+      retiringOwnerId: 'owner-1',
+      now: 10,
+    });
+    expect(parseDurableSessionControlClaim(claim(event))).toMatchObject({
+      source: 'trusted-host',
+      action: 'handoff',
+      retiringOwnerId: 'owner-1',
+    });
+    expect(() => durableDirectSessionControlEvent({
+      source: 'trusted-host',
+      larkAppId: 'cli_test',
+      operationId: 'trusted-host.session-control:cli_test:session-1:owner-1:missing',
+      action: 'handoff',
+      sessionId: 'session-1',
+      rootId: 'om_root',
+      now: 10,
+    })).toThrow(/retiringOwnerId/);
+    expect(() => durableDirectSessionControlEvent({
+      source: 'lark-command',
+      larkAppId: 'cli_test',
+      operationId: 'lark-command.session-control:cli_test:session-1:handoff',
+      action: 'handoff',
+      sessionId: 'session-1',
+      rootId: 'om_root',
+      operatorOpenId: 'ou_operator',
+      retiringOwnerId: 'owner-1',
+      now: 10,
+    })).toThrow(/trusted host source/);
+  });
+
   it('rejects a command control without a Lark user principal', () => {
     expect(() => durableDirectSessionControlEvent({
       source: 'lark-command',

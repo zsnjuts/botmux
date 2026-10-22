@@ -9,6 +9,20 @@
  * one provider-neutral environment variable; every outer budget is derived
  * below so the daemon cannot silently outlive its supervisor.
  */
+export const REMOTE_SHUTDOWN_MODE_ENV = 'BOTMUX_REMOTE_SHUTDOWN_MODE';
+export type RemoteShutdownMode = 'drain' | 'handoff';
+export const DEFAULT_REMOTE_SHUTDOWN_MODE: RemoteShutdownMode = 'drain';
+
+export function parseRemoteShutdownMode(value: string | undefined): RemoteShutdownMode {
+  if (value === undefined) return DEFAULT_REMOTE_SHUTDOWN_MODE;
+  if (value === 'drain' || value === 'handoff') return value;
+  throw new Error(`${REMOTE_SHUTDOWN_MODE_ENV} must be drain or handoff`);
+}
+
+export const REMOTE_SHUTDOWN_MODE = parseRemoteShutdownMode(
+  process.env[REMOTE_SHUTDOWN_MODE_ENV],
+);
+
 export const REMOTE_SHUTDOWN_DRAIN_TIMEOUT_ENV = 'BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS';
 export const DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS = 12_000;
 export const MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS = 12_000;
