@@ -393,7 +393,10 @@ describe('remote runner explicit close', () => {
     ).resolves.toBe(true);
     expect(fork).toHaveBeenCalledTimes(1);
     expect(fork.mock.calls[0]?.[1]).toBe('');
-    expect(fork.mock.calls[0]?.[2]).toBe(true);
+    expect(fork.mock.calls[0]?.[2]).toEqual({
+      resume: true,
+      remoteResumeMode: 'close-control',
+    });
     expect(fork.mock.calls[0]?.[3]).toMatchObject({
       deferDuringDeviceIsolation: false,
       onAdmission: expect.any(Function),
