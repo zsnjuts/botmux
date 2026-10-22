@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
 import type { DaemonSession } from '../core/types.js';
-import { sessionKey } from '../core/types.js';
+import { sessionAnchorId, sessionKey } from '../core/types.js';
 import type { Session } from '../types.js';
 import type { DurableCoordinationStore, DurableJson } from './durable-coordination.js';
 import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
@@ -193,7 +193,17 @@ export function createDurableLarkSessionControlRuntime(
         || options.privateCard
         || value?.visibility === 'private') return false;
     const canonical = await options.store.readSession(sessionKey(rootId, options.larkAppId));
-    if (!canonical) return false;
+    if (!canonical) {
+      if (actionType !== 'toggle_display'
+          || (value?.target_display_mode !== 'hidden'
+            && value?.target_display_mode !== 'screenshot')) return false;
+      const local = options.findActiveSession(sessionId);
+      return !!local
+        && local.larkAppId === options.larkAppId
+        && local.session.status === 'active'
+        && sessionAnchorId(local) === rootId
+        && local.streamCardId === cardMessageId;
+    }
     const session = parseDurablePrimarySessionRecord(canonical).session;
     if (!session || session.larkAppId !== options.larkAppId
         || session.sessionId !== sessionId
