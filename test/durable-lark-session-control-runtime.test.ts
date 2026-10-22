@@ -377,6 +377,61 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
+  it('authorizes an early display toggle from the local card owner before canonical admission', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-display-pre-admission-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const persisted = session();
+    const active = {
+      session: persisted,
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      streamCardId: 'om_card',
+      displayMode: 'hidden',
+    } as DaemonSession;
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [active],
+      findActiveSession: sessionId => (sessionId === active.session.sessionId ? active : undefined),
+      listPersistedSessions: () => [persisted],
+      getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not called' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = displayControl();
+
+    expect(await runtime.authorizeBeforeAck(input.data)).toBe(true);
+    expect(await runtime.authorizeBeforeAck({
+      ...input.data,
+      context: { open_message_id: 'om_other_card' },
+    })).toBe(false);
+    expect(await runtime.authorizeBeforeAck({
+      ...input.data,
+      action: {
+        value: {
+          action: 'toggle_display',
+          target_display_mode: 'screenshot',
+          session_id: 'session-1',
+          root_id: 'om_other_root',
+        },
+      },
+    })).toBe(false);
+    expect(await runtime.authorizeBeforeAck(control().data)).toBe(false);
+    await facade.stop();
+    await store.close();
+  });
+
   it('routes an idempotent display target to the live owner and durably patches the card', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-display-owner-'));
     tempDirs.push(dir);
