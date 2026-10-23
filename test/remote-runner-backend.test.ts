@@ -17,6 +17,7 @@ const sessionToolRunner = resolve('test/fixtures/remote-runner-session-tool.mjs'
 const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
 const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
 const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.mjs');
+const orphanProofRunner = resolve('test/fixtures/remote-runner-orphan-proof.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -618,6 +619,58 @@ describe('RemoteRunnerBackend', () => {
       remoteResumeMode: 'rebuild',
     });
 
+    await exited;
+    expect(backend.getBackendState()).toEqual(initialState);
+  });
+
+  it('accepts only an advanced missing generation for orphan reconciliation', async () => {
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'orphan-proof',
+      generation: 4,
+      remoteSessionId: 'remote-expired',
+      agentThreadId: 'thread-existing',
+      providerState: { sessionKey: 'logical-session' },
+    };
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'orphan-proof',
+      requiredCapabilities: ['orphan_reconciliation'],
+    }, 'session-valid-orphan-proof', initialState);
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    backend.spawn(process.execPath, [orphanProofRunner], {
+      cwd: process.cwd(),
+      cols: 120,
+      rows: 40,
+      env: { ...process.env } as Record<string, string>,
+      remoteResumeMode: 'orphan-reconcile',
+    });
+    await ready;
+    expect(backend.getBackendState()).toMatchObject({ generation: 5 });
+    expect(backend.getBackendState()?.remoteSessionId).toBeUndefined();
+  });
+
+  it('fails closed when orphan reconciliation returns the live baseline', async () => {
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'orphan-proof',
+      generation: 4,
+      remoteSessionId: 'remote-still-present',
+      providerState: { sessionKey: 'logical-session' },
+    };
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'orphan-proof',
+      requiredCapabilities: ['orphan_reconciliation'],
+    }, 'session-invalid-orphan-proof', initialState);
+    children.push(backend);
+    const exited = once<void>(cb => backend.onExit(() => cb()));
+    backend.spawn(process.execPath, [orphanProofRunner], {
+      cwd: process.cwd(),
+      cols: 120,
+      rows: 40,
+      env: { ...process.env } as Record<string, string>,
+      remoteResumeMode: 'orphan-reconcile',
+    });
     await exited;
     expect(backend.getBackendState()).toEqual(initialState);
   });

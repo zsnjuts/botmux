@@ -588,6 +588,13 @@ export class RemoteRunnerBackend implements SessionBackend {
         && ready.state.generation <= this.state.generation) {
       throw new Error('remote runner rebuild did not advance the backend generation');
     }
+    if (opts.remoteResumeMode === 'orphan-reconcile'
+        && this.state
+        && (ready.state.provider !== this.state.provider
+          || ready.state.generation <= this.state.generation
+          || !!ready.state.remoteSessionId)) {
+      throw new Error('remote runner orphan reconciliation did not prove a missing remote generation');
+    }
     if (!this.applyState(ready.state)) throw new Error('remote runner ready state is invalid');
     this.ready = true;
     this.readyCb?.();
