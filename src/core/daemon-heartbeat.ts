@@ -10,14 +10,25 @@
  * A daemon that is down leaves a stale file, which is ignored (restarting is
  * safe when a daemon isn't even running).
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
+import type { LarkConnectionHealth } from '../im/lark/transport/connection.js';
 
 export interface Heartbeat {
+  schemaVersion?: 2;
   larkAppId: string;
   busyCount: number;
   at: string; // ISO 8601
+  pid?: number;
+  eventLoopLagMs?: number;
+  larkConnection?: LarkConnectionHealth;
+}
+
+export interface HeartbeatDetails {
+  pid?: number;
+  eventLoopLagMs?: number;
+  larkConnection?: LarkConnectionHealth;
 }
 
 /** A heartbeat older than this is treated as "daemon not reporting" → ignored.
@@ -28,13 +39,26 @@ export function heartbeatDirIn(dir: string): string {
   return join(dir, 'heartbeats');
 }
 
-export function writeHeartbeatTo(dir: string, larkAppId: string, busyCount: number, atIso: string): void {
+export function writeHeartbeatTo(
+  dir: string,
+  larkAppId: string,
+  busyCount: number,
+  atIso: string,
+  details: HeartbeatDetails = {},
+): void {
   const hbDir = heartbeatDirIn(dir);
   if (!existsSync(hbDir)) mkdirSync(hbDir, { recursive: true });
   const path = join(hbDir, `${sanitize(larkAppId)}.json`);
   const tmp = `${path}.${process.pid}.tmp`;
-  const beat: Heartbeat = { larkAppId, busyCount, at: atIso };
-  writeFileSync(tmp, JSON.stringify(beat));
+  const beat: Heartbeat = {
+    schemaVersion: 2,
+    larkAppId,
+    busyCount,
+    at: atIso,
+    ...details,
+  };
+  writeFileSync(tmp, JSON.stringify(beat), { mode: 0o600 });
+  chmodSync(tmp, 0o600);
   renameSync(tmp, path);
 }
 
@@ -75,8 +99,8 @@ function sanitize(larkAppId: string): string {
 
 // ---- default-dir wrappers (production wiring) ----
 
-export function writeHeartbeat(larkAppId: string, busyCount: number): void {
-  writeHeartbeatTo(config.session.dataDir, larkAppId, busyCount, new Date().toISOString());
+export function writeHeartbeat(larkAppId: string, busyCount: number, details: HeartbeatDetails = {}): void {
+  writeHeartbeatTo(config.session.dataDir, larkAppId, busyCount, new Date().toISOString(), details);
 }
 
 export function anyDaemonBusy(nowMs: number = Date.now()): boolean {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -57,5 +57,33 @@ describe('daemon heartbeat / anyDaemonBusy', () => {
   it('writes atomically (no .tmp leftover)', () => {
     writeHeartbeatTo(dir, 'cli_app_a', 1, iso(T0));
     expect(readdirSync(heartbeatDirIn(dir)).filter(f => f.endsWith('.tmp'))).toEqual([]);
+    expect(statSync(join(heartbeatDirIn(dir), 'cli_app_a.json')).mode & 0o777).toBe(0o600);
+  });
+
+  it('publishes process, event-loop and Lark connection health without changing the busy gate', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 0, iso(T0), {
+      pid: 1234,
+      eventLoopLagMs: 250,
+      larkConnection: {
+        generation: 2,
+        state: 'connected',
+        observedAt: T0,
+        transitionedAt: T0 - 1_000,
+        startedAt: T0 - 2_000,
+        reconnectAttempts: 0,
+        lastConnectTime: T0 - 1_500,
+      },
+    });
+
+    const beat = JSON.parse(readFileSync(join(heartbeatDirIn(dir), 'cli_app_a.json'), 'utf8'));
+    expect(beat).toMatchObject({
+      schemaVersion: 2,
+      larkAppId: 'cli_app_a',
+      busyCount: 0,
+      pid: 1234,
+      eventLoopLagMs: 250,
+      larkConnection: { generation: 2, state: 'connected' },
+    });
+    expect(anyDaemonBusyTo(dir, T0 + 5_000)).toBe(false);
   });
 });

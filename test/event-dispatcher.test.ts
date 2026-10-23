@@ -178,6 +178,7 @@ vi.mock('../src/services/p2p-force-topic-store.js', () => ({
 // Capture the registered event handlers from EventDispatcher.register()
 let capturedHandlers: Record<string, Function> = {};
 let capturedWsClientOptions: Record<string, any> | undefined;
+let createdWsClients: any[] = [];
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class MockEventDispatcher {
@@ -189,8 +190,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   class MockWSClient {
     constructor(options: Record<string, any>) {
       capturedWsClientOptions = options;
+      createdWsClients.push(this);
     }
     start = vi.fn(async () => {});
+    close = vi.fn(() => {});
     getConnectionStatus = vi.fn(() => ({ state: 'connected', reconnectAttempts: 0 }));
   }
   return {
@@ -242,6 +245,7 @@ beforeEach(() => {
     dev: 1, ino: 1, size: 1, mtimeMs: 1, ctimeMs: 1,
   });
   capturedWsClientOptions = undefined;
+  createdWsClients = [];
   config.daemon.forwardFollowupWaitMs = 0;
   mockReadFileSync.mockReset().mockReturnValue('[]');
   mockListChatMessages.mockReset().mockResolvedValue([]);
@@ -1097,8 +1101,8 @@ describe('startLarkEventDispatcher — connection wiring', () => {
       appSecret: 'secret',
       domain: brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn',
     });
-    expect(client.start).toHaveBeenCalledOnce();
-    expect(client.start).toHaveBeenCalledWith({ eventDispatcher: expect.any(Lark.EventDispatcher) });
+    expect(createdWsClients[0].start).toHaveBeenCalledOnce();
+    expect(createdWsClients[0].start).toHaveBeenCalledWith({ eventDispatcher: expect.any(Lark.EventDispatcher) });
     expect(capturedHandlers['im.message.receive_v1']).toBeTypeOf('function');
     expect(capturedHandlers['card.action.trigger']).toBeTypeOf('function');
   });
@@ -11083,11 +11087,12 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     vi.useFakeTimers();
     const reconnectHandlers = makeHandlers();
     reconnectHandlers.handleCardAction.mockResolvedValue({ toast: { type: 'success', content: 'accepted' } });
-    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', reconnectHandlers) as any;
-    expect(ws.start).toHaveBeenCalledTimes(1);
-    ws.getConnectionStatus.mockReturnValue({ state: 'failed', reconnectAttempts: 9 });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', reconnectHandlers);
+    expect(createdWsClients[0].start).toHaveBeenCalledTimes(1);
+    createdWsClients[0].getConnectionStatus.mockReturnValue({ state: 'failed', reconnectAttempts: 9 });
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(ws.start).toHaveBeenCalledTimes(2);
+    expect(createdWsClients).toHaveLength(2);
+    expect(createdWsClients[1].start).toHaveBeenCalledTimes(1);
 
     const result = await capturedHandlers['card.action.trigger']({
       event_id: 'evt-after-reconnect',
@@ -11963,28 +11968,30 @@ describe('ensureBotOpenId — dedup', () => {
 describe('startLarkEventDispatcher — 长连接死后自愈 (reconnect-exhausted recovery)', () => {
   it('SDK 重连耗尽 (state=failed) 时，定时探测并重新 start() 重建长连接', async () => {
     vi.useFakeTimers();
-    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers()) as any;
+    startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
     // 启动时的首次握手
-    expect(ws.start).toHaveBeenCalledTimes(1);
+    expect(createdWsClients[0].start).toHaveBeenCalledTimes(1);
 
     // 模拟主机长断网：SDK 重连预算耗尽、永久放弃，但进程仍 online（PM2 不会兜底）
-    ws.getConnectionStatus.mockReturnValue({ state: 'failed', reconnectAttempts: 9 });
+    createdWsClients[0].getConnectionStatus.mockReturnValue({ state: 'failed', reconnectAttempts: 9 });
 
-    // 健康检查每 60s 一次：发现 failed → 重新 start() 重建
+    // 健康检查每 60s 一次：发现 failed → 新建一个 SDK client generation
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(ws.start).toHaveBeenCalledTimes(2);
+    expect(createdWsClients).toHaveLength(2);
+    expect(createdWsClients[1].start).toHaveBeenCalledTimes(1);
 
     vi.useRealTimers();
   });
 
   it('连接健康 (state=connected) 时不重建，不打断 SDK 自身的重连', async () => {
     vi.useFakeTimers();
-    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers()) as any;
-    expect(ws.start).toHaveBeenCalledTimes(1);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
+    expect(createdWsClients[0].start).toHaveBeenCalledTimes(1);
 
     // getConnectionStatus 默认返回 connected；推进多个周期都不应触发重建
     await vi.advanceTimersByTimeAsync(180_000);
-    expect(ws.start).toHaveBeenCalledTimes(1);
+    expect(createdWsClients).toHaveLength(1);
+    expect(createdWsClients[0].start).toHaveBeenCalledTimes(1);
 
     vi.useRealTimers();
   });
