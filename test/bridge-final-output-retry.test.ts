@@ -1345,6 +1345,48 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sent).toContain('<at id=ou_session_owner></at>');
   });
 
+  it('ordinary final_output addresses the exact human turn instead of the long-lived session owner', async () => {
+    const sessionReply = vi.fn(async () => 'om_current_turn');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.ownerOpenId = 'ou_previous_owner';
+    ds.session.replyTargets = {
+      'turn-1': {
+        updatedAt: new Date().toISOString(),
+        senderOpenId: 'ou_current_human',
+        participants: [{ openId: 'ou_current_human', isBot: false }],
+      },
+    };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    const sent = String(sessionReply.mock.calls[0][1]);
+    expect(sent).toContain('<at id=ou_current_human></at>');
+    expect(sent).not.toContain('ou_previous_owner');
+  });
+
+  it('ordinary final_output does not wake a bot reply target and retains the human owner fallback', async () => {
+    const sessionReply = vi.fn(async () => 'om_bot_turn');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.ownerOpenId = 'ou_session_owner';
+    ds.session.replyTargets = {
+      'turn-1': {
+        updatedAt: new Date().toISOString(),
+        senderOpenId: 'ou_calling_bot',
+        participants: [{ openId: 'ou_calling_bot', isBot: true }],
+      },
+    };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    const sent = String(sessionReply.mock.calls[0][1]);
+    expect(sent).toContain('<at id=ou_session_owner></at>');
+    expect(sent).not.toContain('ou_calling_bot');
+  });
+
   it('ordinary (non-failed) final_output never adds the admin fallback mention', async () => {
     vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
     const sessionReply = vi.fn(async () => 'om_ok_answer');

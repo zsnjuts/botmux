@@ -1043,6 +1043,7 @@ import {
 } from './services/vc-meeting-feed-metadata-store.js';
 import { VcMeetingTerminalReconciler } from './services/vc-meeting-terminal-reconciler.js';
 import {
+  classifyVcMeetingManagedTurn,
   resolveVcMeetingImTurnOrigin,
   verifyVcMeetingManagedOriginClaim,
   evaluateVcMeetingManagedSend,
@@ -30364,8 +30365,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       onXpiSharedCwdTurnTerminal(ds, terminal, context);
       // VC reconcile first: it is in-memory and latency-sensitive, and must not
       // sit behind a synchronous SQLite write. (Master did only this enqueue.)
-      const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
-      if (terminal.dispatchAttempt !== undefined && enqueued?.accepted) {
+      const managedTerminal = classifyVcMeetingManagedTurn(
+        config.session.dataDir,
+        {
+          receiverSessionId: ds.session.sessionId,
+          receiverSession: !!ds.session.vcMeetingReceiver,
+          turnId: terminal.turnId,
+          dispatchAttempt: terminal.dispatchAttempt,
+        },
+      );
+      const enqueued = managedTerminal.kind === 'ordinary'
+        ? undefined
+        : vcMeetingTerminalReconciler?.enqueue(terminal, context);
+      if (managedTerminal.kind !== 'ordinary' && enqueued?.accepted) {
         logger.info(
           `[vc-delivery] terminal queued ${terminal.status} turn=${terminal.turnId.slice(0, 12)} `
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
