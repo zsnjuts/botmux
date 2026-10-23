@@ -1,0 +1,61 @@
+name: Distributed lineage
+
+on:
+  pull_request:
+    branches:
+      - distributed
+  push:
+    branches:
+      - distributed
+    tags:
+      - 'distributed/v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-lineage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify distributed history
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          DELETED: ${{ github.event.deleted }}
+          FORCED: ${{ github.event.forced }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            node scripts/verify-distributed-lineage.mjs --candidate HEAD
+            exit 0
+          fi
+
+          if [[ "$DELETED" == "true" ]]; then
+            echo "distributed-lineage: protected refs cannot be deleted" >&2
+            exit 1
+          fi
+          if [[ "$FORCED" == "true" ]]; then
+            echo "distributed-lineage: force-pushes are not allowed" >&2
+            exit 1
+          fi
+
+          if [[ "$REF_TYPE" == "branch" ]]; then
+            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+              echo "distributed-lineage: the distributed branch must already exist" >&2
+              exit 1
+            fi
+            node scripts/verify-distributed-lineage.mjs --candidate "$AFTER" --previous "$BEFORE"
+            node scripts/verify-distributed-lineage.mjs --candidate "$AFTER"
+            exit 0
+          fi
+
+          node scripts/verify-distributed-lineage.mjs --tag "$REF_NAME" --candidate "$AFTER"
