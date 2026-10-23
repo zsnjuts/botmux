@@ -41,6 +41,7 @@ import { buildDashboardUrls, reportDashboardUrls } from './core/dashboard-url.js
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
+import { getLarkConnectionHealth } from './im/lark/transport/connection.js';
 import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import {
@@ -31882,17 +31883,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions
   // are mid-CLI-turn so the primary daemon's maintenance gate sees activity
   // across all bots (one daemon per bot). See core/daemon-heartbeat.ts.
+  const heartbeatIntervalMs = 15_000;
+  let nextHeartbeatDueAt = Date.now();
   const writeBusyHeartbeat = () => {
     try {
+      const now = Date.now();
       let busy = 0;
       for (const [, ds] of activeSessions) {
         if (ds.worker && !ds.worker.killed && ds.lastScreenStatus === 'working') busy++;
       }
-      writeHeartbeat(cfg.larkAppId, busy);
+      writeHeartbeat(cfg.larkAppId, busy, {
+        pid: process.pid,
+        eventLoopLagMs: Math.max(0, now - nextHeartbeatDueAt),
+        larkConnection: getLarkConnectionHealth(cfg.larkAppId),
+      });
+      nextHeartbeatDueAt = now + heartbeatIntervalMs;
     } catch { /* best-effort */ }
   };
   writeBusyHeartbeat();
-  const maintenanceHeartbeat = setInterval(writeBusyHeartbeat, 15_000);
+  const maintenanceHeartbeat = setInterval(writeBusyHeartbeat, heartbeatIntervalMs);
   maintenanceHeartbeat.unref?.();
 
   // Auto-update / auto-restart and the restart-report DM run only on the
