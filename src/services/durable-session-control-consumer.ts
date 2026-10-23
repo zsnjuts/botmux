@@ -279,23 +279,26 @@ export function startDurableSessionControlConsumer(
       let claim: InboxClaim | undefined;
       try {
         const partitionKeys = nextOwnedPartitionBatch();
-        if (partitionKeys.length > 0) {
-          claim = await options.store.claimNextInbox({
-            workerId: slotWorkerId,
-            lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
-            partitionKeys,
-            leaseDurationMs,
-          });
-        }
-        if (!claim && partitionKeyPrefix
+        if (partitionKeyPrefix
             && now() - lastFallbackClaimAt >= fallbackClaimIntervalMs) {
-          // Prefix fallback is a failover path, not an equal-priority race with
-          // the exact owner. Only one slot probes it per interval.
+          // Give exact owners the initial interval, then reserve one periodic
+          // prefix-first probe. If locally owned partitions are continuously
+          // retryable, probing the prefix only after an exact miss starves
+          // canonical-only failover controls forever. The shared timestamp
+          // still limits this to one slot per interval.
           lastFallbackClaimAt = now();
           claim = await options.store.claimNextInbox({
             workerId: slotWorkerId,
             lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
             partitionKeyPrefix,
+            leaseDurationMs,
+          });
+        }
+        if (!claim && partitionKeys.length > 0) {
+          claim = await options.store.claimNextInbox({
+            workerId: slotWorkerId,
+            lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+            partitionKeys,
             leaseDurationMs,
           });
         }
