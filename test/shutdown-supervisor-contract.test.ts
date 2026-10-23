@@ -107,6 +107,8 @@ describe('graceful shutdown supervisor contract', () => {
     expect(runtimeStop).toBeGreaterThan(release);
   });
 
+  // 源码结构护栏(K3)：shutdown budget 仍位于 daemon 闭包内；这里防止扩大的外层
+  // drain 预算越过 durable stop API 的 300 秒上限并中断滚动热加载。
   it('clamps widened outer shutdown budgets before calling durable stop APIs', () => {
     const helper = daemon.indexOf('const durableStopBudget = (): number => Math.min(300_000, remainingBudget())');
     expect(helper).toBeGreaterThan(0);
