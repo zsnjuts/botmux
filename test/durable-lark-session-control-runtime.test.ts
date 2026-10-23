@@ -11,6 +11,7 @@ import { createDurableSessionFacade } from '../src/services/durable-session-faca
 import { createDurableSessionControlDispatch } from '../src/services/durable-session-control-dispatch.js';
 import {
   durableDirectSessionControlEvent,
+  durableInteractiveSessionControlPartition,
   durableLarkSessionControlEvent,
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
@@ -64,7 +65,7 @@ function control(action: 'close' | 'resume' = 'close') {
   const event = durableLarkSessionControlEvent({
     larkAppId: 'cli_test',
     eventId: durableLarkSessionControlEventId('cli_test', `evt_${action}`),
-    partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+    partitionKey: durableInteractiveSessionControlPartition('cli_test', 'session-1'),
     data,
     now: 2,
   });
@@ -95,7 +96,7 @@ function displayControl(target: 'hidden' | 'screenshot' = 'screenshot') {
   const event = durableLarkSessionControlEvent({
     larkAppId: 'cli_test',
     eventId: durableLarkSessionControlEventId('cli_test', `evt_display_${target}`),
-    partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+    partitionKey: durableInteractiveSessionControlPartition('cli_test', 'session-1'),
     data,
     now: 2,
   });
@@ -515,7 +516,7 @@ describe('durable Lark session control runtime', () => {
     });
     operatorAllowed = true;
     expect(runtime.ownedPartitionKeys()).toEqual([
-      'lark-session-control:cli_test:session-1',
+      'lark-session-control:cli_test:interactive:session-1',
     ]);
     const dispatch = createDurableSessionControlDispatch({
       store,
@@ -543,7 +544,7 @@ describe('durable Lark session control runtime', () => {
     });
     now = 11;
     expect(runtime.ownedPartitionKeys()).toEqual([
-      'lark-session-control:cli_test:session-1',
+      'lark-session-control:cli_test:interactive:session-1',
     ]);
     await facade.stop();
     await store.close();
@@ -866,7 +867,7 @@ describe('durable Lark session control runtime', () => {
     expect(materializeClosedSession).toHaveBeenCalledOnce();
     expect(resumeSession).toHaveBeenCalledWith('session-1');
     expect(runtime.ownedPartitionKeys()).toEqual([
-      'lark-session-control:cli_test:session-1',
+      'lark-session-control:cli_test:interactive:session-1',
     ]);
     const canonical = await store.readSession('om_root::cli_test');
     expect(parseDurablePrimarySessionRecord(canonical!)).toMatchObject({

@@ -105,8 +105,8 @@ import type {
   DurableLarkPostAdmissionOutput,
 } from '../../services/durable-lark-canonical-dispatch.js';
 import {
+  durableInteractiveSessionControlPartition,
   durableLarkSessionControlEventId,
-  durableLarkSessionControlPartition,
 } from '../../services/durable-lark-session-control.js';
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
 import { shouldPersistTriggeredMessage } from '../../services/durable-primary-turn-admission.js';
@@ -6263,7 +6263,7 @@ export function createLarkEventDispatcherRuntime(
               throw new Error('stable card interaction/session identity is missing');
             }
             const eventId = durableLarkSessionControlEventId(larkAppId, stableEventId);
-            const partitionKey = durableLarkSessionControlPartition(larkAppId, sessionId);
+            const partitionKey = durableInteractiveSessionControlPartition(larkAppId, sessionId);
             const inserted = await runtimeOptions.enqueuePrimaryControl({ eventId, partitionKey, data });
             if ((inserted as { kind?: unknown } | undefined)?.kind === 'duplicate') {
               return {

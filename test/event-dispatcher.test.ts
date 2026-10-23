@@ -2535,7 +2535,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       expect(enqueuePrimaryControl).toHaveBeenCalledTimes(1);
       expect(enqueuePrimaryControl).toHaveBeenCalledWith(expect.objectContaining({
         eventId: `card.action.trigger:${MY_APP_ID}:evt_${action}_1`,
-        partitionKey: `lark-session-control:${MY_APP_ID}:session-primary`,
+        partitionKey: `lark-session-control:${MY_APP_ID}:interactive:session-primary`,
       }));
       // The enqueued payload must already be normalized, including the nested
       // event of an envelope, because the durable ingress validates strictly.

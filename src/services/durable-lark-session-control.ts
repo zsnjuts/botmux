@@ -138,6 +138,17 @@ export function durableLarkSessionControlPartition(larkAppId: string, sessionId:
   return `${durableLarkSessionControlPartitionPrefix(larkAppId)}${bounded(sessionId, 'sessionId', 256)}`;
 }
 
+/** User-authorized card/command controls need their own FIFO. Rows written by
+ * an older release may contain a long-backed-off orphan proof in the former
+ * ordinary Session partition; keeping new interactive work there would carry
+ * that head-of-line block across the rolling upgrade indefinitely. */
+export function durableInteractiveSessionControlPartition(
+  larkAppId: string,
+  sessionId: string,
+): string {
+  return `${durableLarkSessionControlPartitionPrefix(larkAppId)}interactive:${bounded(sessionId, 'sessionId', 256)}`;
+}
+
 /** Background orphan proofs can back off for a long time. Keep their FIFO
  * partition separate from explicit card/command lifecycle controls so an
  * inconclusive proof never head-of-line blocks a later user-authorized close.
@@ -257,7 +268,9 @@ export function durableDirectSessionControlEvent(input: {
     lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
     partitionKey: input.action === 'terminalize_orphan'
       ? durableRemoteOrphanControlPartition(larkAppId, sessionId)
-      : durableLarkSessionControlPartition(larkAppId, sessionId),
+      : input.action === 'handoff'
+        ? durableLarkSessionControlPartition(larkAppId, sessionId)
+        : durableInteractiveSessionControlPartition(larkAppId, sessionId),
     payload: payload as unknown as DurableJson,
     visibleAt: now,
     createdAt: now,
@@ -304,12 +317,14 @@ export function parseDurableSessionControlClaim(
     ? bounded(payload.retiringOwnerId, 'retiringOwnerId', 256)
     : undefined;
   const ordinaryPartition = durableLarkSessionControlPartition(larkAppId, sessionId);
-  // Rows persisted before orphan partition isolation remain valid durable
-  // work. Accept their former Session partition until they settle; all newly
-  // constructed orphan controls use the isolated partition above.
+  // Rows persisted before control-class partition isolation remain valid
+  // durable work. Accept their former Session partition until they settle;
+  // newly constructed user and orphan controls use isolated partitions.
   const expectedPartitions = action === 'terminalize_orphan'
     ? [durableRemoteOrphanControlPartition(larkAppId, sessionId), ordinaryPartition]
-    : [ordinaryPartition];
+    : action === 'close' || action === 'resume'
+      ? [durableInteractiveSessionControlPartition(larkAppId, sessionId), ordinaryPartition]
+      : [ordinaryPartition];
   if ((!rootId.startsWith('om_') && !rootId.startsWith('oc_'))
       || (source === 'lark-command' && !operatorOpenId.startsWith('ou_'))
       || (source === 'trusted-host' && operatorOpenId !== 'trusted-host')
@@ -350,8 +365,12 @@ export function parseDurableLarkSessionControlClaim(
   }
   const fields = rawCardFields(payload.event);
   const expectedEventId = durableLarkSessionControlEventId(larkAppId, fields.stableEventId);
-  const expectedPartition = durableLarkSessionControlPartition(larkAppId, fields.sessionId);
-  if (claim.event.eventId !== expectedEventId || claim.event.partitionKey !== expectedPartition) {
+  const expectedPartitions = [
+    durableInteractiveSessionControlPartition(larkAppId, fields.sessionId),
+    durableLarkSessionControlPartition(larkAppId, fields.sessionId),
+  ];
+  if (claim.event.eventId !== expectedEventId
+      || !expectedPartitions.includes(claim.event.partitionKey)) {
     throw new Error(`durable session control ${claim.event.eventId} has a mismatched identity`);
   }
   return {

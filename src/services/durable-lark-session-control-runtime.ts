@@ -5,7 +5,7 @@ import { sessionAnchorId, sessionKey } from '../core/types.js';
 import type { Session } from '../types.js';
 import type { DurableCoordinationStore, DurableJson } from './durable-coordination.js';
 import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
-import { durableLarkSessionControlPartition } from './durable-lark-session-control.js';
+import { durableInteractiveSessionControlPartition } from './durable-lark-session-control.js';
 import type {
   DurableSessionControlDispatchOptions,
   DurableSessionControlReconcileResult,
@@ -188,7 +188,7 @@ export function createDurableLarkSessionControlRuntime(
       }
     }
     return [...sessionIds].map(sessionId =>
-      durableLarkSessionControlPartition(options.larkAppId, sessionId));
+      durableInteractiveSessionControlPartition(options.larkAppId, sessionId));
   };
 
   const authorizeBeforeAck = async (raw: unknown): Promise<boolean> => {

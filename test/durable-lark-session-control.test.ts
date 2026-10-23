@@ -3,6 +3,7 @@ import { DURABLE_INBOX_LANE_SESSION_CONTROL, type InboxClaim } from '../src/serv
 import { normalizeCardActionData } from '../src/im/lark/card-action-data.js';
 import {
   durableDirectSessionControlEvent,
+  durableInteractiveSessionControlPartition,
   durableLarkSessionControlEvent,
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
@@ -43,7 +44,7 @@ function displayControl(target: 'hidden' | 'screenshot' = 'screenshot') {
 function claim(event = durableLarkSessionControlEvent({
   larkAppId: 'cli_test',
   eventId: durableLarkSessionControlEventId('cli_test', 'evt_control_1'),
-  partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+  partitionKey: durableInteractiveSessionControlPartition('cli_test', 'session-1'),
   data: rawControl(),
   now: 10,
 })): InboxClaim {
@@ -61,7 +62,7 @@ describe('durable Lark session control envelope', () => {
     const parsed = parseDurableLarkSessionControlClaim(claim());
     expect(parsed).toMatchObject({
       operationId: 'card.action.trigger:cli_test:evt_control_1',
-      partitionKey: 'lark-session-control:cli_test:session-1',
+      partitionKey: 'lark-session-control:cli_test:interactive:session-1',
       larkAppId: 'cli_test',
       action: 'close',
       sessionId: 'session-1',
@@ -89,7 +90,7 @@ describe('durable Lark session control envelope', () => {
       expect(parseDurableSessionControlClaim(claim(event))).toMatchObject({
         source,
         operationId: `${source}.session-control:cli_test:om_command`,
-        partitionKey: 'lark-session-control:cli_test:session-1',
+        partitionKey: 'lark-session-control:cli_test:interactive:session-1',
         action: 'close',
         sessionId: 'session-1',
         rootId: 'om_root',
@@ -198,7 +199,7 @@ describe('durable Lark session control envelope', () => {
     const event = durableLarkSessionControlEvent({
       larkAppId: 'cli_test',
       eventId: durableLarkSessionControlEventId('cli_test', 'evt_display_1'),
-      partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+      partitionKey: durableInteractiveSessionControlPartition('cli_test', 'session-1'),
       data: { ...displayControl(), event_id: 'evt_display_1' },
       now: 10,
     });
