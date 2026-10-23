@@ -357,9 +357,22 @@ export function createDurableLarkSessionControlRuntime(
       return { kind: 'ignored', reason: 'canonical Session has no submitted remote lineage' };
     }
     if (control.action === 'terminalize_orphan' && live) {
-      throw new DurableSessionControlDeferredError(
-        'canonical Session still has a local runtime owner',
-      );
+      if (canonicalSession.lastFailedTurn?.recoveredRemoteTurn === true
+          && options.abandonOrphanTakeover) {
+        // A worker that adopted a provider-owned turn and then reported that
+        // exact recovered turn failed is not usable ownership proof. Retire
+        // only this replica's stranded projection; canonical state remains
+        // active until a fresh orphan-reconcile provider proves the remote
+        // resource missing and the fenced control commits it closed.
+        await options.abandonOrphanTakeover(control.sessionId);
+        live = options.findActiveSession(control.sessionId);
+        persisted = options.getPersistedSession(control.sessionId);
+      }
+      if (live) {
+        throw new DurableSessionControlDeferredError(
+          'canonical Session still has a local runtime owner',
+        );
+      }
     }
     if (control.action === 'toggle_display' && !live) {
       if (context.claim.attempts <= 2) {

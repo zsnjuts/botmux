@@ -50,6 +50,10 @@ function candidateForApp(
   return parsed;
 }
 
+function hasStrandedRecoveredTurn(session: ReturnType<typeof parseDurablePrimarySessionRecord>['session']): boolean {
+  return session.lastFailedTurn?.recoveredRemoteTurn === true;
+}
+
 /**
  * Discover canonical-only Remote Runner Sessions, fence out a still-live owner,
  * then enqueue one provider-neutral orphan reconciliation control. The control
@@ -93,7 +97,9 @@ export async function scanDurableRemoteOrphans(
         try { options.onError?.(error); } catch { /* observation cannot alter reconciliation */ }
         continue;
       }
-      if (!parsed || options.hasLocalOwner(parsed.session.sessionId)) continue;
+      if (!parsed
+          || (options.hasLocalOwner(parsed.session.sessionId)
+            && !hasStrandedRecoveredTurn(parsed.session))) continue;
       result.candidates += 1;
       const acquired = await options.store.acquireSessionLease({
         sessionKey: record.sessionKey,
@@ -110,7 +116,8 @@ export async function scanDurableRemoteOrphans(
         if (!current || current.revision !== record.revision) continue;
         const currentParsed = candidateForApp(current, options.larkAppId);
         if (!currentParsed || currentParsed.session.sessionId !== parsed.session.sessionId
-            || options.hasLocalOwner(parsed.session.sessionId)) continue;
+            || (options.hasLocalOwner(parsed.session.sessionId)
+              && !hasStrandedRecoveredTurn(currentParsed.session))) continue;
         const remote = normalizeRemoteRunnerBackendState(currentParsed.session.remoteBackendState)!;
         const operationId = [
           'trusted-host.remote-orphan',

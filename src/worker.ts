@@ -26073,6 +26073,9 @@ function emitTurnTerminal(
       log(`Structured bridge retired terminal attempt turn=${turnId.slice(0, 12)} attempt=${dispatchAttempt ?? '-'} status=${status}`);
     }
   }
+  const recoveredRemoteTurn = remoteRunnerRecoveredTurnInFlight
+    && currentBotmuxTurnId === turnId
+    && currentBotmuxDispatchAttempt === dispatchAttempt;
   // Revoke before publishing terminal. A stale terminal from a superseded
   // same-principal steer must not clear the newer turn's authority.
   releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
@@ -26086,6 +26089,7 @@ function emitTurnTerminal(
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
+    ...(recoveredRemoteTurn ? { recoveredRemoteTurn: true } : {}),
     ...(outputDisposition ? { outputDisposition } : {}),
     ...(retryable !== undefined ? { retryable } : {}),
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
@@ -26103,9 +26107,7 @@ function emitTurnTerminal(
     durableTurnInFlight = false;
     wakePending = true;
   }
-  if (remoteRunnerRecoveredTurnInFlight
-    && currentBotmuxTurnId === turnId
-    && currentBotmuxDispatchAttempt === dispatchAttempt) {
+  if (recoveredRemoteTurn) {
     // Recovered ordinary turns intentionally have no dispatch attempt, so the
     // durable-attempt predicate above cannot release this independent startup
     // fence. Exact turn identity is sufficient: a later/stale terminal cannot

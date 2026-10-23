@@ -178,6 +178,15 @@ describe('controlled failed-turn recovery', () => {
       { workerGeneration: 4, caller, silent: false });
     expect(ds.session.lastFailedTurn).toBeUndefined();
   });
+  it('revokes recovered-turn orphan eligibility after a later successful turn', () => {
+    ds.session.workerGeneration = 4;
+    ds.session.lastFailedTurn.recoveredRemoteTurn = true;
+    recordFailedTurnTerminal(ds, { turnId: 'om_later_success', status: 'completed' },
+      { workerGeneration: 4, caller, silent: false });
+    expect(ds.session.lastFailedTurn).toMatchObject({ turnId: request.turnId, status: 'failed' });
+    expect(ds.session.lastFailedTurn.recoveredRemoteTurn).toBeUndefined();
+    expect(store.updateSession).toHaveBeenCalledWith(ds.session);
+  });
   it('replaces an unclaimed quota observation with the real failed terminal', () => {
     ds.session.lastFailedTurn.limitedSnapshot = true;
     ds.lastUserPrompt = 'actual prompt'; ds.lastCliInput = 'actual wrapped input';

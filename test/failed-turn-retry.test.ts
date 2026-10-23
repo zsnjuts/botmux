@@ -90,6 +90,23 @@ describe('buildFailedTurnRecord', () => {
     );
     expect(record?.errorCode).toBeUndefined();
   });
+
+  it('preserves provider-neutral provenance for a failed recovered remote turn', () => {
+    const record = buildFailedTurnRecord(
+      {
+        turnId: 't-recovered',
+        status: 'ambiguous',
+        errorCode: 'provider_takeover_failed',
+        recoveredRemoteTurn: true,
+      },
+      { cliInput: 'original input' },
+    );
+    expect(record).toMatchObject({
+      turnId: 't-recovered',
+      status: 'ambiguous',
+      recoveredRemoteTurn: true,
+    });
+  });
 });
 
 describe('retryCooldownRemaining', () => {
