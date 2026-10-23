@@ -160,6 +160,15 @@ describe('durable Lark session control envelope', () => {
       partitionKey: 'lark-session-control:cli_test:orphan:session-1',
       sessionId: 'session-1',
     });
+    expect(parseDurableSessionControlClaim(claim({
+      ...event,
+      partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+    }))).toMatchObject({
+      source: 'trusted-host',
+      action: 'terminalize_orphan',
+      partitionKey: 'lark-session-control:cli_test:session-1',
+      sessionId: 'session-1',
+    });
   });
 
   it('rejects a command control without a Lark user principal', () => {
