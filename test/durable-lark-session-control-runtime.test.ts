@@ -1870,6 +1870,7 @@ describe('durable Lark session control runtime', () => {
       closeResidualText: () => 'residual',
       closeRefusedText: () => 'refused',
       resumeRefusedText: () => 'resume-refused',
+      now: () => 10,
     });
     const input = directControl('trusted-host', 'handoff', facade.ownerId);
 
@@ -1877,6 +1878,58 @@ describe('durable Lark session control runtime', () => {
       claim: input.claim,
       signal: new AbortController().signal,
     })).rejects.toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    await facade.stop();
+    await store.close();
+  });
+
+  it('settles a stale trusted handoff so newer lifecycle controls can advance', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-stale-handoff-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'peer-owner' });
+    const canonical = session({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'tae-traex',
+        generation: 1,
+        remoteSessionId: 'remote-session-1',
+        providerState: { sessionKey: 'bmx1-' + 'a'.repeat(40) },
+      },
+    });
+    await admitDurableLarkSession({ facade, message: message(), session: canonical });
+    const takeOverActiveSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      takeOverActiveSession,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'not_local' }),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+      now: () => 300_003,
+    });
+    const input = directControl('trusted-host', 'handoff', 'retiring-owner');
+
+    await expect(runtime.resolve(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'stale remote handoff exceeded its recovery horizon',
+    });
+    expect(takeOverActiveSession).not.toHaveBeenCalled();
     await facade.stop();
     await store.close();
   });
@@ -1942,6 +1995,7 @@ describe('durable Lark session control runtime', () => {
       closeRefusedText: () => 'refused',
       resumeRefusedText: () => 'resume-refused',
       resumeReadinessStabilityMs: 0,
+      now: () => 10,
     });
     const input = directControl('trusted-host', 'handoff', 'retiring-owner');
     const dispatch = createDurableSessionControlDispatch({
