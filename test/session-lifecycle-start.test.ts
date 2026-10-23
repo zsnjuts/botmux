@@ -518,6 +518,47 @@ describe('narrow XPI shared-cwd generation admission seam', () => {
   });
 });
 
+describe('Remote Runner lifecycle resume intent', () => {
+  it('carries orphan reconciliation on the privileged fork options channel', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      remoteRunner: {
+        command: process.execPath,
+        args: ['provider.mjs'],
+        requiredCapabilities: ['orphan_reconciliation'],
+      },
+    }));
+    const ds = makeDs();
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.session.remoteBackendState = {
+      version: 1,
+      provider: 'tae-traex',
+      generation: 3,
+      remoteSessionId: 'remote-expired',
+      providerState: { sessionKey: 'logical-session' },
+    };
+
+    forkWorker(ds, '', { resume: true }, {
+      remoteResumeMode: 'orphan-reconcile',
+    });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toMatchObject({
+      type: 'init',
+      resume: true,
+      remoteResumeMode: 'orphan-reconcile',
+      remoteBackendState: {
+        generation: 3,
+        remoteSessionId: 'remote-expired',
+      },
+    });
+    expect(ds.initConfig?.remoteResumeMode).toBe('orphan-reconcile');
+  });
+});
+
 describe('host memory pressure worker admission', () => {
   it('blocks a fresh/resumed fork before child creation and posts retry guidance', async () => {
     const sessionReply = vi.fn(async () => 'om_pressure');

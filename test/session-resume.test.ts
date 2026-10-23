@@ -293,7 +293,8 @@ describe('takeOverDurableActiveRemoteSession', () => {
     const map = new Map<string, DaemonSession>();
     vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
       expect(prompt).toBe('');
-      expect(resume).toEqual({ resume: true, remoteResumeMode: 'reattach' });
+      expect(resume).toEqual({ resume: true });
+      expect(opts).toEqual(expect.objectContaining({ remoteResumeMode: 'reattach' }));
       ds.worker = { killed: false };
       opts?.onAdmission?.('accepted');
       return true;
@@ -391,7 +392,8 @@ describe('takeOverDurableActiveRemoteSession', () => {
     sessionStore.updateSession(stale.session);
     vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
       expect(prompt).toBe('');
-      expect(resume).toEqual({ resume: true, remoteResumeMode: 'orphan-reconcile' });
+      expect(resume).toEqual({ resume: true });
+      expect(opts).toEqual(expect.objectContaining({ remoteResumeMode: 'orphan-reconcile' }));
       ds.worker = { killed: false };
       opts?.onAdmission?.('accepted');
       return true;
@@ -483,7 +485,8 @@ describe('resumeSession', () => {
         ds.worker = { killed: false };
         opts?.onAdmission?.('accepted');
         expect(prompt).toBe('');
-        expect(resume).toEqual({ resume: true, remoteResumeMode: 'rebuild' });
+        expect(resume).toEqual({ resume: true });
+        expect(opts).toEqual(expect.objectContaining({ remoteResumeMode: 'rebuild' }));
         return true;
       });
 

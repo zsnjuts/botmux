@@ -7655,8 +7655,8 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
     ds.remoteCloseState = undefined;
     const accepted = forkImpl(ds, '', {
       resume: true,
-      remoteResumeMode: 'close-control',
     }, {
+      remoteResumeMode: 'close-control',
       // A close request must not leave a delayed wake callback behind after it
       // has already returned failure. This also disables marginal-memory
       // reclaim/re-entry, which shares the same explicit no-defer gate.
@@ -13203,9 +13203,6 @@ export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
 
 export type ForkResumeOrTurnId = boolean | string | {
   resume?: boolean;
-  /** Explicit close reactivation asks a Remote Runner provider to replace the
-   * cancelled remote generation instead of reattaching it. */
-  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control' | 'orphan-reconcile';
   turnId?: string;
   dispatchAttempt?: number;
   /** The opening prompt is a claimed durable-primary Inbox row and must ACK
@@ -13241,6 +13238,14 @@ export interface WorkerAdmissionBlockedNotice {
 }
 export type ForkWorkerOptions = {
   onAdmission?: (admission: WorkerForkAdmission) => void;
+  /**
+   * Privileged Remote Runner lifecycle intent for this exact worker spawn.
+   * Keep it outside ForkResumeOrTurnId: that object also carries replayable
+   * turn/admission metadata and may be rewritten while recovering a queued
+   * activation. A close, rebuild or orphan proof must never silently degrade
+   * into an ordinary reattach when that happens.
+   */
+  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control' | 'orphan-reconcile';
   /** Replace the direct provider reply when the caller owns a durable output lane. */
   onAdmissionBlocked?: (notice: WorkerAdmissionBlockedNotice) => void;
   /** Called once when an admitted worker exits before its ready boundary. */
@@ -13603,7 +13608,7 @@ export function forkWorker(
     && promptInput !== null
     && promptInput.codexAppSteerable === true;
   let resume = false;
-  let remoteResumeMode: 'reattach' | 'rebuild' | 'close-control' | 'orphan-reconcile' | undefined;
+  const remoteResumeMode = opts.remoteResumeMode;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
   let initDurablePrimaryInbox: true | undefined;
@@ -13616,7 +13621,6 @@ export function forkWorker(
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
     resume = resumeOrTurnId.resume === true;
-    remoteResumeMode = resumeOrTurnId.remoteResumeMode;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
     initDurablePrimaryInbox = resumeOrTurnId.durablePrimaryInbox;

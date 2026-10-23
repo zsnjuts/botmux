@@ -3846,8 +3846,8 @@ export async function takeOverDurableActiveRemoteSession(
     try {
       started = forkWorker(ds, '', {
         resume: true,
-        remoteResumeMode: opts.remoteResumeMode ?? 'reattach',
       }, {
+        remoteResumeMode: opts.remoteResumeMode ?? 'reattach',
         deferDuringDeviceIsolation: false,
         onAdmission: value => { admission = value; },
       });
@@ -4194,7 +4194,8 @@ export async function resumeSession(
     };
     let started = false;
     try {
-      started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'rebuild' }, {
+      started = forkWorker(ds, '', { resume: true }, {
+        remoteResumeMode: 'rebuild',
         deferDuringDeviceIsolation: false,
         onAdmission: value => { admission = value; },
         onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
