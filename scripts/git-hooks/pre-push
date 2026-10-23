@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# pre-push hook: 拦截会污染 npm latest 的倒退 tag
+# pre-push hook: 保护 distributed 线性历史，并拦截会污染 npm latest 的倒退 tag
 #
-# 触发场景：push 一个纯净 vX.Y.Z 形式的 tag（即将被 CI 发到 npm
-# latest dist-tag）。如果该版本号小于等于仓库现有的最大稳定版本，
-# 拒绝 push——曾发生 `git tag | tail` 拿字典序末尾 v2.9.x 当成最新
-# 版本，CI 把 npm latest 从 2.27.4 覆盖到 2.9.x，导致所有
-# `npm i botmux` 用户被回退的事故。
+# distributed 分支只接受 fast-forward 更新，且不能删除；既有
+# distributed/vN tag 不能移动或删除，新 tag 必须包含上一数字版本。
+# 纯净 vX.Y.Z tag 仍执行 npm latest 防降级检查。
 #
 # 启用方法（一次性）：
 #   git config core.hooksPath scripts/git-hooks
@@ -17,6 +15,17 @@
 #   <local_ref> <local_sha> <remote_ref> <remote_sha>
 
 set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+lineage_script="$repo_root/scripts/verify-distributed-lineage.mjs"
+
+is_zero_oid() {
+  [[ "$1" =~ ^0+$ ]]
+}
+
+verify_lineage() {
+  node "$lineage_script" "$@"
+}
 
 semver_le() {
   # 返回 0 当 $1 <= $2（即 $1 是倒退）。仅处理 X.Y.Z 三位整数版本。
@@ -32,9 +41,36 @@ semver_le() {
   fi
 }
 
-while read -r local_ref local_sha remote_ref _remote_sha; do
-  # 只关心 tag 的 push
+while read -r local_ref local_sha remote_ref remote_sha; do
   case "$remote_ref" in
+    refs/heads/distributed)
+      if is_zero_oid "$local_sha"; then
+        echo "pre-push: distributed 分支不能删除" >&2
+        exit 1
+      fi
+
+      if ! is_zero_oid "$remote_sha"; then
+        verify_lineage --candidate "$local_sha" --previous "$remote_sha"
+      fi
+      verify_lineage --candidate "$local_sha"
+      continue
+      ;;
+
+    refs/tags/distributed/v*)
+      tag_name=${remote_ref#refs/tags/}
+      if is_zero_oid "$local_sha"; then
+        echo "pre-push: $tag_name 不能删除" >&2
+        exit 1
+      fi
+      if ! is_zero_oid "$remote_sha"; then
+        echo "pre-push: 已存在的 $tag_name 不能移动" >&2
+        exit 1
+      fi
+
+      verify_lineage --tag "$tag_name" --candidate "$local_sha"
+      continue
+      ;;
+
     refs/tags/v*) ;;
     *) continue ;;
   esac
