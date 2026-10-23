@@ -422,7 +422,11 @@ describe('remote runner explicit close', () => {
       target: DaemonSession,
       prompt: unknown,
       resume: unknown,
-      opts: { deferDuringDeviceIsolation?: boolean; onAdmission?: (value: 'accepted') => void },
+      opts: {
+        remoteResumeMode?: 'close-control';
+        deferDuringDeviceIsolation?: boolean;
+        onAdmission?: (value: 'accepted') => void;
+      },
     ) => {
       const worker = createFakeWorker();
       target.worker = worker as never;
@@ -438,9 +442,9 @@ describe('remote runner explicit close', () => {
     expect(fork.mock.calls[0]?.[1]).toBe('');
     expect(fork.mock.calls[0]?.[2]).toEqual({
       resume: true,
-      remoteResumeMode: 'close-control',
     });
     expect(fork.mock.calls[0]?.[3]).toMatchObject({
+      remoteResumeMode: 'close-control',
       deferDuringDeviceIsolation: false,
       onAdmission: expect.any(Function),
     });
