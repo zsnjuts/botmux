@@ -303,16 +303,20 @@ export function parseDurableSessionControlClaim(
   const retiringOwnerId = action === 'handoff'
     ? bounded(payload.retiringOwnerId, 'retiringOwnerId', 256)
     : undefined;
-  const expectedPartition = action === 'terminalize_orphan'
-    ? durableRemoteOrphanControlPartition(larkAppId, sessionId)
-    : durableLarkSessionControlPartition(larkAppId, sessionId);
+  const ordinaryPartition = durableLarkSessionControlPartition(larkAppId, sessionId);
+  // Rows persisted before orphan partition isolation remain valid durable
+  // work. Accept their former Session partition until they settle; all newly
+  // constructed orphan controls use the isolated partition above.
+  const expectedPartitions = action === 'terminalize_orphan'
+    ? [durableRemoteOrphanControlPartition(larkAppId, sessionId), ordinaryPartition]
+    : [ordinaryPartition];
   if ((!rootId.startsWith('om_') && !rootId.startsWith('oc_'))
       || (source === 'lark-command' && !operatorOpenId.startsWith('ou_'))
       || (source === 'trusted-host' && operatorOpenId !== 'trusted-host')
       || ((action === 'handoff' || action === 'terminalize_orphan')
         && source !== 'trusted-host')
       || claim.event.eventId !== operationId
-      || claim.event.partitionKey !== expectedPartition) {
+      || !expectedPartitions.includes(claim.event.partitionKey)) {
     throw new Error(`durable session control ${claim.event.eventId} has a mismatched identity`);
   }
   return {
