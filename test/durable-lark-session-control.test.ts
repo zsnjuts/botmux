@@ -6,6 +6,7 @@ import {
   durableLarkSessionControlEvent,
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
+  durableRemoteOrphanControlPartition,
   parseDurableLarkSessionControlClaim,
   parseDurableSessionControlClaim,
 } from '../src/services/durable-lark-session-control.js';
@@ -137,6 +138,28 @@ describe('durable Lark session control envelope', () => {
       retiringOwnerId: 'owner-1',
       now: 10,
     })).toThrow(/trusted host source/);
+  });
+
+  it('isolates background orphan controls from the explicit lifecycle FIFO partition', () => {
+    const event = durableDirectSessionControlEvent({
+      source: 'trusted-host',
+      larkAppId: 'cli_test',
+      operationId: 'trusted-host.remote-orphan:cli_test:session-1:2',
+      action: 'terminalize_orphan',
+      sessionId: 'session-1',
+      rootId: 'om_root',
+      cardMessageId: 'om_card',
+      now: 10,
+    });
+    expect(event.partitionKey).toBe(
+      durableRemoteOrphanControlPartition('cli_test', 'session-1'),
+    );
+    expect(parseDurableSessionControlClaim(claim(event))).toMatchObject({
+      source: 'trusted-host',
+      action: 'terminalize_orphan',
+      partitionKey: 'lark-session-control:cli_test:orphan:session-1',
+      sessionId: 'session-1',
+    });
   });
 
   it('rejects a command control without a Lark user principal', () => {

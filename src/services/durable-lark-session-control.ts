@@ -138,6 +138,14 @@ export function durableLarkSessionControlPartition(larkAppId: string, sessionId:
   return `${durableLarkSessionControlPartitionPrefix(larkAppId)}${bounded(sessionId, 'sessionId', 256)}`;
 }
 
+/** Background orphan proofs can back off for a long time. Keep their FIFO
+ * partition separate from explicit card/command lifecycle controls so an
+ * inconclusive proof never head-of-line blocks a later user-authorized close.
+ * The canonical Session lease still serializes both partitions' mutations. */
+export function durableRemoteOrphanControlPartition(larkAppId: string, sessionId: string): string {
+  return `${durableLarkSessionControlPartitionPrefix(larkAppId)}orphan:${bounded(sessionId, 'sessionId', 256)}`;
+}
+
 /** Application-scoped fallback discovery prefix for controls whose prior
  * runtime owner disappeared during a rolling replacement. */
 export function durableLarkSessionControlPartitionPrefix(larkAppId: string): string {
@@ -247,7 +255,9 @@ export function durableDirectSessionControlEvent(input: {
   const event: DurableInboxEvent = {
     eventId: operationId,
     lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
-    partitionKey: durableLarkSessionControlPartition(larkAppId, sessionId),
+    partitionKey: input.action === 'terminalize_orphan'
+      ? durableRemoteOrphanControlPartition(larkAppId, sessionId)
+      : durableLarkSessionControlPartition(larkAppId, sessionId),
     payload: payload as unknown as DurableJson,
     visibleAt: now,
     createdAt: now,
@@ -293,13 +303,16 @@ export function parseDurableSessionControlClaim(
   const retiringOwnerId = action === 'handoff'
     ? bounded(payload.retiringOwnerId, 'retiringOwnerId', 256)
     : undefined;
+  const expectedPartition = action === 'terminalize_orphan'
+    ? durableRemoteOrphanControlPartition(larkAppId, sessionId)
+    : durableLarkSessionControlPartition(larkAppId, sessionId);
   if ((!rootId.startsWith('om_') && !rootId.startsWith('oc_'))
       || (source === 'lark-command' && !operatorOpenId.startsWith('ou_'))
       || (source === 'trusted-host' && operatorOpenId !== 'trusted-host')
       || ((action === 'handoff' || action === 'terminalize_orphan')
         && source !== 'trusted-host')
       || claim.event.eventId !== operationId
-      || claim.event.partitionKey !== durableLarkSessionControlPartition(larkAppId, sessionId)) {
+      || claim.event.partitionKey !== expectedPartition) {
     throw new Error(`durable session control ${claim.event.eventId} has a mismatched identity`);
   }
   return {
