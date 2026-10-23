@@ -6900,6 +6900,7 @@ type RemoteClosePreparation =
         | 'remote_runner_worker_missing'
         | 'remote_runner_close_reconciliation_required'
         | 'remote_runner_durable_close_failed'
+        | 'remote_orphan_proof_invalid'
         | 'remote_shutdown_fence_in_progress'
         // mojo reuses this preparation contract: same problem (a remote,
         // credential-bearing session that must be proven gone before the row is
@@ -9211,7 +9212,7 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; remoteOrphanProof?: true; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -9231,6 +9232,21 @@ export async function closeSession(
   const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
   const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
   const isOwnedRemoteRunnerClose = isOwnedClose && closeFrozenBackendType === 'remote-runner';
+  if (opts?.remoteOrphanProof) {
+    const remote = normalizeRemoteRunnerBackendState(ds?.session.remoteBackendState);
+    const storedRemote = normalizeRemoteRunnerBackendState(stored?.remoteBackendState);
+    if (!isOwnedRemoteRunnerClose || !ds || !stored || ds.session.status !== 'active'
+        || stored.status !== 'active' || ds.workerReady !== true
+        || !remote || !storedRemote || remote.remoteSessionId || storedRemote.remoteSessionId
+        || remote.generation < 1 || storedRemote.generation !== remote.generation) {
+      return {
+        ok: false,
+        alreadyClosed: false,
+        error: 'remote_orphan_proof_invalid',
+        retryable: true,
+      };
+    }
+  }
   const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
   if (closeJournal && !isOwnedMojoClose) {
     // Never let a Mojo cancellation journal silently disappear through another
@@ -9323,7 +9339,7 @@ export async function closeSession(
     ? await prepareRiffExplicitClose(ds, stored)
     : isOwnedMojoClose
       ? await prepareMojoExplicitClose(ds, stored)
-      : isOwnedRemoteRunnerClose
+      : isOwnedRemoteRunnerClose && !opts?.remoteOrphanProof
         ? await prepareRemoteRunnerExplicitClose(ds, stored)
         : { ok: true };
   if (!prepared.ok) {
@@ -9473,7 +9489,13 @@ export async function closeSession(
   if (ds) {
     disposeOrdinaryTurnRecovery(ds.session);
     disposeReadonlyTaskContinuation(ds.session);
-    killWorker(ds, {
+    if (opts?.remoteOrphanProof) {
+      // The provider has already atomically closed its durable state after an
+      // authoritative read-only missing proof. Retire only this temporary
+      // observer; sending the generic close IPC would issue a second cancel and
+      // advance provider lineage again.
+      retireWorkerProcessOnly(ds, 'remote_orphan_terminalized');
+    } else killWorker(ds, {
       ...(codexArchiveReleaseTicket ? { codexCleanupRelease: codexArchiveReleaseTicket.request } : {}),
       ...(preparedRemoteRequestId ? { remoteCloseCommitRequestId: preparedRemoteRequestId } : {}),
       // The prepare above already proved this cancel; the durable row cleared the
@@ -13183,7 +13205,7 @@ export type ForkResumeOrTurnId = boolean | string | {
   resume?: boolean;
   /** Explicit close reactivation asks a Remote Runner provider to replace the
    * cancelled remote generation instead of reattaching it. */
-  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control';
+  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control' | 'orphan-reconcile';
   turnId?: string;
   dispatchAttempt?: number;
   /** The opening prompt is a claimed durable-primary Inbox row and must ACK
@@ -13581,7 +13603,7 @@ export function forkWorker(
     && promptInput !== null
     && promptInput.codexAppSteerable === true;
   let resume = false;
-  let remoteResumeMode: 'reattach' | 'rebuild' | 'close-control' | undefined;
+  let remoteResumeMode: 'reattach' | 'rebuild' | 'close-control' | 'orphan-reconcile' | undefined;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
   let initDurablePrimaryInbox: true | undefined;

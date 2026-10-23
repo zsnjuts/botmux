@@ -7,3 +7,9 @@
 export class DurableSessionControlOwnerHandoffError extends Error {
   override name = 'DurableSessionControlOwnerHandoffError';
 }
+
+/** A read-only orphan proof was unavailable or disproved. Keep the durable
+ * control pending, but avoid hammering the provider control plane. */
+export class DurableSessionControlDeferredError extends Error {
+  override name = 'DurableSessionControlDeferredError';
+}

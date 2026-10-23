@@ -139,6 +139,10 @@ import {
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
+import {
+  startDurableRemoteOrphanReconciler,
+  type DurableRemoteOrphanReconciler,
+} from './services/durable-remote-orphan-reconciler.js';
 import { requestDurableSessionControl } from './services/durable-session-control-request.js';
 import { buildSessionControlPendingCard } from './im/lark/session-control-pending-card.js';
 import {
@@ -361,7 +365,7 @@ import {
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
 import { scanMultipleProjects } from './services/project-scanner.js';
-import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, buildTurnFailedCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
@@ -29403,6 +29407,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   );
   const durablePrimaryRuntimes: DurableLarkPrimaryRuntime[] = [];
   const durablePrimaryEventRuntimes: LarkEventDispatcherRuntime[] = [];
+  const durableRemoteOrphanReconcilers: DurableRemoteOrphanReconciler[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
     ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
@@ -31077,7 +31082,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const takeOverPrimarySession = async (
           stableKey: string,
           canonical: Session,
-          options?: { remoteResumeMode?: 'reattach' | 'close-control' },
+          options?: { remoteResumeMode?: 'reattach' | 'close-control' | 'orphan-reconcile' },
         ): Promise<Session | { kind: 'retry'; reason: string } | undefined> => {
           if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
           try {
@@ -31194,11 +31199,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             takeOverActiveSession: async (stableKey, canonical, options) => {
               return takeOverPrimarySession(stableKey, canonical, options);
             },
+            abandonOrphanTakeover: sessionId => {
+              const target = findActiveBySessionId(sessionId);
+              if (target) {
+                retireWorkerProcessOnly(target, 'remote_orphan_proof_not_established');
+                for (const [key, candidate] of activeSessions) {
+                  if (candidate === target) activeSessions.delete(key);
+                }
+              }
+              const local = sessionStore.getOwnedSession(sessionId);
+              if (local?.status === 'active') sessionStore.closeSession(sessionId);
+              if (target) {
+                target.session.status = 'closed';
+                target.session.closedAt ??= new Date().toISOString();
+              }
+            },
             canOperate: (chatId, operatorOpenId) =>
               canOperate(cfg.larkAppId, chatId, operatorOpenId),
             closeSession: sessionId => closeSessionHelper(sessionId, {
               awaitWorkerExit: false,
               cardVisibility: 'public',
+            }),
+            terminalizeOrphanSession: sessionId => closeSessionHelper(sessionId, {
+              awaitWorkerExit: false,
+              // The durable outbox owns the only visible terminal card. The
+              // local close must not race it with a generic closed projection.
+              cardVisibility: 'private',
+              remoteOrphanProof: true,
             }),
             resumeSession: sessionId => resumeSession(sessionId, activeSessions),
             handlePresentationControl: data => botEventHandlers.handleCardAction(
@@ -31213,6 +31240,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ),
             buildPendingCard: action => buildSessionControlPendingCard(
               action,
+              localeForBot(cfg.larkAppId),
+            ),
+            buildOrphanedCard: session => buildTurnFailedCard({
+              rootId: storedSessionAnchorId('session' in session ? session.session : session),
+              sessionId: 'session' in session ? session.session.sessionId : session.sessionId,
+              cliId: 'remote-runner',
+              cliName: getCliDisplayName('remote-runner'),
+              status: 'ambiguous',
+              errorCode: 'remote_runner_orphan_terminalized',
+              reason: tr('worker.remote_orphan_terminalized', undefined, localeForBot(cfg.larkAppId)),
+              retryOffer: 'none',
+              locale: localeForBot(cfg.larkAppId),
+            }),
+            orphanedNoticeText: () => tr(
+              'worker.remote_orphan_terminalized',
+              undefined,
               localeForBot(cfg.larkAppId),
             ),
             closeResidualText: residual => {
@@ -31313,6 +31356,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           durablePrimaryRuntimes.push(primaryRuntime);
           durablePrimaryEventRuntimes.push(eventRuntime);
           durablePrimaryRuntimeByApp.set(cfg.larkAppId, primaryRuntime);
+          const orphanReconciler = startDurableRemoteOrphanReconciler({
+            store: durableCoordinationRuntime.store,
+            larkAppId: cfg.larkAppId,
+            ownerId: primaryRuntime.session.ownerId,
+            hasLocalOwner: sessionId => {
+              const local = findActiveBySessionId(sessionId);
+              return !!local && local.session.status === 'active';
+            },
+            onError: error => logger.warn(
+              `[durable-orphan:${cfg.larkAppId}] `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            ),
+          });
+          durableRemoteOrphanReconcilers.push(orphanReconciler);
           eventRuntime.connect();
           void primaryRuntime.ready.then(() => {
             logger.info(`[durable-primary:${cfg.larkAppId}] runtime ready`);
@@ -32489,6 +32546,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     await feedbackWebhookDispatcher?.stop(remainingBudget());
     setTurnResultRuntime(undefined);
     for (const runtime of durablePrimaryEventRuntimes) runtime.close();
+    for (const reconciler of durableRemoteOrphanReconcilers) reconciler.stop();
     closeLinkRefRuntime();
     for (const runtime of durablePrimaryRuntimes) {
       const stopped = await runtime.stop(remainingBudget());
@@ -32584,6 +32642,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionListHandler(null);
     setDurableConfigCoordinator(undefined);
     for (const runtime of durablePrimaryEventRuntimes) runtime.close();
+    for (const reconciler of durableRemoteOrphanReconcilers) reconciler.stop();
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();
     durableSessionFacade?.terminate();

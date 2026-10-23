@@ -8,7 +8,10 @@ import {
   parseDurableSessionControlClaim,
   type DurableLarkSessionControlClaim,
 } from './durable-lark-session-control.js';
-import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
+import {
+  DurableSessionControlDeferredError,
+  DurableSessionControlOwnerHandoffError,
+} from './durable-session-control-errors.js';
 
 export type DurableSessionControlDispatchResult =
   | { kind: 'settled' }
@@ -40,6 +43,9 @@ export interface DurableSessionControlConsumerOptions {
   retryDelayMs?: number;
   /** Fast requeue used only when a prefix failover raced the exact owner. */
   ownerHandoffRetryDelayMs?: number;
+  /** Slow retry for provider-authority probes that intentionally made no
+   * mutation because the remote was live or its state was inconclusive. */
+  deferredRetryDelayMs?: number;
   /** Give an exact local owner time to claim before cluster-prefix failover. */
   fallbackClaimIntervalMs?: number;
   concurrency?: number;
@@ -144,6 +150,12 @@ export function startDurableSessionControlConsumer(
     10,
     5_000,
   );
+  const deferredRetryDelayMs = boundedInteger(
+    options.deferredRetryDelayMs ?? 60_000,
+    'deferredRetryDelayMs',
+    1_000,
+    3_600_000,
+  );
   const fallbackClaimIntervalMs = boundedInteger(
     options.fallbackClaimIntervalMs ?? 1_000,
     'fallbackClaimIntervalMs',
@@ -245,7 +257,9 @@ export function startDurableSessionControlConsumer(
       reportError(error);
       const delayMs = error instanceof DurableSessionControlOwnerHandoffError
         ? ownerHandoffRetryDelayMs
-        : retryDelayMs;
+        : error instanceof DurableSessionControlDeferredError
+          ? deferredRetryDelayMs
+          : retryDelayMs;
       const retried = await options.store.retryInboxClaim({
         claim,
         visibleAt: now() + delayMs,

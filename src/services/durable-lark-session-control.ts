@@ -7,10 +7,15 @@ import {
 
 export const DURABLE_LARK_SESSION_CONTROL_VERSION = 1 as const;
 
-export type DurableLarkSessionControlAction = 'close' | 'resume' | 'toggle_display' | 'handoff';
+export type DurableLarkSessionControlAction =
+  | 'close'
+  | 'resume'
+  | 'toggle_display'
+  | 'handoff'
+  | 'terminalize_orphan';
 export type DurableLifecycleSessionControlAction = Extract<
   DurableLarkSessionControlAction,
-  'close' | 'resume' | 'handoff'
+  'close' | 'resume' | 'handoff' | 'terminalize_orphan'
 >;
 export type DurableSessionControlSource = 'lark-card' | 'lark-command' | 'trusted-host';
 
@@ -222,8 +227,9 @@ export function durableDirectSessionControlEvent(input: {
   const retiringOwnerId = input.action === 'handoff'
     ? bounded(input.retiringOwnerId, 'retiringOwnerId', 256)
     : undefined;
-  if (input.action === 'handoff' && input.source !== 'trusted-host') {
-    throw new Error('durable handoff requires a trusted host source');
+  if ((input.action === 'handoff' || input.action === 'terminalize_orphan')
+      && input.source !== 'trusted-host') {
+    throw new Error(`durable ${input.action} requires a trusted host source`);
   }
   const payload: DurableDirectSessionControlEnvelope = {
     version: DURABLE_LARK_SESSION_CONTROL_VERSION,
@@ -276,7 +282,8 @@ export function parseDurableSessionControlClaim(
   const operationId = bounded(payload.operationId, 'operationId', 1_024);
   const action = payload.action;
   if (!larkAppId.startsWith('cli_')
-      || (action !== 'close' && action !== 'resume' && action !== 'handoff')) {
+      || (action !== 'close' && action !== 'resume' && action !== 'handoff'
+        && action !== 'terminalize_orphan')) {
     throw new Error(`durable session control ${claim.event.eventId} has an invalid identity`);
   }
   const sessionId = bounded(payload.sessionId, 'sessionId', 256);
@@ -289,7 +296,8 @@ export function parseDurableSessionControlClaim(
   if ((!rootId.startsWith('om_') && !rootId.startsWith('oc_'))
       || (source === 'lark-command' && !operatorOpenId.startsWith('ou_'))
       || (source === 'trusted-host' && operatorOpenId !== 'trusted-host')
-      || (action === 'handoff' && source !== 'trusted-host')
+      || ((action === 'handoff' || action === 'terminalize_orphan')
+        && source !== 'trusted-host')
       || claim.event.eventId !== operationId
       || claim.event.partitionKey !== durableLarkSessionControlPartition(larkAppId, sessionId)) {
     throw new Error(`durable session control ${claim.event.eventId} has a mismatched identity`);
