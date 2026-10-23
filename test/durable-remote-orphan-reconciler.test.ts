@@ -172,6 +172,88 @@ describe('durable Remote Runner orphan reconciler', () => {
     await store.close();
   });
 
+  it('isolates a legacy partition conflict and continues scanning later Sessions', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-orphan-legacy-conflict-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'seed-owner' });
+
+    const legacySession = canonical();
+    legacySession.sessionId = 'session-legacy-conflict';
+    legacySession.rootMessageId = 'om_a_root';
+    const laterSession = canonical();
+    laterSession.sessionId = 'session-later';
+    laterSession.rootMessageId = 'om_b_root';
+    for (const [messageId, session] of [
+      ['om_a_turn', legacySession],
+      ['om_b_turn', laterSession],
+    ] as const) {
+      await admitDurableLarkSession({
+        facade,
+        message: {
+          eventType: 'lark.im.message.receive_v1',
+          eventId: `im.message.receive_v1:cli_test:${messageId}`,
+          partitionKey: 'lark-message-routing:cli_test:oc_chat',
+          larkAppId: 'cli_test',
+          messageId,
+          attempts: 1,
+          data: {},
+        },
+        session,
+      });
+      await facade.releaseLease(`${session.rootMessageId}::cli_test`);
+    }
+
+    const legacyEvent = durableDirectSessionControlEvent({
+      source: 'trusted-host',
+      larkAppId: 'cli_test',
+      operationId: 'trusted-host.remote-orphan:cli_test:session-legacy-conflict:2',
+      action: 'terminalize_orphan',
+      sessionId: 'session-legacy-conflict',
+      rootId: 'om_a_root',
+      cardMessageId: 'om_card',
+      now: 9,
+    });
+    // Simulate the durable row shape written before orphan partition isolation.
+    legacyEvent.partitionKey = durableLarkSessionControlPartition(
+      'cli_test',
+      'session-legacy-conflict',
+    );
+    await expect(store.enqueueInbox(legacyEvent)).resolves.toEqual({ kind: 'inserted' });
+
+    const errors: unknown[] = [];
+    await expect(scanDurableRemoteOrphans({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'orphan-owner',
+      hasLocalOwner: () => false,
+      onError: error => errors.push(error),
+      now: () => 10,
+    })).resolves.toMatchObject({
+      scanned: 2,
+      candidates: 2,
+      enqueued: 1,
+      duplicates: 0,
+      invalid: 1,
+    });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toEqual(expect.objectContaining({
+      message: 'durable orphan reconciliation conflict '
+        + 'trusted-host.remote-orphan:cli_test:session-legacy-conflict:2',
+    }));
+
+    const later = await store.claimNextInbox({
+      workerId: 'later-worker',
+      lane: 'session-control',
+      partitionKeys: [durableRemoteOrphanControlPartition('cli_test', 'session-later')],
+      leaseDurationMs: 100,
+    });
+    expect(later?.event.eventId).toBe('trusted-host.remote-orphan:cli_test:session-later:2');
+
+    await facade.stop();
+    await store.close();
+  });
+
   it('leaves a valid local owner and an occupied cross-replica lease untouched', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-orphan-owned-'));
     tempDirs.push(dir);

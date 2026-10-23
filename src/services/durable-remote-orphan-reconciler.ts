@@ -141,7 +141,17 @@ export async function scanDurableRemoteOrphans(
           }),
         });
         if (inserted.kind === 'conflict') {
-          throw new Error(`durable orphan reconciliation conflict ${operationId}`);
+          // A conflicting historical row is isolated to this Session. This is
+          // especially important during rolling upgrades: an orphan control
+          // persisted before partition isolation has the same stable event id
+          // but the former ordinary Session partition. The legacy row remains
+          // valid work for the backwards-compatible consumer; it must not
+          // abort the scan and starve unrelated canonical-only Sessions.
+          result.invalid += 1;
+          try {
+            options.onError?.(new Error(`durable orphan reconciliation conflict ${operationId}`));
+          } catch { /* observation cannot alter reconciliation */ }
+          continue;
         }
         if (inserted.kind === 'stale_lease') continue;
         if (inserted.kind === 'inserted') {
