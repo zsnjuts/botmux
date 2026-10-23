@@ -31102,7 +31102,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             }
             const local = activeSessions.get(stableKey);
             if (local?.session.sessionId === claimed.session.sessionId
-                && local.session.status === 'active') {
+                && local.session.status === 'active'
+                && options?.remoteResumeMode !== 'orphan-reconcile') {
               return local.session;
             }
             const takeover = await takeOverDurableActiveRemoteSession(
