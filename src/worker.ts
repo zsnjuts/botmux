@@ -23395,6 +23395,16 @@ async function spawnCli(
     restoreMojoLivePatchAfterRespawn();
     markPromptReady();
   }
+  if (effectiveBackendType === 'remote-runner') {
+    const remoteBackend = observedBackend as SessionBackend;
+    if (!remoteBackend.waitUntilReady) {
+      throw new Error('remote runner backend does not expose startup readiness');
+    }
+    await remoteBackend.waitUntilReady();
+    if (spawnGeneration !== cliSpawnGeneration || backend !== observedBackend) {
+      throw new CliSpawnSupersededError();
+    }
+  }
 }
 
 /**

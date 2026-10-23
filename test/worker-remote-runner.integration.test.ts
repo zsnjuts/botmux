@@ -264,6 +264,138 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
+  it('does not publish worker ready before orphan reconciliation advances durable lineage', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-orphan-ready-'));
+    tempDirs.push(root);
+    const commandsPath = join(root, 'commands.jsonl');
+    const releaseReadyPath = join(root, 'release-ready');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+input.on('close', () => process.exit(0));
+input.on('line', line => {
+  const command = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(command) + '\\n');
+  if (command.type === 'hello') {
+    emit({
+      type: 'hello', requestId: command.requestId, provider: 'orphan-ready-provider',
+      capabilities: ['start','resume','turn','cancel','detach','reattach','status','orphan_reconciliation'],
+    });
+  } else if (command.type === 'resume') {
+    const timer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(releaseReadyPath)})) return;
+      clearInterval(timer);
+      const state = { ...command.state, generation: command.state.generation + 1 };
+      delete state.remoteSessionId;
+      emit({ type: 'ready', requestId: command.requestId, state });
+    }, 10);
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    const requiredCapabilities = [
+      'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+      'orphan_reconciliation',
+    ];
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_remote_orphan_ready',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: {
+        expectedProvider: 'orphan-ready-provider',
+        requiredCapabilities,
+      },
+    }]));
+    const persistedState = {
+      version: 1 as const,
+      provider: 'orphan-ready-provider',
+      generation: 4,
+      remoteSessionId: 'remote-expired',
+      agentThreadId: 'thread-existing',
+      providerState: { sessionKey: 'logical-session' },
+    };
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-remote-orphan-ready',
+        LARK_APP_ID: 'app_remote_orphan_ready',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-remote-orphan-ready',
+      chatId: 'oc_remote_orphan_ready',
+      rootMessageId: 'om_remote_orphan_ready',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: {
+        expectedProvider: 'orphan-ready-provider',
+        requiredCapabilities,
+      },
+      remoteBackendState: persistedState,
+      remoteResumeMode: 'orphan-reconcile',
+      prompt: '',
+      larkAppId: 'app_remote_orphan_ready',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => existsSync(commandsPath)
+        && readFileSync(commandsPath, 'utf8').includes('"type":"resume"'),
+      () => `orphan provider did not receive resume command\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.some(message => message.type === 'ready')).toBe(false);
+
+    writeFileSync(releaseReadyPath, 'release\n');
+    await waitFor(
+      () => messages.some(message => message.type === 'ready'),
+      () => `worker did not publish ready after orphan proof\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+
+    const commands = readFileSync(commandsPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    expect(commands).toContainEqual(expect.objectContaining({
+      type: 'resume',
+      resumeMode: 'orphan-reconcile',
+      state: persistedState,
+    }));
+    const advancedStateIndex = messages.findIndex(message =>
+      message.type === 'remote_backend_state'
+      && message.state.generation === 5
+      && message.state.remoteSessionId === undefined);
+    const readyIndex = messages.findIndex(message => message.type === 'ready');
+    expect(advancedStateIndex).toBeGreaterThanOrEqual(0);
+    expect(readyIndex).toBeGreaterThan(advancedStateIndex);
+    expect(messages.some(message => message.type === 'error')).toBe(false);
+  });
+
   it('passes persisted provider state and defers a durable refork ACK until provider submission', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-resume-'));
     tempDirs.push(root);

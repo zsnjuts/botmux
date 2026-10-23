@@ -384,6 +384,13 @@ export class RemoteRunnerBackend implements SessionBackend {
     this.readyCb = cb;
     if (this.ready) queueMicrotask(cb);
   }
+  async waitUntilReady(): Promise<void> {
+    if (!this.startupPromise) throw new Error('remote runner has not spawned');
+    await this.startupPromise;
+    if (!this.ready || !this.child || this.killed) {
+      throw new Error('remote runner provider exited before startup completed');
+    }
+  }
   onBackendState(cb: (state: RemoteRunnerBackendState) => void): void {
     this.stateCb = cb;
     if (this.state) queueMicrotask(() => cb(this.state!));
