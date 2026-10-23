@@ -5,6 +5,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { Session } from '../src/types.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import { createDurableSessionFacade } from '../src/services/durable-session-facade.js';
+import {
+  durableDirectSessionControlEvent,
+  durableLarkSessionControlPartition,
+  durableRemoteOrphanControlPartition,
+} from '../src/services/durable-lark-session-control.js';
 import { admitDurableLarkSession } from '../src/services/durable-session-primary.js';
 import { scanDurableRemoteOrphans } from '../src/services/durable-remote-orphan-reconciler.js';
 
@@ -84,7 +89,7 @@ describe('durable Remote Runner orphan reconciler', () => {
     const claim = await store.claimNextInbox({
       workerId: 'control-worker',
       lane: 'session-control',
-      partitionKeys: ['lark-session-control:cli_test:session-orphan'],
+      partitionKeys: [durableRemoteOrphanControlPartition('cli_test', 'session-orphan')],
       leaseDurationMs: 60_000,
     });
     expect(claim?.event).toMatchObject({
@@ -95,6 +100,74 @@ describe('durable Remote Runner orphan reconciler', () => {
         sessionId: 'session-orphan',
       },
     });
+    await facade.stop();
+    await store.close();
+  });
+
+  it('does not let an orphan proof backoff block a later explicit close', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-orphan-close-bypass-'));
+    tempDirs.push(dir);
+    let clock = 10;
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), {
+      now: () => clock,
+    });
+    const facade = createDurableSessionFacade({ store, ownerId: 'seed-owner' });
+    await admitDurableLarkSession({
+      facade,
+      message: {
+        eventType: 'lark.im.message.receive_v1',
+        eventId: 'im.message.receive_v1:cli_test:om_turn',
+        partitionKey: 'lark-message-routing:cli_test:oc_chat',
+        larkAppId: 'cli_test',
+        messageId: 'om_turn',
+        attempts: 1,
+        data: {},
+      },
+      session: canonical(),
+    });
+    await facade.releaseLease('om_root::cli_test');
+    await scanDurableRemoteOrphans({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'orphan-owner',
+      hasLocalOwner: () => false,
+      now: () => clock,
+    });
+    const orphan = await store.claimNextInbox({
+      workerId: 'orphan-worker',
+      lane: 'session-control',
+      partitionKeys: [durableRemoteOrphanControlPartition('cli_test', 'session-orphan')],
+      leaseDurationMs: 100,
+    });
+    expect(orphan).toBeDefined();
+    await store.retryInboxClaim({ claim: orphan!, visibleAt: 1_000 });
+
+    clock = 11;
+    await store.enqueueInbox(durableDirectSessionControlEvent({
+      source: 'lark-command',
+      larkAppId: 'cli_test',
+      operationId: 'lark-command.session-control:cli_test:om_close',
+      action: 'close',
+      sessionId: 'session-orphan',
+      rootId: 'om_root',
+      operatorOpenId: 'ou_operator',
+      cardMessageId: 'om_close',
+      now: clock,
+    }));
+    const close = await store.claimNextInbox({
+      workerId: 'close-worker',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-orphan')],
+      leaseDurationMs: 100,
+    });
+    expect(close?.event.eventId).toBe('lark-command.session-control:cli_test:om_close');
+    expect(close?.attempts).toBe(1);
+    expect(await store.claimNextInbox({
+      workerId: 'orphan-too-early',
+      lane: 'session-control',
+      partitionKeys: [durableRemoteOrphanControlPartition('cli_test', 'session-orphan')],
+      leaseDurationMs: 100,
+    })).toBeUndefined();
     await facade.stop();
     await store.close();
   });
