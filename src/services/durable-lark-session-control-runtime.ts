@@ -332,6 +332,23 @@ export function createDurableLarkSessionControlRuntime(
     if (control.action === 'handoff' && !handoffBaselineState) {
       return { kind: 'ignored', reason: 'canonical Session is not backed by a Remote Runner' };
     }
+    const handoffNeverStartedRemote = control.action === 'handoff'
+      && handoffBaselineState?.generation === 0
+      && !handoffBaselineState.remoteSessionId
+      && !handoffBaselineState.agentThreadId;
+    // A provider can fail before it publishes any remote identity while the
+    // local Session shell is already durable. If the owning daemon then rolls,
+    // its trusted-host handoff must retire that empty shell instead of retrying
+    // an impossible reattach forever. Keep this compatibility path in the
+    // consumer as well as the producer so an ambiguous handoff written by an
+    // older daemon can reconcile after upgrade.
+    if (handoffNeverStartedRemote && persisted?.status !== 'closed') {
+      persisted = options.materializeClosedSession({
+        ...structuredClone(canonicalSession),
+        status: 'closed',
+        closedAt: new Date(now()).toISOString(),
+      });
+    }
     const orphanBaselineState = control.action === 'terminalize_orphan'
       ? normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState)
       : undefined;
@@ -540,6 +557,21 @@ export function createDurableLarkSessionControlRuntime(
                   generation: active?.session.remoteBackendState?.generation,
                 }
               : {}),
+          },
+        };
+      }
+      if (handoffNeverStartedRemote && current.status === 'closed') {
+        return {
+          result: result('closed', undefined, {
+            retiringOwnerId: control.retiringOwnerId,
+            applied: false,
+            recovery: 'never-started',
+          }),
+          evidence: {
+            source: 'session-store',
+            status: 'closed',
+            recovery: 'never-started',
+            ...(current.closedAt ? { closedAt: current.closedAt } : {}),
           },
         };
       }
@@ -899,7 +931,9 @@ export function createDurableLarkSessionControlRuntime(
               || (control.action === 'resume'
                 && status !== 'active'
                 && !(status === 'closed' && parsed.applied === false))
-              || (control.action === 'handoff' && status !== 'active')
+              || (control.action === 'handoff'
+                && status !== 'active'
+                && !(handoffNeverStartedRemote && status === 'closed'))
               || (control.action === 'terminalize_orphan' && status !== 'closed')
               || (control.action === 'toggle_display'
                 && (status !== 'active'

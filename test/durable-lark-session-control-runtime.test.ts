@@ -209,6 +209,203 @@ describe('durable Lark session control runtime', () => {
     await facade.stop();
   });
 
+  it('retires a never-started Remote Runner when a trusted host requests handoff', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-unstarted-handoff-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'retiring-owner' });
+    const canonical = session({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'tae-traex',
+        generation: 0,
+        providerState: { sessionKey: 'bmx1-never-started' },
+      },
+    });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+
+    const facade = createDurableSessionFacade({ store, ownerId: 'peer-owner' });
+    let persisted: Session | undefined;
+    const materializeClosedSession = vi.fn((value: Session) => {
+      persisted = structuredClone(value);
+      return persisted;
+    });
+    const takeOverActiveSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: () => persisted,
+      materializeClosedSession,
+      takeOverActiveSession,
+      canOperate: () => true,
+      closeSession: vi.fn(),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: error => error,
+      now: () => 20,
+    });
+    const input = directControl('trusted-host', 'handoff', 'retiring-owner');
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(materializeClosedSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1',
+      status: 'closed',
+      closedAt: new Date(20).toISOString(),
+    }));
+    expect(takeOverActiveSession).not.toHaveBeenCalled();
+    expect(await store.readControlOperation(input.control.operationId)).toMatchObject({
+      state: 'completed',
+      attempts: 1,
+      result: {
+        action: 'handoff',
+        status: 'closed',
+        applied: false,
+        recovery: 'never-started',
+      },
+    });
+    expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
+      .toMatchObject({
+        session: { status: 'closed' },
+        controls: [{
+          source: 'trusted-host',
+          action: 'handoff',
+          operationId: input.control.operationId,
+        }],
+      });
+    await facade.stop();
+    await store.close();
+  });
+
+  it('reconciles a legacy ambiguous handoff for a never-started Remote Runner', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-legacy-handoff-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'retiring-owner' });
+    const canonical = session({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'tae-traex',
+        generation: 0,
+        providerState: { sessionKey: 'bmx1-never-started' },
+      },
+    });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+
+    const facade = createDurableSessionFacade({ store, ownerId: 'peer-owner' });
+    const input = directControl('trusted-host', 'handoff', 'retiring-owner');
+    const acquired = await store.acquireSessionLease({
+      sessionKey: 'om_root::cli_test',
+      ownerId: facade.ownerId,
+      leaseDurationMs: 60_000,
+    });
+    if (acquired.kind !== 'acquired') throw new Error('expected Session lease');
+    const operationPayload = {
+      version: 1,
+      type: 'botmux.lark.session-control-operation',
+      larkAppId: 'cli_test',
+      action: 'handoff',
+      sessionId: 'session-1',
+      rootId: 'om_root',
+      operatorOpenId: 'trusted-host',
+      cardMessageId: 'om_card',
+      retiringOwnerId: 'retiring-owner',
+    };
+    await store.enqueueControlOperation({
+      lease: acquired.lease,
+      operation: {
+        operationId: input.control.operationId,
+        sessionKey: 'om_root::cli_test',
+        payload: operationPayload,
+        createdAt: input.claim.event.createdAt,
+      },
+    });
+    const begun = await store.beginControlOperationAttempt({
+      lease: acquired.lease,
+      operationId: input.control.operationId,
+    });
+    if (begun.kind !== 'applied') throw new Error('expected control attempt');
+    await store.markControlOperationAmbiguous({
+      attempt: begun.attempt,
+      error: 'legacy takeover could not reattach generation zero',
+    });
+
+    let persisted: Session | undefined;
+    const takeOverActiveSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: () => persisted,
+      materializeClosedSession: value => {
+        persisted = structuredClone(value);
+        return persisted;
+      },
+      takeOverActiveSession,
+      canOperate: () => true,
+      closeSession: vi.fn(),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: error => error,
+      now: () => 20,
+    });
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(takeOverActiveSession).not.toHaveBeenCalled();
+    expect(await store.readControlOperation(input.control.operationId)).toMatchObject({
+      state: 'completed',
+      attempts: 1,
+      reconciliation: {
+        kind: 'completed',
+        attempt: 1,
+        evidence: {
+          source: 'session-store',
+          status: 'closed',
+          recovery: 'never-started',
+        },
+      },
+      result: { action: 'handoff', status: 'closed' },
+    });
+    expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
+      .toMatchObject({ session: { status: 'closed' } });
+    await facade.stop();
+    await store.close();
+  });
+
   it('re-authorizes typed Lark controls but trusts the HMAC-gated host source', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-source-auth-'));
     tempDirs.push(dir);
