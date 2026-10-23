@@ -1022,6 +1022,16 @@ export function createDurableLarkSessionControlRuntime(
               content: parsed.cardJson,
               msgType: 'interactive',
               providerUuid: `bct_${digest.slice(0, 40)}`,
+              ...(control.action === 'terminalize_orphan'
+                ? {
+                    terminalUpdateFallback: {
+                      target: control.rootId.startsWith('om_')
+                        ? { kind: 'reply' as const, messageId: control.rootId, replyInThread: true }
+                        : { kind: 'send' as const, chatId: current.chatId },
+                      providerUuid: `bcf_${digest.slice(0, 40)}`,
+                    },
+                  }
+                : {}),
               createdAt: context.claim.event.createdAt,
               visibleAt: now(),
             }), 'card');

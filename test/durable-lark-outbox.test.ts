@@ -169,7 +169,14 @@ describe('durable Lark outbox adapter', () => {
   });
 
   it('updates one stable card target idempotently through the durable outbox', async () => {
-    const record = row({ target: { kind: 'update', messageId: 'om_card' }, msgType: 'interactive' });
+    const record = row({
+      target: { kind: 'update', messageId: 'om_card' },
+      msgType: 'interactive',
+      terminalUpdateFallback: {
+        target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+        providerUuid: 'fallback_0123456789abcdef0123456789abcdef',
+      },
+    });
     const transport = deps();
     const result = await deliverDurableLarkOutbox(
       record,
@@ -191,6 +198,88 @@ describe('durable Lark outbox adapter', () => {
     expect(transport.updateMessage).toHaveBeenCalledWith('cli_test', 'om_card', 'hello');
     expect(transport.sendMessage).not.toHaveBeenCalled();
     expect(transport.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('replies once with the same terminal card when its update target was withdrawn', async () => {
+    const record = row({
+      target: { kind: 'update', messageId: 'om_card' },
+      msgType: 'interactive',
+      terminalUpdateFallback: {
+        target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+        providerUuid: 'fallback_0123456789abcdef0123456789abcdef',
+      },
+    });
+    const transport = deps();
+    transport.updateMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_card'));
+
+    const result = await deliverDurableLarkOutbox(
+      record,
+      context(record),
+      transport,
+      { now: () => 2_000 },
+    );
+
+    expect(result).toEqual({
+      kind: 'delivered',
+      receipt: {
+        provider: 'lark',
+        providerMessageId: 'om_replied',
+        providerUuid: 'fallback_0123456789abcdef0123456789abcdef',
+        operation: 'reply',
+        targetId: 'om_root',
+        disposition: 'fallback',
+        reason: 'message_withdrawn',
+        replacedTargetId: 'om_card',
+      },
+    });
+    expect(transport.replyMessage).toHaveBeenCalledWith(
+      'cli_test',
+      'om_root',
+      'hello',
+      'interactive',
+      true,
+      'fallback_0123456789abcdef0123456789abcdef',
+      { sessionId: 'session-1' },
+      { suppressHook: true },
+    );
+    expect(transport.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('safely retries a terminal-card fallback with its stable UUID', async () => {
+    const record = row({
+      target: { kind: 'update', messageId: 'om_card' },
+      msgType: 'interactive',
+      terminalUpdateFallback: {
+        target: { kind: 'send', chatId: 'oc_chat' },
+        providerUuid: 'fallback_0123456789abcdef0123456789abcdef',
+      },
+    });
+    const transport = deps();
+    transport.updateMessage.mockRejectedValueOnce(new MessageUpdateExpiredError('om_card'));
+    transport.sendMessage.mockRejectedValueOnce(Object.assign(new Error('gateway unavailable'), { status: 503 }));
+
+    const result = await deliverDurableLarkOutbox(
+      record,
+      context(record),
+      transport,
+      { now: () => 2_000, retryDelaysMs: [5_000] },
+    );
+
+    expect(result).toEqual({
+      kind: 'retry',
+      visibleAt: 7_000,
+      error: 'terminal update message_update_expired; fallback failed: gateway unavailable',
+      proof: 'stable_target_idempotency',
+    });
+  });
+
+  it('rejects a terminal update fallback on a non-update row', () => {
+    expect(() => row({
+      terminalUpdateFallback: {
+        target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+        providerUuid: 'fallback_0123456789abcdef0123456789abcdef',
+      },
+    })).toThrow(/requires an update target/);
   });
 
   it('uses the provider UUID window for bounded safe retry', async () => {

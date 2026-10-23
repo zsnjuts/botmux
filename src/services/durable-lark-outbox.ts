@@ -24,6 +24,13 @@ export type DurableLarkOutboxTarget =
   | { kind: 'reply'; messageId: string; replyInThread: boolean }
   | { kind: 'update'; messageId: string };
 
+export type DurableLarkOutboxFallbackTarget = Exclude<DurableLarkOutboxTarget, { kind: 'update' }>;
+
+export interface DurableLarkOutboxTerminalUpdateFallback {
+  target: DurableLarkOutboxFallbackTarget;
+  providerUuid: string;
+}
+
 export interface DurableLarkOutboxEnvelope {
   version: typeof DURABLE_LARK_OUTBOX_VERSION;
   type: 'botmux.lark.outbound';
@@ -33,6 +40,7 @@ export interface DurableLarkOutboxEnvelope {
   content: string;
   msgType: string;
   providerUuid: string;
+  terminalUpdateFallback?: DurableLarkOutboxTerminalUpdateFallback;
   hookContext?: { [key: string]: DurableJson };
 }
 
@@ -44,6 +52,7 @@ export interface DurableLarkOutboxInput {
   content: string;
   msgType?: string;
   providerUuid: string;
+  terminalUpdateFallback?: DurableLarkOutboxTerminalUpdateFallback;
   hookContext?: Record<string, unknown>;
   visibleAt?: number;
   createdAt?: number;
@@ -142,6 +151,26 @@ function target(value: unknown): DurableLarkOutboxTarget {
   throw new Error('durable Lark outbox target is invalid');
 }
 
+function terminalUpdateFallback(
+  value: unknown,
+  primaryTarget: DurableLarkOutboxTarget,
+): DurableLarkOutboxTerminalUpdateFallback | undefined {
+  if (value === undefined) return undefined;
+  if (primaryTarget.kind !== 'update') {
+    throw new Error('durable Lark terminal update fallback requires an update target');
+  }
+  const item = record(value);
+  if (!item) throw new Error('durable Lark terminal update fallback is invalid');
+  const fallbackTarget = target(item.target);
+  if (fallbackTarget.kind === 'update') {
+    throw new Error('durable Lark terminal update fallback must send or reply');
+  }
+  return {
+    target: fallbackTarget,
+    providerUuid: providerUuid(item.providerUuid),
+  };
+}
+
 function envelope(value: unknown): DurableLarkOutboxEnvelope {
   const item = record(value);
   if (item?.version !== DURABLE_LARK_OUTBOX_VERSION || item.type !== 'botmux.lark.outbound') {
@@ -151,15 +180,18 @@ function envelope(value: unknown): DurableLarkOutboxEnvelope {
   const larkAppId = nonempty(item.larkAppId, 'durable Lark app id', 256);
   if (!larkAppId.startsWith('cli_')) throw new Error('durable Lark app id is invalid');
   const msgType = nonempty(item.msgType, 'durable Lark message type', 64);
+  const parsedTarget = target(item.target);
+  const fallback = terminalUpdateFallback(item.terminalUpdateFallback, parsedTarget);
   return {
     version: DURABLE_LARK_OUTBOX_VERSION,
     type: 'botmux.lark.outbound',
     messageId,
     larkAppId,
-    target: target(item.target),
+    target: parsedTarget,
     content: content(item.content),
     msgType,
     providerUuid: providerUuid(item.providerUuid),
+    ...(fallback ? { terminalUpdateFallback: fallback } : {}),
     ...(item.hookContext === undefined
       ? {}
       : { hookContext: durableObject(item.hookContext, 'durable Lark hookContext', MAX_HOOK_CONTEXT_BYTES) }),
@@ -178,6 +210,9 @@ export function durableLarkOutboxMessage(input: DurableLarkOutboxInput): Durable
     content: input.content,
     msgType: input.msgType ?? 'text',
     providerUuid: input.providerUuid,
+    ...(input.terminalUpdateFallback
+      ? { terminalUpdateFallback: input.terminalUpdateFallback }
+      : {}),
     ...(input.hookContext ? { hookContext: input.hookContext } : {}),
   });
   return {
@@ -320,6 +355,73 @@ export async function deliverDurableLarkOutbox(
         && (error instanceof MessageWithdrawnError
           || error instanceof MessageUpdateExpiredError
           || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'))) {
+      const reason = error instanceof MessageUpdateExpiredError
+        ? 'message_update_expired'
+        : error instanceof MessageWithdrawnError
+          ? 'message_withdrawn'
+          : 'topic_unavailable';
+      const fallback = reason === 'topic_unavailable'
+        ? undefined
+        : parsed.terminalUpdateFallback;
+      if (fallback) {
+        try {
+          const providerMessageId = fallback.target.kind === 'send'
+            ? await deps.sendMessage(
+              parsed.larkAppId,
+              fallback.target.chatId,
+              parsed.content,
+              parsed.msgType,
+              fallback.providerUuid,
+              hookContext,
+              { suppressHook: true },
+            )
+            : await deps.replyMessage(
+              parsed.larkAppId,
+              fallback.target.messageId,
+              parsed.content,
+              parsed.msgType,
+              fallback.target.replyInThread,
+              fallback.providerUuid,
+              hookContext,
+              { suppressHook: true },
+            );
+          return {
+            kind: 'delivered',
+            receipt: {
+              provider: 'lark',
+              providerMessageId,
+              providerUuid: fallback.providerUuid,
+              operation: fallback.target.kind,
+              targetId: fallback.target.kind === 'send'
+                ? fallback.target.chatId
+                : fallback.target.messageId,
+              disposition: 'fallback',
+              reason,
+              replacedTargetId: parsed.target.messageId,
+            },
+          };
+        } catch (fallbackError) {
+          const fallbackDetail = describeSendFailure(fallbackError);
+          if (fallbackError instanceof TopicSendError
+              && fallbackError.code === 'TOPIC_SEND_CHECK_FAILED') {
+            return safeRetry(
+              `terminal update ${reason}; fallback unavailable: ${fallbackDetail}`,
+              'no_side_effect',
+            );
+          }
+          const fallbackClassification = classifyFeishuError(fallbackError);
+          if (fallbackClassification?.errorClass === 'retryable') {
+            return safeRetry(
+              `terminal update ${reason}; fallback failed: ${fallbackDetail}`,
+              'stable_target_idempotency',
+            );
+          }
+          return {
+            kind: 'ambiguous',
+            error: `terminal update ${reason}; fallback failed: ${fallbackDetail}`,
+          };
+        }
+      }
       return {
         kind: 'delivered',
         receipt: {
@@ -329,11 +431,7 @@ export async function deliverDurableLarkOutbox(
           operation: 'update',
           targetId: parsed.target.messageId,
           disposition: 'discarded',
-          reason: error instanceof MessageUpdateExpiredError
-            ? 'message_update_expired'
-            : error instanceof MessageWithdrawnError
-              ? 'message_withdrawn'
-              : 'topic_unavailable',
+          reason,
         },
       };
     }
