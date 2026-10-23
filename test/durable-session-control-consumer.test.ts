@@ -211,6 +211,38 @@ describe('durable session control consumer', () => {
     await store.close();
   });
 
+  it('uses idle exact-owner slots to drain canonical-only backlog after the grace', async () => {
+    let now = 10;
+    let ownerReads = 0;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-remote-a', 'evt-remote-a', 1));
+    await store.enqueueInbox(controlEvent('session-remote-b', 'evt-remote-b', 2));
+    const dispatched: string[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-prefix-with-idle-exact',
+      ownedPartitionKeys: () => {
+        ownerReads += 1;
+        if (ownerReads === 1) now += 1_000;
+        return [durableLarkSessionControlPartition('cli_test', 'session-local-idle')];
+      },
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      dispatch: async control => {
+        dispatched.push(control.sessionId);
+        return { kind: 'settled' };
+      },
+      concurrency: 2,
+      batchSize: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await consumer.ready;
+    expect(new Set(dispatched)).toEqual(new Set(['session-remote-a', 'session-remote-b']));
+    await consumer.stop();
+    await store.close();
+  });
+
   it('gives the exact owner one interval before prefix failover can steal a fresh control', async () => {
     let now = 10;
     const store = makeStore(() => now);

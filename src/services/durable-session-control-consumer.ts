@@ -183,7 +183,7 @@ export function startDurableSessionControlConsumer(
   let stopPromise: Promise<DurableSessionControlConsumerStopResult> | undefined;
   let partitionCursor = 0;
   let lastFallbackClaimAt = now();
-  let prefixOnlyFallbackOpen = false;
+  let fallbackWindowOpen = false;
 
   const reportError = (error: unknown): void => {
     try { options.onError?.(error); } catch { /* observers cannot alter claim state */ }
@@ -285,24 +285,20 @@ export function startDurableSessionControlConsumer(
       let claim: InboxClaim | undefined;
       try {
         const partitionKeys = nextOwnedPartitionBatch();
-        if (partitionKeys.length > 0) prefixOnlyFallbackOpen = false;
+        let prefixClaimAttempted = false;
         if (partitionKeyPrefix
-            && (prefixOnlyFallbackOpen
-              || now() - lastFallbackClaimAt >= fallbackClaimIntervalMs)) {
+            && now() - lastFallbackClaimAt >= fallbackClaimIntervalMs) {
           // Give exact owners the initial interval, then reserve one periodic
           // prefix-first probe. If locally owned partitions are continuously
           // retryable, probing the prefix only after an exact miss starves
-          // canonical-only failover controls forever. Once this Pod owns no
-          // exact partitions, the initial grace still protects a live remote
-          // owner, but the prefix becomes the only eligible work source and
-          // all slots must be allowed to drain it. Keeping the one-slot
-          // throttle open in that state makes a backlog of slow historical
-          // reconciliations delay fresh close/orphan controls for minutes.
-          if (partitionKeys.length === 0) {
-            prefixOnlyFallbackOpen = true;
-          } else {
-            lastFallbackClaimAt = now();
-          }
+          // canonical-only failover controls forever. Opening the fallback
+          // window also lets other idle slots use the prefix after an exact
+          // miss. Without that second path, even one locally owned partition
+          // keeps a large canonical-only backlog serialized behind this
+          // single periodic probe.
+          fallbackWindowOpen = true;
+          lastFallbackClaimAt = now();
+          prefixClaimAttempted = true;
           claim = await options.store.claimNextInbox({
             workerId: slotWorkerId,
             lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
@@ -315,6 +311,14 @@ export function startDurableSessionControlConsumer(
             workerId: slotWorkerId,
             lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
             partitionKeys,
+            leaseDurationMs,
+          });
+        }
+        if (!claim && partitionKeyPrefix && fallbackWindowOpen && !prefixClaimAttempted) {
+          claim = await options.store.claimNextInbox({
+            workerId: slotWorkerId,
+            lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+            partitionKeyPrefix,
             leaseDurationMs,
           });
         }
