@@ -31083,7 +31083,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           stableKey: string,
           canonical: Session,
           options?: { remoteResumeMode?: 'reattach' | 'close-control' | 'orphan-reconcile' },
-        ): Promise<Session | { kind: 'retry'; reason: string } | undefined> => {
+        ): Promise<{
+          session: Session;
+          owner: DaemonSession;
+        } | { kind: 'retry'; reason: string } | undefined> => {
           if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
           try {
             const claimed = await claimDurableLarkActiveSession({
@@ -31104,7 +31107,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             if (local?.session.sessionId === claimed.session.sessionId
                 && local.session.status === 'active'
                 && options?.remoteResumeMode !== 'orphan-reconcile') {
-              return local.session;
+              return { session: local.session, owner: local };
             }
             const takeover = await takeOverDurableActiveRemoteSession(
               claimed.session,
@@ -31117,7 +31120,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 + (takeover.detail ? ` (${takeover.detail})` : ''),
               );
             }
-            return takeover.ds.session;
+            return { session: takeover.ds.session, owner: takeover.ds };
           } catch (error) {
             await primaryRuntime.session.releaseLease(stableKey);
             throw error;
@@ -31163,7 +31166,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
             },
-            takeOverPrimarySession,
+            takeOverPrimarySession: async (stableKey, canonical) => {
+              const result = await takeOverPrimarySession(stableKey, canonical);
+              return result && !('kind' in result) ? result.session : result;
+            },
           },
         );
         startEventDispatchers.push(() => {
@@ -31200,16 +31206,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             takeOverActiveSession: async (stableKey, canonical, options) => {
               return takeOverPrimarySession(stableKey, canonical, options);
             },
-            abandonOrphanTakeover: sessionId => {
-              const target = findActiveBySessionId(sessionId);
+            abandonOrphanTakeover: (sessionId, expectedOwner) => {
+              const current = findActiveBySessionId(sessionId);
+              const target = expectedOwner ?? current;
               if (target) {
                 retireWorkerProcessOnly(target, 'remote_orphan_proof_not_established');
                 for (const [key, candidate] of activeSessions) {
                   if (candidate === target) activeSessions.delete(key);
                 }
               }
+              // A proof owner can be superseded while its provider is starting.
+              // Retire that exact process, but never close the replacement's
+              // local row merely because it reused the logical Session id.
+              const stillCurrent = findActiveBySessionId(sessionId);
               const local = sessionStore.getOwnedSession(sessionId);
-              if (local?.status === 'active') sessionStore.closeSession(sessionId);
+              if ((!stillCurrent || stillCurrent === target) && local?.status === 'active') {
+                sessionStore.closeSession(sessionId);
+              }
               if (target) {
                 target.session.status = 'closed';
                 target.session.closedAt ??= new Date().toISOString();

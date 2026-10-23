@@ -64,11 +64,17 @@ export interface DurableLarkSessionControlRuntimeOptions {
     sessionKey: string,
     canonical: Session,
     options?: { remoteResumeMode?: 'reattach' | 'close-control' | 'orphan-reconcile' },
-  ): Promise<Session | { kind: 'retry'; reason: string } | undefined>;
+  ): Promise<{
+    session: Session;
+    owner: DaemonSession;
+  } | { kind: 'retry'; reason: string } | undefined>;
   /** Roll back only this replica's temporary canonical materialization after
    * an orphan proof was refused or inconclusive. It must not mutate canonical
    * state or call the provider's cancel operation. */
-  abandonOrphanTakeover?(sessionId: string): Promise<void> | void;
+  abandonOrphanTakeover?(
+    sessionId: string,
+    expectedOwner?: DaemonSession,
+  ): Promise<void> | void;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   terminalizeOrphanSession?(sessionId: string): Promise<CloseResult>;
@@ -684,7 +690,7 @@ export function createDurableLarkSessionControlRuntime(
             if (!takeover) {
               return { kind: 'not_applied', error: 'remote handoff takeover is unavailable' };
             }
-            if ('kind' in takeover && takeover.kind === 'retry') {
+            if ('kind' in takeover) {
               return { kind: 'not_applied', error: takeover.reason };
             }
             live = options.findActiveSession(control.sessionId);
@@ -704,37 +710,45 @@ export function createDurableLarkSessionControlRuntime(
             if (!takeover) {
               return { kind: 'not_applied', error: 'orphan reconciliation is unavailable' };
             }
-            if ('kind' in takeover && takeover.kind === 'retry') {
+            if ('kind' in takeover) {
               return { kind: 'not_applied', error: takeover.reason };
+            }
+            const proofOwner = takeover.owner;
+            if (proofOwner.initConfig?.remoteResumeMode !== 'orphan-reconcile') {
+              await options.abandonOrphanTakeover?.(control.sessionId, proofOwner);
+              return {
+                kind: 'not_applied',
+                error: 'orphan reconciliation owner did not retain its lifecycle intent',
+              };
             }
             const deadline = now() + resumeReadinessTimeoutMs;
             for (;;) {
               if (signal.aborted) throw signal.reason;
               live = options.findActiveSession(control.sessionId);
-              if (live && (!options.isResumeReady || options.isResumeReady(live))) break;
+              if (live !== proofOwner) {
+                await options.abandonOrphanTakeover?.(control.sessionId, proofOwner);
+                return {
+                  kind: 'not_applied',
+                  error: 'orphan reconciliation owner changed before proof completed',
+                };
+              }
+              if (!options.isResumeReady || options.isResumeReady(proofOwner)) break;
               if (now() >= deadline) {
-                await options.abandonOrphanTakeover?.(control.sessionId);
+                await options.abandonOrphanTakeover?.(control.sessionId, proofOwner);
                 return {
                   kind: 'not_applied',
                   error: 'provider did not prove the remote resource missing',
                 };
               }
-              if (!live) {
-                await options.abandonOrphanTakeover?.(control.sessionId);
-                return {
-                  kind: 'not_applied',
-                  error: 'provider refused or could not complete orphan reconciliation',
-                };
-              }
               await wait(Math.min(resumeReadinessPollMs, deadline - now()), signal);
             }
             const provedState = normalizeRemoteRunnerBackendState(
-              live?.session.remoteBackendState,
+              proofOwner.session.remoteBackendState,
             );
             if (!provedState || provedState.remoteSessionId
                 || !orphanBaselineState
                 || provedState.generation <= orphanBaselineState.generation) {
-              await options.abandonOrphanTakeover?.(control.sessionId);
+              await options.abandonOrphanTakeover?.(control.sessionId, proofOwner);
               return {
                 kind: 'not_applied',
                 error: 'provider did not advance into a missing-remote terminal lineage',
