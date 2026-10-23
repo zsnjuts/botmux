@@ -43,6 +43,7 @@ const TERMINAL_RESUME_REFUSALS = new Set([
   'not_closed',
   'resume_cancelled',
 ]);
+const TRUSTED_HANDOFF_HORIZON_MS = 5 * 60_000;
 
 export interface DurableLarkSessionControlRuntimeOptions {
   larkAppId: string;
@@ -318,6 +319,16 @@ export function createDurableLarkSessionControlRuntime(
     }
     if (control.action === 'terminalize_orphan' && !trustedHost) {
       return { kind: 'ignored', reason: 'orphan terminalization requires a trusted host' };
+    }
+    if (control.action === 'handoff' && trustedHost
+        && now() - context.claim.event.createdAt >= TRUSTED_HANDOFF_HORIZON_MS) {
+      // Handoff is a short transition between a retiring owner and its
+      // successor. Once that transition horizon is exceeded, retrying the old
+      // event cannot restore the original owner and only keeps newer lifecycle
+      // controls behind the same partition FIFO head. Complete the stale
+      // handoff without changing canonical state; a later message or orphan
+      // proof can then recover the current lineage under its own fence.
+      return { kind: 'ignored', reason: 'stale remote handoff exceeded its recovery horizon' };
     }
     if (control.action === 'handoff'
         && options.facade().ownerId === control.retiringOwnerId) {
