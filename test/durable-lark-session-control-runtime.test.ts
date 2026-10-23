@@ -1496,7 +1496,13 @@ describe('durable Lark session control runtime', () => {
       });
     const digest = createHash('sha256').update(input.control.operationId).digest('hex');
     expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
-      .toMatchObject({ content: '{"orphan":"terminal"}' });
+      .toMatchObject({
+        content: '{"orphan":"terminal"}',
+        terminalUpdateFallback: {
+          target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+          providerUuid: `bcf_${digest.slice(0, 40)}`,
+        },
+      });
     await facade.stop();
     await store.close();
   });
