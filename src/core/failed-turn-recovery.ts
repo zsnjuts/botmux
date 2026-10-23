@@ -99,11 +99,23 @@ export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void
  * active turn; a late terminal must not erase an already-claimed receipt. */
 export function recordFailedTurnTerminal(
   ds: DaemonSession,
-  terminal: { turnId: string; status: string; errorCode?: string },
+  terminal: {
+    turnId: string;
+    status: string;
+    errorCode?: string;
+    recoveredRemoteTurn?: true;
+  },
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
   if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
     clearLimitedFailedTurn(ds, terminal.turnId);
+    // A later successful turn proves that this local Remote Runner owner is no
+    // longer stranded on the prior recovered-turn failure. Keep the historical
+    // failure record, but revoke the orphan-reconciliation eligibility marker.
+    if (ds.session.lastFailedTurn?.recoveredRemoteTurn) {
+      delete ds.session.lastFailedTurn.recoveredRemoteTurn;
+      store.updateSession(ds.session);
+    }
   }
   if (terminal.status !== 'failed' && terminal.status !== 'ambiguous') return;
   if (!shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)

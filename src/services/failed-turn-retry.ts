@@ -34,7 +34,12 @@ export function shouldRecordFailedTurn(
  *  when there is no CLI input to re-inject (e.g. a turn that died before its
  *  prompt was wrapped). */
 export function buildFailedTurnRecord(
-  terminal: { turnId: string; status: 'failed' | 'ambiguous'; errorCode?: string },
+  terminal: {
+    turnId: string;
+    status: 'failed' | 'ambiguous';
+    errorCode?: string;
+    recoveredRemoteTurn?: true;
+  },
   sources: { userPrompt?: string; cliInput?: string; codexAppInput?: CodexAppTurnInput;
     trustedCaller?: TrustedCaller; originalTurnId?: string; silent?: boolean },
   now: Date = new Date(),
@@ -47,6 +52,7 @@ export function buildFailedTurnRecord(
     ...(sources.codexAppInput ? { codexAppInput: sources.codexAppInput } : {}),
     failedAt: now.toISOString(),
     ...(terminal.errorCode ? { errorCode: terminal.errorCode } : {}),
+    ...(terminal.recoveredRemoteTurn ? { recoveredRemoteTurn: true } : {}),
     status: terminal.status,
     retryCount: 0,
     ...(sources.silent ? { silent: true } : {}),

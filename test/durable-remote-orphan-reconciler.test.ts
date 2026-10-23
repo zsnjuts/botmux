@@ -133,4 +133,46 @@ describe('durable Remote Runner orphan reconciler', () => {
     await facade.stop();
     await store.close();
   });
+
+  it('does not let a stranded recovered-turn owner suppress provider reconciliation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-orphan-stranded-owner-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'seed-owner' });
+    const stranded = canonical();
+    stranded.lastFailedTurn = {
+      turnId: 'om_recovered',
+      userPrompt: 'original prompt',
+      cliInput: 'original input',
+      failedAt: '2026-10-23T00:01:00.000Z',
+      errorCode: 'provider_takeover_failed',
+      status: 'ambiguous',
+      retryCount: 0,
+      recoveredRemoteTurn: true,
+    };
+    await admitDurableLarkSession({
+      facade,
+      message: {
+        eventType: 'lark.im.message.receive_v1',
+        eventId: 'im.message.receive_v1:cli_test:om_turn',
+        partitionKey: 'lark-message-routing:cli_test:oc_chat',
+        larkAppId: 'cli_test',
+        messageId: 'om_turn',
+        attempts: 1,
+        data: {},
+      },
+      session: stranded,
+    });
+    await facade.releaseLease('om_root::cli_test');
+
+    await expect(scanDurableRemoteOrphans({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'orphan-owner',
+      hasLocalOwner: () => true,
+    })).resolves.toMatchObject({ candidates: 1, enqueued: 1 });
+
+    await facade.stop();
+    await store.close();
+  });
 });

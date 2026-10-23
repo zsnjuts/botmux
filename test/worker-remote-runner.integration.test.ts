@@ -215,7 +215,8 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     await waitFor(
       () => messages.some(message => message.type === 'turn_terminal'
         && message.turnId === 'om_turn_survived'
-        && message.status === 'completed'),
+        && message.status === 'completed'
+        && message.recoveredRemoteTurn === true),
       () => `remote runner takeover did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
     );
     await waitFor(

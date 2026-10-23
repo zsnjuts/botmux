@@ -283,6 +283,12 @@ export interface FailedTurnRecord {
   codexAppInput?: CodexAppTurnInput;
   failedAt: string;        // ISO
   errorCode?: string;
+  /** This terminal belongs to a provider-owned turn adopted during Remote
+   * Runner resume. A failed/ambiguous recovered turn means the local worker no
+   * longer proves that it can advance the persisted remote lineage; the
+   * durable orphan reconciler may probe that lineage even while this replica
+   * still has a stranded active projection. */
+  recoveredRemoteTurn?: true;
   status: 'failed' | 'ambiguous';
   retryCount: number;
   lastRetryAt?: string;    // ISO
@@ -2402,6 +2408,10 @@ export type WorkerToDaemon =
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       errorCode?: string;
+      /** The worker adopted this already-submitted turn from the Remote Runner
+       * provider during resume. This is host-observed provenance, not an error
+       * code convention supplied by one provider. */
+      recoveredRemoteTurn?: true;
       /** Provider-neutral recovery hint. Only an explicit true authorizes the
        * daemon's bounded ordinary-turn continuation policy. */
       retryable?: boolean;
