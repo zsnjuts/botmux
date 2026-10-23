@@ -79,7 +79,7 @@ describe('trusted-host durable Session control request', () => {
       expect(event).toMatchObject({
         eventId: 'trusted-host.session-control:cli_test:session-1:7:close',
         lane: 'session-control',
-        partitionKey: 'lark-session-control:cli_test:session-1',
+        partitionKey: 'lark-session-control:cli_test:interactive:session-1',
         payload: {
           type: 'botmux.session.control',
           source: 'trusted-host',

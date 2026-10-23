@@ -7,6 +7,7 @@ import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-c
 import { createDurableSessionFacade } from '../src/services/durable-session-facade.js';
 import {
   durableDirectSessionControlEvent,
+  durableInteractiveSessionControlPartition,
   durableLarkSessionControlPartition,
   durableRemoteOrphanControlPartition,
 } from '../src/services/durable-lark-session-control.js';
@@ -104,7 +105,7 @@ describe('durable Remote Runner orphan reconciler', () => {
     await store.close();
   });
 
-  it('does not let an orphan proof backoff block a later explicit close', async () => {
+  it('does not let a legacy ordinary-partition orphan backoff block a later explicit close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-orphan-close-bypass-'));
     tempDirs.push(dir);
     let clock = 10;
@@ -126,17 +127,22 @@ describe('durable Remote Runner orphan reconciler', () => {
       session: canonical(),
     });
     await facade.releaseLease('om_root::cli_test');
-    await scanDurableRemoteOrphans({
-      store,
+    const legacyOrphan = durableDirectSessionControlEvent({
+      source: 'trusted-host',
       larkAppId: 'cli_test',
-      ownerId: 'orphan-owner',
-      hasLocalOwner: () => false,
-      now: () => clock,
+      operationId: 'trusted-host.remote-orphan:cli_test:session-orphan:2',
+      action: 'terminalize_orphan',
+      sessionId: 'session-orphan',
+      rootId: 'om_root',
+      cardMessageId: 'om_card',
+      now: clock,
     });
+    legacyOrphan.partitionKey = durableLarkSessionControlPartition('cli_test', 'session-orphan');
+    await store.enqueueInbox(legacyOrphan);
     const orphan = await store.claimNextInbox({
       workerId: 'orphan-worker',
       lane: 'session-control',
-      partitionKeys: [durableRemoteOrphanControlPartition('cli_test', 'session-orphan')],
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-orphan')],
       leaseDurationMs: 100,
     });
     expect(orphan).toBeDefined();
@@ -157,7 +163,7 @@ describe('durable Remote Runner orphan reconciler', () => {
     const close = await store.claimNextInbox({
       workerId: 'close-worker',
       lane: 'session-control',
-      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-orphan')],
+      partitionKeys: [durableInteractiveSessionControlPartition('cli_test', 'session-orphan')],
       leaseDurationMs: 100,
     });
     expect(close?.event.eventId).toBe('lark-command.session-control:cli_test:om_close');
@@ -165,7 +171,7 @@ describe('durable Remote Runner orphan reconciler', () => {
     expect(await store.claimNextInbox({
       workerId: 'orphan-too-early',
       lane: 'session-control',
-      partitionKeys: [durableRemoteOrphanControlPartition('cli_test', 'session-orphan')],
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-orphan')],
       leaseDurationMs: 100,
     })).toBeUndefined();
     await facade.stop();
