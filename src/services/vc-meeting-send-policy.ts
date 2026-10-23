@@ -49,6 +49,37 @@ export interface VcMeetingManagedSendOrigin {
   forInMeetingOutput?: boolean;
 }
 
+/**
+ * Classify whether an attempt-bearing turn actually belongs to the VC-managed
+ * delivery domain. `dispatchAttempt` is also used by other durable admission
+ * lanes, so its presence alone is routing identity, not VC output authority.
+ *
+ * A canonical receiver marker is sufficient evidence even before its receipt
+ * is visible. Conversely, a persisted receipt keeps the turn managed if the
+ * marker was lost or is stale, so corrupted receiver metadata cannot downgrade
+ * an existing VC delivery into an ordinary send.
+ */
+export type VcMeetingManagedTurnEvidence =
+  | { kind: 'ordinary' }
+  | { kind: 'receiver_session' }
+  | { kind: 'durable_receipt' };
+
+export function classifyVcMeetingManagedTurn(
+  dataDir: string,
+  origin: Pick<
+    VcMeetingManagedSendOrigin,
+    'receiverSessionId' | 'receiverSession' | 'turnId' | 'dispatchAttempt'
+  >,
+): VcMeetingManagedTurnEvidence {
+  if (origin.receiverSession) return { kind: 'receiver_session' };
+  if (!origin.turnId || origin.dispatchAttempt === undefined) {
+    return { kind: 'ordinary' };
+  }
+  return findVcMeetingDeliveryByKey(dataDir, origin.turnId)
+    ? { kind: 'durable_receipt' }
+    : { kind: 'ordinary' };
+}
+
 export type VcMeetingManagedSendDecision =
   | { ok: true; kind: 'ordinary' }
   | {
@@ -198,6 +229,10 @@ export function evaluateVcMeetingManagedSend(
   dataDir: string,
   origin: VcMeetingManagedSendOrigin,
 ): VcMeetingManagedSendDecision {
+  const managedEvidence = classifyVcMeetingManagedTurn(dataDir, origin);
+  if (managedEvidence.kind === 'ordinary') {
+    return { ok: true, kind: 'ordinary' };
+  }
   if (origin.dispatchAttempt === undefined) {
     if (origin.receiverSession) {
       const imOrigin = origin.currentImTurnOrigin;

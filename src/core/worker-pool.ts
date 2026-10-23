@@ -3062,7 +3062,36 @@ function topicReportsToDispatcher(ds: DaemonSession, dispatchRoot: string | unde
   }
 }
 
-function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
+function exactTurnHumanRecipientOpenId(
+  ds: DaemonSession,
+  turnId: string | undefined,
+): string | undefined {
+  if (!turnId) return undefined;
+  const reply = pickTurnReplyTarget(ds.session, turnId);
+  const frozen = ds.session.turnReplyContexts?.[turnId];
+  const openId = reply?.senderOpenId ?? frozen?.replyTargetSenderOpenId;
+  if (!openId?.startsWith('ou_') || openId === getBot(ds.larkAppId).botOpenId) {
+    return undefined;
+  }
+  const participant = reply?.participants?.find(candidate => candidate.openId === openId);
+  const isBot = participant?.isBot
+    ?? (frozen?.replyTargetSenderOpenId === openId
+      ? frozen.replyTargetSenderIsBot
+      : undefined)
+    ?? (ds.session.quoteTargetId === turnId
+      && ds.session.quoteTargetSenderOpenId === openId
+      ? ds.session.quoteTargetSenderIsBot
+      : undefined);
+  return isBot === false ? openId : undefined;
+}
+
+function daemonCardFooterRecipientOpenId(
+  ds: DaemonSession,
+  effectiveCliId?: string,
+  turnId?: string,
+): string | undefined {
+  const turnRecipient = exactTurnHumanRecipientOpenId(ds, turnId);
+  if (turnRecipient) return turnRecipient;
   const owner = ds.session.ownerOpenId;
   if (!owner) {
     // Mira / Mir run through botmux's stdout-runner and cannot execute
@@ -20397,7 +20426,11 @@ function deliverFinalOutput(
         : imOrigin?.replyTargetSenderOpenId
           ?? (zeroPromptReply
             ? (reportInsteadOfAt ? undefined : initiator?.openId)
-            : daemonCardFooterRecipientOpenId(ds, effectiveCliId));
+            : daemonCardFooterRecipientOpenId(
+                ds,
+                effectiveCliId,
+                msg.replyTurnId ?? msg.turnId,
+              ));
       // 失败兜底通知正文 @ 真人。有 footer 收件人（真人 owner / 触发者）时其 <at>
       // 已经会提醒，不重复；仅当没有任何真人收件人时（bot-to-bot 派发的会话）回退
       // @ bot 管理员，让模型网关类故障有人看见而不是静默滑过。
