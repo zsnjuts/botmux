@@ -204,6 +204,93 @@ describe('durable config coordinator', () => {
     await store.close();
   });
 
+  it('inspects content drift without exposing configuration bytes', async () => {
+    const { path, store, coordinator } = fixture();
+    await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
+    const committedSha256 = contentSha256(path);
+    writeFileSync(path, JSON.stringify({ editedOutsideCoordinator: true, secret: 'still-private' }) + '\n');
+
+    const result = await coordinator.inspect({ scope: 'global', path });
+
+    expect(result).toMatchObject({
+      scope: 'global',
+      status: 'content_drift',
+      committedSha256,
+      fileSha256: contentSha256(path),
+      pathMatches: true,
+    });
+    expect(JSON.stringify(result)).not.toContain('still-private');
+    expect(JSON.stringify(result)).not.toContain(path);
+    await store.close();
+  });
+
+  it('reconciles an explicitly confirmed external write under the durable lease', async () => {
+    const { path, store, coordinator } = fixture();
+    await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
+    const committedSha256 = contentSha256(path);
+    writeFileSync(path, JSON.stringify({ editedOutsideCoordinator: true }) + '\n');
+    const fileSha256 = contentSha256(path);
+
+    const result = await coordinator.reconcile({
+      scope: 'global',
+      path,
+      expectedCommittedSha256: committedSha256,
+      expectedFileSha256: fileSha256,
+    });
+
+    expect(result).toMatchObject({
+      status: 'in_sync',
+      recordRevision: 3,
+      committedSha256: fileSha256,
+      fileSha256,
+    });
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({
+        revision: 3,
+        value: {
+          phase: 'committed',
+          baseSha256: committedSha256,
+          contentSha256: fileSha256,
+          audit: [
+            expect.objectContaining({ outcome: 'committed' }),
+            expect.objectContaining({
+              outcome: 'reconciled_external',
+              baseSha256: committedSha256,
+              contentSha256: fileSha256,
+              changedPaths: ['<external-reconcile>'],
+            }),
+          ],
+        },
+      });
+    await expect(coordinator.run({ scope: 'global', path, mutation: async () => undefined }))
+      .resolves.toBeUndefined();
+    await store.close();
+  });
+
+  it('rejects stale reconcile hashes without changing the CAS record', async () => {
+    const { path, store, coordinator } = fixture();
+    await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
+    const committedSha256 = contentSha256(path);
+    writeFileSync(path, JSON.stringify({ editedOutsideCoordinator: true }) + '\n');
+    const fileSha256 = contentSha256(path);
+
+    await expect(coordinator.reconcile({
+      scope: 'global',
+      path,
+      expectedCommittedSha256: '0'.repeat(64),
+      expectedFileSha256: fileSha256,
+    })).rejects.toThrow('durable_config_reconcile_committed_sha_mismatch');
+    await expect(coordinator.reconcile({
+      scope: 'global',
+      path,
+      expectedCommittedSha256: committedSha256,
+      expectedFileSha256: 'f'.repeat(64),
+    })).rejects.toThrow('durable_config_reconcile_file_sha_mismatch');
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({ revision: 2, value: { contentSha256: committedSha256 } });
+    await store.close();
+  });
+
   it('binds a matching committed v1 record to the normalized path before continuing', async () => {
     const { path, store, coordinator } = fixture();
     await seedLegacyRecord(store, { scope: 'global', path, phase: 'committed' });

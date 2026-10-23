@@ -175,7 +175,13 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig } from '../global-config.js';
+import { globalConfigPath, readGlobalConfig } from '../global-config.js';
+import { groupContextSettingsStorePath } from '../services/group-context-settings-store.js';
+import {
+  inspectDurableConfig,
+  reconcileDurableConfig,
+} from '../services/durable-config-mutation.js';
+import type { DurableConfigScope } from '../services/durable-config-coordinator.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -673,6 +679,71 @@ function ipcErrorText(err: unknown): string {
   if (typeof err === 'string' || typeof err === 'number' || typeof err === 'boolean') return `${err}`;
   return 'internal error';
 }
+
+function durableConfigScope(value: string | null): DurableConfigScope | undefined {
+  return value === 'bots' || value === 'global' || value === 'group-context' ? value : undefined;
+}
+
+function durableConfigPath(scope: DurableConfigScope): string {
+  if (scope === 'bots') return requireConfigPath();
+  if (scope === 'global') return globalConfigPath();
+  return groupContextSettingsStorePath();
+}
+
+function durableConfigErrorStatus(error: string): number {
+  if (error === 'durable_config_coordinator_unavailable') return 503;
+  if (error.startsWith('durable config ')) return 400;
+  if (error.includes('_mismatch') || error.includes('_not_drifted')
+      || error.includes('_uninitialized') || error.includes('_requires_committed_v2')
+      || error === 'durable_config_busy') return 409;
+  return 500;
+}
+
+ipcRoute('GET', '/api/durable-config-cas', requireBoundBot(async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'durable_config_cas_unauthorized' });
+  }
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  const scope = durableConfigScope(url.searchParams.get('scope'));
+  if (!scope) return jsonRes(res, 400, { ok: false, error: 'invalid_scope' });
+  try {
+    const inspection = await inspectDurableConfig({ scope, path: durableConfigPath(scope) });
+    jsonRes(res, 200, { ok: true, inspection });
+  } catch (error) {
+    const detail = ipcErrorText(error);
+    jsonRes(res, durableConfigErrorStatus(detail), { ok: false, error: detail });
+  }
+}));
+
+ipcRoute('POST', '/api/durable-config-cas', requireBoundBot(async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'durable_config_cas_unauthorized' });
+  }
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  const scope = durableConfigScope(url.searchParams.get('scope'));
+  if (!scope) return jsonRes(res, 400, { ok: false, error: 'invalid_scope' });
+  const body = await readJsonBodyOrBadJson<{
+    expectedCommittedSha256?: unknown;
+    expectedFileSha256?: unknown;
+  }>(req, res);
+  if (body === BAD_JSON) return;
+  if (typeof body.expectedCommittedSha256 !== 'string'
+      || typeof body.expectedFileSha256 !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'expected_hashes_required' });
+  }
+  try {
+    const inspection = await reconcileDurableConfig({
+      scope,
+      path: durableConfigPath(scope),
+      expectedCommittedSha256: body.expectedCommittedSha256,
+      expectedFileSha256: body.expectedFileSha256,
+    });
+    jsonRes(res, 200, { ok: true, inspection });
+  } catch (error) {
+    const detail = ipcErrorText(error);
+    jsonRes(res, durableConfigErrorStatus(detail), { ok: false, error: detail });
+  }
+}));
 
 function rejectProtectedSessionMutation(
   res: ServerResponse,

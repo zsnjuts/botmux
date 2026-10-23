@@ -4689,6 +4689,10 @@ export async function enforceMessageQuotaForCliInput(
      *  所以闸看不到文件内容——但至少能看到「这轮带了什么附件」，让
      *  「禁止上传 .env / 只许图片」这类策略可写。见 hooks.md 的边界说明。 */
     promptAttachments?: Array<{ type: string; name: string }>;
+    /** Durable-primary callers convert infrastructure failures into an explicit
+     * Inbox retry. Legacy callers omit this and keep the historical fail-closed
+     * drop behavior. The reason must remain bounded and provider-neutral. */
+    onRetryableInfrastructureFailure?: (reason: string) => void;
   },
 ): Promise<boolean> {
   if (opts?.listenerAuthorized) {
@@ -4818,8 +4822,13 @@ export async function enforceMessageQuotaForCliInput(
       : undefined;
     quota = await consumeQuota(larkAppId, ev.quotaKey, def, ev.expiredGrantCleanup);
   } catch (err) {
-    logger.warn(`[quota:${larkAppId}] consume failed; dropping message ${messageId.substring(0, 12)}: ${err}`);
+    logger.warn(
+      `[quota:${larkAppId}] consume failed; `
+      + `${opts?.onRetryableInfrastructureFailure ? 'retrying durable Inbox message' : 'dropping message'} `
+      + `${messageId.substring(0, 12)}: ${err}`,
+    );
     abortCharge(larkAppId, messageId);
+    opts?.onRetryableInfrastructureFailure?.('message quota infrastructure unavailable');
     return false;
   }
 
@@ -5349,6 +5358,7 @@ interface V3SavedWorkflowImInvocation {
   memberUnionId?: string;
   /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
   botSender?: boolean;
+  onRetryableInfrastructureFailure?: (reason: string) => void;
 }
 
 const v3DistillationGenerationInFlight = new Map<string, Promise<void>>();
@@ -5575,6 +5585,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     teamTrustUnionId,
     memberUnionId,
     botSender,
+    onRetryableInfrastructureFailure,
   } = invocation;
   const command = parseV3SavedWorkflowCommand(content);
   if (!command) return false;
@@ -5636,6 +5647,7 @@ async function handleV3SavedWorkflowCommandIfAny(
       memberUnionId,
       chatType,
       botSender,
+      { onRetryableInfrastructureFailure },
     ),
   });
   if (!policy.ok) {
@@ -22850,17 +22862,20 @@ async function startInitialPassthroughSession(args: {
   /** 本轮 inbound 进入 durable 队列（staging + append）后回调，供调用方翻转
    *  ingress 接纳标记——之后的 repo card / 状态回复失败不得再诱导重发。 */
   onDurablyAdmitted?: () => void;
+  onRetryableInfrastructureFailure?: (reason: string) => void;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, promptResources, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
+    onRetryableInfrastructureFailure,
     routeToCanonicalOwner,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
     promptContent: commandContent || parsed.content,
     promptAttachments: promptResources?.map(r => ({ type: r.type, name: r.name })),
+    onRetryableInfrastructureFailure,
   })) {
     return;
   }
@@ -23555,7 +23570,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       quotaSenderUnionId,
       chatType,
       undefined,
-      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments },
+      {
+        promptContent: birthPromptContent,
+        promptAttachments: birthPromptAttachments,
+        onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
+      },
     )) return;
     quotaConsumedBeforeSessionGroupBirth = true;
     const reborn = await maybeBirthSessionGroup(data, ctx);
@@ -23822,6 +23841,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     teamTrustUnionId,
     memberUnionId: senderUnionId,
     botSender: isBotSenderType,
+    onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
   })) {
     return;
   }
@@ -23900,6 +23920,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
     promptContent: content,
     promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
+    onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
   })) {
     return;
   }
@@ -24617,6 +24638,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
           ownerUnionId: senderUnionId,
           creatorOpenId: senderOpenId,
           onDurablyAdmitted: () => markIngressAdmitted(ctx),
+          onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
             scope,
@@ -26204,6 +26226,7 @@ async function handleThreadReplyAdmitted(
     teamTrustUnionId: threadTeamTrustUnionId,
     memberUnionId: threadSenderUnionId,
     botSender: isBotSenderType || isForeignBot,
+    onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
   })) {
     return;
   }
@@ -26469,7 +26492,11 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
-    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
+    {
+      promptContent: parsed.content,
+      promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
+      onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
+    },
   )) {
     return;
   }
@@ -28208,6 +28235,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
           ownerUnionId: isForeignBotSender ? undefined : data?.sender?.sender_id?.union_id,
           creatorOpenId: senderOpenId,
           onDurablyAdmitted: () => markIngressAdmitted(ctx),
+          onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
             scope,
@@ -32488,6 +32516,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // keepalive (waitAllWithin) holds the loop so a fire-and-forget SIGTERM
     // handler cannot exit mid-wait once workers/services have stopped.
     const remainingBudget = (): number => Math.max(0, shutdownDeadlineMs - Date.now());
+    // Durable coordination components intentionally cap one stop call at five
+    // minutes. Remote-runner deployments may widen the outer daemon drain to
+    // substantially longer than that; passing the outer remainder through used
+    // to fail validation immediately and abort SIGTERM before any runtime could
+    // stop. Preserve the complete outer deadline while respecting each
+    // component's public stop contract.
+    const durableStopBudget = (): number => Math.min(300_000, remainingBudget());
 
     // --- Phase 1: process reaping (orphan prevention) ------------------------
     // Give every live worker PROCESS a normal grace to exit, then SIGKILL any
@@ -32563,7 +32598,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const reconciler of durableRemoteOrphanReconcilers) reconciler.stop();
     closeLinkRefRuntime();
     for (const runtime of durablePrimaryRuntimes) {
-      const stopped = await runtime.stop(remainingBudget());
+      const stopped = await runtime.stop(durableStopBudget());
       if (stopped.kind === 'timed_out') {
         logger.warn('[durable-primary] runtime stop timed out');
       }
@@ -32573,8 +32608,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionLifecycleHandler(null);
     setDurableSessionListHandler(null);
     setDurableConfigCoordinator(undefined);
-    await durableInboxShadowConsumer?.stop(remainingBudget());
-    const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
+    await durableInboxShadowConsumer?.stop(durableStopBudget());
+    const durableSessionStop = await durableSessionFacade?.stop(durableStopBudget());
     if (durableSessionStop?.kind === 'timed_out') {
       logger.warn(
         `[durable-session] shadow facade stop timed out `
@@ -32585,7 +32620,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }
-    const durableRecallStop = await durableGroupContextRecallFacade?.stop(remainingBudget());
+    const durableRecallStop = await durableGroupContextRecallFacade?.stop(durableStopBudget());
     if (durableRecallStop?.kind === 'timed_out') {
       logger.warn(
         `[durable-recall] facade stop timed out `

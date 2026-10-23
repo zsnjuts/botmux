@@ -432,6 +432,21 @@ describe('message quota enforcement', () => {
     expect(mocks.commitCharge).not.toHaveBeenCalled();
   });
 
+  it('asks durable-primary ingress to retry when quota infrastructure fails', async () => {
+    const retry = vi.fn();
+    mocks.consumeQuota.mockRejectedValue(new Error('durable_config_content_drift'));
+
+    await expect(enforceMessageQuotaForCliInput(
+      'quota_app', 'oc_1', 'ou_chat', 'om_retry_inbox', 'om_anchor',
+      undefined, undefined, 'group', false,
+      { onRetryableInfrastructureFailure: retry },
+    )).resolves.toBe(false);
+
+    expect(retry).toHaveBeenCalledWith('message quota infrastructure unavailable');
+    expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_retry_inbox');
+    expect(mocks.commitCharge).not.toHaveBeenCalled();
+  });
+
   it('aborts pending dedup on consume failure so a retry can charge again', async () => {
     mocks.consumeQuota
       .mockRejectedValueOnce(new Error('lock timeout'))

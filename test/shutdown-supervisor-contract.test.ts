@@ -98,13 +98,26 @@ describe('graceful shutdown supervisor contract', () => {
     const controlStop = daemon.indexOf('runtime.control?.stop(', enqueue);
     const detach = daemon.indexOf('detachWorkerForTransfer(ds)', controlStop);
     const release = daemon.indexOf('runtime.session.releaseLease(canonicalKey)', detach);
-    const runtimeStop = daemon.indexOf('runtime.stop(remainingBudget())', release);
+    const runtimeStop = daemon.indexOf('runtime.stop(durableStopBudget())', release);
     expect(handoff).toBeGreaterThan(0);
     expect(enqueue).toBeGreaterThan(handoff);
     expect(controlStop).toBeGreaterThan(enqueue);
     expect(detach).toBeGreaterThan(controlStop);
     expect(release).toBeGreaterThan(detach);
     expect(runtimeStop).toBeGreaterThan(release);
+  });
+
+  it('clamps widened outer shutdown budgets before calling durable stop APIs', () => {
+    const helper = daemon.indexOf('const durableStopBudget = (): number => Math.min(300_000, remainingBudget())');
+    expect(helper).toBeGreaterThan(0);
+    for (const call of [
+      'runtime.stop(durableStopBudget())',
+      'durableInboxShadowConsumer?.stop(durableStopBudget())',
+      'durableSessionFacade?.stop(durableStopBudget())',
+      'durableGroupContextRecallFacade?.stop(durableStopBudget())',
+    ]) {
+      expect(daemon.indexOf(call, helper), call).toBeGreaterThan(helper);
+    }
   });
 
   // 源码结构护栏(K3)：startup guard 位于 daemon 闭包内；这里防止 handoff 在缺少
