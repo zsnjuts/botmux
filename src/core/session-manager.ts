@@ -3637,7 +3637,7 @@ export type DurableActiveSessionTakeoverResult =
     };
 
 interface DurableActiveSessionTakeoverOptions {
-  remoteResumeMode?: 'reattach' | 'close-control';
+  remoteResumeMode?: 'reattach' | 'close-control' | 'orphan-reconcile';
 }
 
 function activeCanonicalTakeoverUnsupportedReason(
@@ -3659,7 +3659,12 @@ function activeCanonicalTakeoverUnsupportedReason(
   } catch {
     return 'canonical Session application is not configured on this replica';
   }
+  if (opts.remoteResumeMode === 'orphan-reconcile'
+      && !requiredCapabilities?.includes('orphan_reconciliation')) {
+    return 'Remote Runner orphan_reconciliation is not required on this replica';
+  }
   if (opts.remoteResumeMode !== 'close-control'
+      && opts.remoteResumeMode !== 'orphan-reconcile'
       && !requiredCapabilities?.includes('turn_recovery')) {
     return 'Remote Runner turn_recovery is not required on this replica';
   }

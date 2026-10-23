@@ -118,6 +118,26 @@ describe('remote runner protocol', () => {
     });
   });
 
+  it('carries an explicit provider-authoritative orphan reconciliation intent', () => {
+    expect(remoteRunnerCommand('resume', {
+      requestId: 'orphan-1',
+      sessionId: 'session-1',
+      cwd: '/tmp/work',
+      state: {
+        version: 1,
+        provider: 'reference',
+        generation: 7,
+        remoteSessionId: 'remote-existing',
+      },
+      resumeMode: 'orphan-reconcile',
+    })).toMatchObject({
+      type: 'resume',
+      requestId: 'orphan-1',
+      resumeMode: 'orphan-reconcile',
+      state: { generation: 7, remoteSessionId: 'remote-existing' },
+    });
+  });
+
   it('validates a generation-fenced recovered turn on ready', () => {
     const recovered = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,

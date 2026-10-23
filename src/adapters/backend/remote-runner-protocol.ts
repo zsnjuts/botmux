@@ -48,6 +48,9 @@ export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
 /** Optional recovery of a provider-owned turn that survived the host process. */
 export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
   'turn_recovery',
+  /** The provider can prove that a previously submitted turn has lost its
+   * bound remote resource without replaying the turn. */
+  'orphan_reconciliation',
 ] as const;
 
 export const REMOTE_RUNNER_CAPABILITIES = [
@@ -275,8 +278,11 @@ export type RemoteRunnerCommand =
       /** `rebuild` means the prior remote resource was explicitly cancelled;
        * the provider must create a new generation before reporting ready.
        * `close-control` means the provider is only being rehydrated to run
-       * `cancel`; it must not accept a model turn from that startup. */
-      resumeMode?: 'reattach' | 'rebuild' | 'close-control';
+       * `cancel`; it must not accept a model turn from that startup.
+       * `orphan-reconcile` is stricter: `ready` is an authoritative proof that
+       * the submitted turn's bound remote resource is already gone. A live,
+       * unknown or unqueryable resource must return `failure` instead. */
+      resumeMode?: 'reattach' | 'rebuild' | 'close-control' | 'orphan-reconcile';
       model?: string;
       modelBackendVariant?: 'standard' | 'max';
       reasoningEffort?: string;

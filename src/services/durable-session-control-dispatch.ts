@@ -8,7 +8,10 @@ import type {
   DurableSessionControlDispatchContext,
   DurableSessionControlDispatchResult,
 } from './durable-session-control-consumer.js';
-import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
+import {
+  DurableSessionControlDeferredError,
+  DurableSessionControlOwnerHandoffError,
+} from './durable-session-control-errors.js';
 
 export type DurableSessionControlEffectResult =
   | { kind: 'completed'; result: DurableJson }
@@ -156,7 +159,10 @@ export function createDurableSessionControlDispatch(
         throw new Error(`durable session control reconciliation lost ${control.operationId}`);
       }
       if (mutation.record.state === 'pending') {
-        throw new Error('durable session control backend proved not-applied; retrying safely');
+        const message = 'durable session control backend proved not-applied; retrying safely';
+        throw control.action === 'terminalize_orphan'
+          ? new DurableSessionControlDeferredError(message)
+          : new Error(message);
       }
       return mutation.record;
     };
@@ -192,7 +198,9 @@ export function createDurableSessionControlDispatch(
           if (retried.kind !== 'applied') {
             throw new Error(`durable session control safe retry lost ${control.operationId}`);
           }
-          throw new Error(effect.error);
+          throw control.action === 'terminalize_orphan'
+            ? new DurableSessionControlDeferredError(effect.error)
+            : new Error(effect.error);
         }
         if (effect.kind === 'ambiguous') {
           const ambiguous = await options.store.markControlOperationAmbiguous({

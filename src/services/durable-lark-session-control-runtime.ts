@@ -10,7 +10,10 @@ import type {
   DurableSessionControlDispatchOptions,
   DurableSessionControlReconcileResult,
 } from './durable-session-control-dispatch.js';
-import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
+import {
+  DurableSessionControlDeferredError,
+  DurableSessionControlOwnerHandoffError,
+} from './durable-session-control-errors.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
 import {
   commitDurableLarkSessionControl,
@@ -60,10 +63,15 @@ export interface DurableLarkSessionControlRuntimeOptions {
   takeOverActiveSession?(
     sessionKey: string,
     canonical: Session,
-    options?: { remoteResumeMode?: 'reattach' | 'close-control' },
+    options?: { remoteResumeMode?: 'reattach' | 'close-control' | 'orphan-reconcile' },
   ): Promise<Session | { kind: 'retry'; reason: string } | undefined>;
+  /** Roll back only this replica's temporary canonical materialization after
+   * an orphan proof was refused or inconclusive. It must not mutate canonical
+   * state or call the provider's cancel operation. */
+  abandonOrphanTakeover?(sessionId: string): Promise<void> | void;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
+  terminalizeOrphanSession?(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
   /** Execute an idempotent card-presentation action on the replica that owns
    * the live worker. The callback returns the same shape as handleCardAction. */
@@ -73,6 +81,8 @@ export interface DurableLarkSessionControlRuntimeOptions {
   buildClosedCard(session: DaemonSession | Session): string;
   buildActiveCard(session: DaemonSession): string;
   buildPendingCard?(action: 'close' | 'resume', session: Session): string;
+  buildOrphanedCard?(session: DaemonSession | Session): string;
+  orphanedNoticeText?(): string;
   closeResidualText(residual: { reason?: string; taskId?: string }): string;
   closeRefusedText(error: string, taskId?: string): string;
   resumeRefusedText(error: string, activeSessionId?: string, sessionId?: string): string;
@@ -277,7 +287,8 @@ export function createDurableLarkSessionControlRuntime(
     if (control.action === 'resume' && canonicalSession.status !== 'closed') {
       return { kind: 'ignored', reason: 'canonical Session is no longer closed' };
     }
-    if (control.action === 'handoff' && canonicalSession.status !== 'active') {
+    if ((control.action === 'handoff' || control.action === 'terminalize_orphan')
+        && canonicalSession.status !== 'active') {
       return { kind: 'ignored', reason: 'canonical Session is no longer active' };
     }
     if (control.action === 'close' && canonicalSession.status !== 'active'
@@ -299,6 +310,9 @@ export function createDurableLarkSessionControlRuntime(
         && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
       return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
     }
+    if (control.action === 'terminalize_orphan' && !trustedHost) {
+      return { kind: 'ignored', reason: 'orphan terminalization requires a trusted host' };
+    }
     if (control.action === 'handoff'
         && options.facade().ownerId === control.retiringOwnerId) {
       throw new DurableSessionControlOwnerHandoffError(
@@ -317,6 +331,18 @@ export function createDurableLarkSessionControlRuntime(
       : undefined;
     if (control.action === 'handoff' && !handoffBaselineState) {
       return { kind: 'ignored', reason: 'canonical Session is not backed by a Remote Runner' };
+    }
+    const orphanBaselineState = control.action === 'terminalize_orphan'
+      ? normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState)
+      : undefined;
+    if (control.action === 'terminalize_orphan'
+        && (!orphanBaselineState?.remoteSessionId || orphanBaselineState.generation < 1)) {
+      return { kind: 'ignored', reason: 'canonical Session has no submitted remote lineage' };
+    }
+    if (control.action === 'terminalize_orphan' && live) {
+      throw new DurableSessionControlDeferredError(
+        'canonical Session still has a local runtime owner',
+      );
     }
     if (control.action === 'toggle_display' && !live) {
       if (context.claim.attempts <= 2) {
@@ -403,6 +429,12 @@ export function createDurableLarkSessionControlRuntime(
       && effectiveCardMessageId.startsWith('om_')
       ? options.buildClosedCard(live ?? session)
       : undefined;
+    const orphanCard = control.action === 'terminalize_orphan'
+      && !options.privateCard
+      && typeof effectiveCardMessageId === 'string'
+      && effectiveCardMessageId.startsWith('om_')
+      ? options.buildOrphanedCard?.(session)
+      : undefined;
     // A Remote Runner resume may briefly reactivate its local Session while the
     // replacement provider generation is still starting. If startup later
     // rolls back, worker readiness may already have repainted the clicked card
@@ -447,6 +479,24 @@ export function createDurableLarkSessionControlRuntime(
           evidence: {
             source: 'session-store',
             status: 'closed',
+            ...(current.closedAt ? { closedAt: current.closedAt } : {}),
+          },
+        };
+      }
+      if (control.action === 'terminalize_orphan' && current.status === 'closed') {
+        const terminalState = normalizeRemoteRunnerBackendState(current.remoteBackendState);
+        if (!terminalState || terminalState.remoteSessionId
+            || !orphanBaselineState
+            || terminalState.generation <= orphanBaselineState.generation) return undefined;
+        return {
+          result: result('closed', orphanCard, {
+            error: 'remote_runner_orphan_terminalized',
+            ...(orphanCard ? {} : { noticeText: options.orphanedNoticeText?.() }),
+          }),
+          evidence: {
+            source: 'session-store',
+            status: 'closed',
+            reconciliation: 'remote-missing',
             ...(current.closedAt ? { closedAt: current.closedAt } : {}),
           },
         };
@@ -632,6 +682,69 @@ export function createDurableLarkSessionControlRuntime(
             }
             return waitForHandoffReadiness(signal);
           }
+          if (control.action === 'terminalize_orphan') {
+            const takeover = await options.takeOverActiveSession?.(
+              canonicalKey,
+              canonicalSession,
+              { remoteResumeMode: 'orphan-reconcile' },
+            );
+            if (!takeover) {
+              return { kind: 'not_applied', error: 'orphan reconciliation is unavailable' };
+            }
+            if ('kind' in takeover && takeover.kind === 'retry') {
+              return { kind: 'not_applied', error: takeover.reason };
+            }
+            const deadline = now() + resumeReadinessTimeoutMs;
+            for (;;) {
+              if (signal.aborted) throw signal.reason;
+              live = options.findActiveSession(control.sessionId);
+              if (live && (!options.isResumeReady || options.isResumeReady(live))) break;
+              if (now() >= deadline) {
+                await options.abandonOrphanTakeover?.(control.sessionId);
+                return {
+                  kind: 'not_applied',
+                  error: 'provider did not prove the remote resource missing',
+                };
+              }
+              if (!live) {
+                await options.abandonOrphanTakeover?.(control.sessionId);
+                return {
+                  kind: 'not_applied',
+                  error: 'provider refused or could not complete orphan reconciliation',
+                };
+              }
+              await wait(Math.min(resumeReadinessPollMs, deadline - now()), signal);
+            }
+            const provedState = normalizeRemoteRunnerBackendState(
+              live?.session.remoteBackendState,
+            );
+            if (!provedState || provedState.remoteSessionId
+                || !orphanBaselineState
+                || provedState.generation <= orphanBaselineState.generation) {
+              await options.abandonOrphanTakeover?.(control.sessionId);
+              return {
+                kind: 'not_applied',
+                error: 'provider did not advance into a missing-remote terminal lineage',
+              };
+            }
+            const closed = await options.terminalizeOrphanSession?.(control.sessionId);
+            if (!closed) {
+              return { kind: 'not_applied', error: 'orphan terminalization is unavailable' };
+            }
+            if (!closed.ok) {
+              return {
+                kind: 'not_applied',
+                error: closed.error ?? 'orphan terminalization close was not applied',
+              };
+            }
+            return {
+              kind: 'completed',
+              result: result('closed', orphanCard, {
+                error: 'remote_runner_orphan_terminalized',
+                ...(orphanCard ? {} : { noticeText: options.orphanedNoticeText?.() }),
+              }),
+            };
+          }
           if (control.action === 'close') {
             const closed = await options.closeSession(control.sessionId);
             if (closed.ok) {
@@ -731,6 +844,16 @@ export function createDurableLarkSessionControlRuntime(
               ? { kind: 'completed', ...reconciled }
               : { kind: 'unknown', error: 'backend cannot yet prove the lifecycle outcome' };
           }
+          if (control.action === 'terminalize_orphan') {
+            const reconciled = observed();
+            return reconciled
+              ? { kind: 'completed', ...reconciled }
+              : {
+                  kind: 'not_applied',
+                  error: 'orphan terminalization has no closed local projection',
+                  evidence: { source: 'session-store', status: 'active' },
+                };
+          }
           if (control.action === 'handoff') {
             const reconciled = observed();
             if (reconciled) return { kind: 'completed', ...reconciled };
@@ -777,6 +900,7 @@ export function createDurableLarkSessionControlRuntime(
                 && status !== 'active'
                 && !(status === 'closed' && parsed.applied === false))
               || (control.action === 'handoff' && status !== 'active')
+              || (control.action === 'terminalize_orphan' && status !== 'closed')
               || (control.action === 'toggle_display'
                 && (status !== 'active'
                   || (parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
