@@ -116,6 +116,11 @@ function timeoutPromise(ms: number): { promise: Promise<false>; cancel(): void }
   };
 }
 
+function deferredRetryBackoff(baseMs: number, attempts: number): number {
+  const exponent = Math.min(Math.max(attempts - 1, 0), 6);
+  return Math.min(3_600_000, baseMs * (2 ** exponent));
+}
+
 /**
  * Owner-routed control consumer。Inbox claim 只保证 lane/partition FIFO；真正的
  * Session fencing、外部副作用 attempt 和 canonical Session 提交由 dispatch 回调完成。
@@ -178,6 +183,7 @@ export function startDurableSessionControlConsumer(
   let stopPromise: Promise<DurableSessionControlConsumerStopResult> | undefined;
   let partitionCursor = 0;
   let lastFallbackClaimAt = now();
+  let prefixOnlyFallbackOpen = false;
 
   const reportError = (error: unknown): void => {
     try { options.onError?.(error); } catch { /* observers cannot alter claim state */ }
@@ -258,7 +264,7 @@ export function startDurableSessionControlConsumer(
       const delayMs = error instanceof DurableSessionControlOwnerHandoffError
         ? ownerHandoffRetryDelayMs
         : error instanceof DurableSessionControlDeferredError
-          ? deferredRetryDelayMs
+          ? deferredRetryBackoff(deferredRetryDelayMs, claim.attempts)
           : retryDelayMs;
       const retried = await options.store.retryInboxClaim({
         claim,
@@ -279,14 +285,24 @@ export function startDurableSessionControlConsumer(
       let claim: InboxClaim | undefined;
       try {
         const partitionKeys = nextOwnedPartitionBatch();
+        if (partitionKeys.length > 0) prefixOnlyFallbackOpen = false;
         if (partitionKeyPrefix
-            && now() - lastFallbackClaimAt >= fallbackClaimIntervalMs) {
+            && (prefixOnlyFallbackOpen
+              || now() - lastFallbackClaimAt >= fallbackClaimIntervalMs)) {
           // Give exact owners the initial interval, then reserve one periodic
           // prefix-first probe. If locally owned partitions are continuously
           // retryable, probing the prefix only after an exact miss starves
-          // canonical-only failover controls forever. The shared timestamp
-          // still limits this to one slot per interval.
-          lastFallbackClaimAt = now();
+          // canonical-only failover controls forever. Once this Pod owns no
+          // exact partitions, the initial grace still protects a live remote
+          // owner, but the prefix becomes the only eligible work source and
+          // all slots must be allowed to drain it. Keeping the one-slot
+          // throttle open in that state makes a backlog of slow historical
+          // reconciliations delay fresh close/orphan controls for minutes.
+          if (partitionKeys.length === 0) {
+            prefixOnlyFallbackOpen = true;
+          } else {
+            lastFallbackClaimAt = now();
+          }
           claim = await options.store.claimNextInbox({
             workerId: slotWorkerId,
             lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
