@@ -3172,6 +3172,28 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(JSON.parse(String(sessionReply.mock.calls[0][1]))).toEqual({ turnFailed: true, mentionOpenId: 'ou_admin_human' });
     });
 
+    it('does not duplicate a Remote Runner ambiguous final_output with a terminal card', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_card');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = dispatchedRunnerDs('remote-runner');
+      ds.adoptedFrom = undefined;
+      ds.session.backendType = 'remote-runner';
+      const { __testOnly_setupWorkerHandlers } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      ds.worker!.emit('message', {
+        type: 'turn_terminal',
+        sessionId: ds.session.sessionId,
+        turnId: 'turn-remote',
+        status: 'ambiguous',
+        errorCode: 'tae_traex_turn_takeover_failed',
+        recoveredRemoteTurn: true,
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).not.toHaveBeenCalled();
+    });
+
     it('lets a zero-prompt CLI report to the dispatcher instead of @-ing it', async () => {
       await bindTopicToDispatcher();
       const sessionReply = vi.fn(async () => 'om_reply');

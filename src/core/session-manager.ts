@@ -18,7 +18,7 @@ import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, retireWorkerProcessOnly } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -3703,11 +3703,36 @@ export async function takeOverDurableActiveRemoteSession(
   return withActiveSessionKeyLock(activeSessions, key, async () => {
     const existing = activeSessions.get(key);
     if (existing) {
-      return {
-        ok: false as const,
-        error: 'anchor_occupied' as const,
-        activeSessionId: existing.session.sessionId,
-      };
+      if (opts.remoteResumeMode !== 'orphan-reconcile'
+          || existing.session.sessionId !== expectedSessionId) {
+        return {
+          ok: false as const,
+          error: 'anchor_occupied' as const,
+          activeSessionId: existing.session.sessionId,
+        };
+      }
+      const baseline = normalizeRemoteRunnerBackendState(canonical.remoteBackendState);
+      const observed = normalizeRemoteRunnerBackendState(existing.session.remoteBackendState);
+      const hasMissingRemoteProof = !!baseline
+        && !!observed
+        && observed.provider === baseline.provider
+        && observed.generation > baseline.generation
+        && !observed.remoteSessionId;
+      if (hasMissingRemoteProof) return { ok: true as const, ds: existing };
+
+      // A recovered-turn owner can be materialized again between the control
+      // runtime's initial retirement and its fenced takeover. Returning that
+      // ordinary owner would make every orphan attempt observe the original
+      // generation forever. Retire only this replica-local projection while
+      // holding the route lock, then start the explicitly requested fresh
+      // orphan-reconcile provider below. Canonical state remains active until
+      // that provider advances into a missing-remote generation.
+      retireWorkerProcessOnly(existing, 'remote_orphan_reconciliation_requires_fresh_provider');
+      if (activeSessions.get(key) === existing) activeSessions.delete(key);
+      const existingLocal = sessionStore.getOwnedSession(expectedSessionId);
+      if (existingLocal?.status === 'active') sessionStore.closeSession(expectedSessionId);
+      existing.session.status = 'closed';
+      existing.session.closedAt ??= new Date().toISOString();
     }
     const sameIdElsewhere = [...activeSessions.values()].find(
       ds => ds.session.sessionId === expectedSessionId,

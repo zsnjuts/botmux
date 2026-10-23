@@ -18262,8 +18262,20 @@ function setupWorkerHandlers(
         // 现在统一走失败卡。仍然刻意**不**碰已经有可见卡片的路径：`failed` 的
         // 结构化终态由 Channel B 的 final_output 卡承载（还带半截答案），在这里
         // 再发一张就是重复通知。
-        const structuredFailedOwnsNotice = !isClaudeProviderFailure && msg.status === 'failed'
-          && !(msg.errorCode === CODEX_CAPACITY_ERROR_CODE && recoveryOwnsTerminal && !recoveryHandled);
+        // Remote Runner always emits a structured final_output diagnostic
+        // before its failed/ambiguous terminal (including recovered-turn
+        // takeover failures). Let that single durable output own the visible
+        // notice; posting another generic terminal card would duplicate the
+        // same failure after a Pod handoff. Other structured backends do not
+        // universally provide an ambiguous final_output, so keep their
+        // historical fallback-card behavior.
+        const remoteRunnerFailureOwnsNotice = !isClaudeProviderFailure
+          && msg.status === 'ambiguous'
+          && (ds.session.backendType === 'remote-runner' || ds.session.cliId === 'remote-runner');
+        const structuredFailedOwnsNotice = remoteRunnerFailureOwnsNotice
+          || (!isClaudeProviderFailure && msg.status === 'failed'
+            && !(msg.errorCode === CODEX_CAPACITY_ERROR_CODE
+              && recoveryOwnsTerminal && !recoveryHandled));
         const shouldPostFailureCard = shouldNotifyTurnFailure({
           status: msg.status,
           ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
