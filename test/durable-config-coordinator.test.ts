@@ -1,7 +1,17 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDurableConfigCoordinator } from '../src/services/durable-config-coordinator.js';
 import {
@@ -19,6 +29,13 @@ function contentSha256(path: string): string {
 }
 
 function pathSha256(path: string): string {
+  const normalized = resolve(path);
+  return createHash('sha256')
+    .update(join(realpathSync(dirname(normalized)), basename(normalized)))
+    .digest('hex');
+}
+
+function lexicalPathSha256(path: string): string {
   return createHash('sha256').update(resolve(path)).digest('hex');
 }
 
@@ -198,6 +215,73 @@ describe('durable config coordinator', () => {
       revision: 4,
       value: { version: 2, phase: 'committed', pathSha256: pathSha256(path) },
     });
+    await store.close();
+  });
+
+  it('uses the same CAS identity through a stable directory alias', async () => {
+    const { path, store, coordinator } = fixture();
+    const aliasDir = join(path, '..', 'pinned-control');
+    symlinkSync(join(path, '..'), aliasDir, 'dir');
+    const aliasPath = join(aliasDir, 'config.json');
+
+    await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
+    await coordinator.run({ scope: 'global', path: aliasPath, mutation: async () => undefined });
+
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({ revision: 4, value: { pathSha256: pathSha256(path) } });
+    await store.close();
+  });
+
+  it.skipIf(process.platform !== 'linux')('uses the canonical identity through a pinned procfs directory fd', async () => {
+    const { path, store, coordinator } = fixture();
+    const directoryFd = openSync(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY);
+    try {
+      const pinnedPath = `/proc/${process.pid}/fd/${directoryFd}/${basename(path)}`;
+      await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
+      await coordinator.run({ scope: 'global', path: pinnedPath, mutation: async () => undefined });
+
+      expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+        .toMatchObject({ revision: 4, value: { pathSha256: pathSha256(path) } });
+    } finally {
+      closeSync(directoryFd);
+      await store.close();
+    }
+  });
+
+  it('rebinds a matching lexical v2 alias record to the canonical identity', async () => {
+    const { path, store, coordinator } = fixture();
+    const aliasDir = join(path, '..', 'legacy-pinned-control');
+    symlinkSync(join(path, '..'), aliasDir, 'dir');
+    const aliasPath = join(aliasDir, 'config.json');
+    const acquired = await store.acquireSessionLease({
+      sessionKey: 'auxiliary::config-cas::global',
+      ownerId: 'legacy-v2-seed',
+      leaseDurationMs: 300_000,
+    });
+    if (acquired.kind !== 'acquired') throw new Error('failed to seed lexical v2 record');
+    const digest = contentSha256(path);
+    await store.writeAuxiliaryState({
+      lease: acquired.lease,
+      expectedRevision: null,
+      value: {
+        version: 2,
+        type: 'botmux.config.cas',
+        scope: 'global',
+        phase: 'committed',
+        operationId: 'legacy-v2-operation',
+        pathSha256: lexicalPathSha256(aliasPath),
+        baseSha256: digest,
+        contentSha256: digest,
+        updatedAt: 1,
+        audit: [],
+      },
+    });
+    await store.releaseSessionLease(acquired.lease);
+
+    await coordinator.run({ scope: 'global', path: aliasPath, mutation: async () => undefined });
+
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({ revision: 4, value: { pathSha256: pathSha256(path) } });
     await store.close();
   });
 

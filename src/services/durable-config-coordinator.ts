@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { readFile, realpath } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import type {
   DurableAuxiliaryStateRecord,
   DurableAuxiliaryStateStore,
@@ -45,7 +45,7 @@ interface LegacyDurableConfigCasValue extends DurableConfigCasValueBase {
 
 interface DurableConfigCasValue extends DurableConfigCasValueBase {
   version: typeof RECORD_VERSION;
-  /** SHA-256 of the normalized absolute file path; never persist the path itself. */
+  /** SHA-256 of the canonical parent directory plus leaf name; never persist the path itself. */
   pathSha256: string;
 }
 
@@ -63,6 +63,23 @@ export interface DurableConfigCoordinator {
 
 function sha256(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex');
+}
+
+async function configPathIdentity(path: string): Promise<{
+  pathSha256: string;
+  lexicalPathSha256: string;
+}> {
+  const normalizedPath = resolve(path);
+  // Canonicalize only the parent directory.  The group-context document may
+  // not exist yet, while its shared parent is required to exist before a
+  // durable write.  This also makes stable directory aliases (for example a
+  // pinned /proc/<pid>/fd directory) share one CAS identity without giving up
+  // the alias as the actual I/O path.
+  const canonicalPath = join(await realpath(dirname(normalizedPath)), basename(normalizedPath));
+  return {
+    pathSha256: sha256(Buffer.from(canonicalPath, 'utf8')),
+    lexicalPathSha256: sha256(Buffer.from(normalizedPath, 'utf8')),
+  };
 }
 
 function hash(value: unknown): string {
@@ -271,8 +288,7 @@ export function createDurableConfigCoordinator(input: {
       path: string;
       mutation: () => Promise<T>;
     }): Promise<T> {
-      const normalizedPath = resolve(path);
-      const pathSha256 = sha256(Buffer.from(normalizedPath, 'utf8'));
+      const { pathSha256, lexicalPathSha256 } = await configPathIdentity(path);
       const previous = localTails.get(scope) ?? Promise.resolve();
       let releaseLocal!: () => void;
       const localGate = new Promise<void>(resolve => { releaseLocal = resolve; });
@@ -294,7 +310,23 @@ export function createDurableConfigCoordinator(input: {
           let current = record ? parseRecord(record, scope) : undefined;
 
           if (current?.version === RECORD_VERSION && current.pathSha256 !== pathSha256) {
-            throw new Error('durable_config_path_mismatch');
+            // v2 originally hashed the lexical absolute path.  Rebind only
+            // when the record proves it belongs to this exact access path;
+            // unrelated files remain a hard mismatch.  A committed record
+            // must still match the current bytes before its identity changes.
+            if (current.pathSha256 !== lexicalPathSha256) {
+              throw new Error('durable_config_path_mismatch');
+            }
+            if (current.phase === 'committed' && current.contentSha256 !== before.sha256) {
+              throw new Error('durable_config_content_drift');
+            }
+            const rebound: DurableConfigCasValue = {
+              ...current,
+              pathSha256,
+              updatedAt: now(),
+            };
+            record = await commit({ lease, expectedRevision: record!.revision, value: rebound });
+            current = rebound;
           }
 
           if (current?.version === LEGACY_RECORD_VERSION) {
