@@ -250,6 +250,46 @@ describe('durable session control consumer', () => {
     await store.close();
   });
 
+  it('periodically probes failover controls even while exact owner work stays available', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-remote', 'evt-remote', 1));
+    await store.enqueueInbox(controlEvent('session-local-a', 'evt-local-a', 2));
+    await store.enqueueInbox(controlEvent('session-local-b', 'evt-local-b', 3));
+    const dispatched: string[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-fair',
+      ownedPartitionKeys: () => [
+        durableLarkSessionControlPartition('cli_test', 'session-local-a'),
+        durableLarkSessionControlPartition('cli_test', 'session-local-b'),
+      ],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      dispatch: async control => {
+        dispatched.push(control.sessionId);
+        if (dispatched.length === 1) now += 1_000;
+        return { kind: 'settled' };
+      },
+      concurrency: 1,
+      batchSize: 2,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await consumer.ready;
+    expect(dispatched).toEqual(['session-local-a', 'session-remote']);
+    await consumer.stop();
+
+    const remaining = await store.claimNextInbox({
+      workerId: 'proof',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-local-b')],
+      leaseDurationMs: 100,
+    });
+    expect(remaining?.event.eventId).toBe('card.action.trigger:cli_test:evt-local-b');
+    await store.close();
+  });
+
   it('retries dispatch failures without completing the control row', async () => {
     let now = 10;
     const store = makeStore(() => now);
