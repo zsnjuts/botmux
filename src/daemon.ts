@@ -7850,6 +7850,8 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     || typeof task.workingDir !== 'string' || !task.workingDir.trim()
     || typeof task.chatId !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(task.chatId)
     || !['top-level', 'topic', 'new-topic'].includes(task.executionPosition)
+    || (task.bindSession !== undefined && typeof task.bindSession !== 'boolean')
+    || task.boundSessionId !== undefined
     || (task.deliver !== undefined && task.deliver !== 'origin' && task.deliver !== 'local')
     || (task.calendar !== undefined && task.calendar !== null && typeof task.calendar !== 'string')
     || (task.calendarDayType !== undefined
@@ -7861,7 +7863,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   // a conversation turn. It may create an ownerless local task, preserving the
   // historical admin CLI while still committing through the authority store.
   if (!ds) {
-    if (!trustedHost || task.larkAppId !== selfDaemonLarkAppId) {
+    if (!trustedHost || task.larkAppId !== selfDaemonLarkAppId || task.bindSession === true) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_host_admin_required' });
     }
     try {
@@ -7893,6 +7895,13 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (task.executionPosition !== 'topic' && task.rootMessageId !== undefined) {
       return jsonRes(res, 400, { ok: false, error: 'schedule_session_tool_root_forbidden' });
     }
+  }
+  if (task.bindSession === true
+      && (task.executionPosition !== 'topic'
+        || task.followActive === true
+        || !expectedRoot
+        || task.rootMessageId !== expectedRoot)) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_session_binding_invalid' });
   }
   const turnId = ds.managedTurnOrigin.turnId;
   const generation = ds.workerGeneration;
@@ -7996,6 +8005,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       rootMessageId: task.executionPosition === 'topic'
         ? (direct ? task.rootMessageId : expectedRoot)
         : undefined,
+      boundSessionId: task.bindSession === true ? ds.session.sessionId : undefined,
       executionPosition: task.executionPosition,
       deliver: task.deliver === 'local' ? 'local' as const : 'origin' as const,
       larkAppId: ds.larkAppId,
@@ -29641,6 +29651,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const durableRemoteOrphanReconcilers: DurableRemoteOrphanReconciler[] = [];
   const durableConfigReloadWatchers: DurableConfigReloadWatcher[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
+  const durablePrimaryControlRuntimeByApp = new Map<string, ReturnType<
+    typeof createDurableLarkSessionControlRuntime
+  >>();
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
     ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
     : undefined;
@@ -31624,6 +31637,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               return tr(key, undefined, loc);
             },
           });
+          durablePrimaryControlRuntimeByApp.set(cfg.larkAppId, primaryControlRuntime);
           primaryRuntime = startDurableLarkPrimaryRuntime({
             store: durableCoordinationRuntime.store,
             larkAppId: cfg.larkAppId,
@@ -32234,8 +32248,69 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   refreshCliVersion,
                   additionalPrompt,
                   {
+                    ...(targetTask.boundSessionId
+                      ? { scheduledTurnId: `schedule:${targetTask.id}:${executionContext.runId}` }
+                      : {}),
                     prepareTurnIdentity: (session, turnId) =>
                       prepareTurnCliIdentity(session, turnId),
+                    resumeBoundSession: async input => {
+                      if (input.larkAppId !== effectiveAppId) {
+                        throw new Error('bound Session application mismatch');
+                      }
+                      const deadline = Date.now() + 45_000;
+                      for (;;) {
+                        try {
+                          if (durableCoordinationRuntime?.mode === 'primary') {
+                            const control = durablePrimaryControlRuntimeByApp.get(input.larkAppId);
+                            if (!control) throw new Error('durable primary Session control is unavailable');
+                            await control.resumeTrustedDirect({
+                              operationId: `schedule-bound-resume:${input.turnId}:${input.sessionId}`,
+                              sessionId: input.sessionId,
+                              rootId: input.rootMessageId,
+                            });
+                          } else {
+                            const stored = sessionStore.getSession(input.sessionId);
+                            if (!stored
+                                || stored.larkAppId !== input.larkAppId
+                                || stored.chatId !== input.chatId
+                                || storedSessionAnchorId(stored) !== input.rootMessageId) {
+                              throw new Error('bound Session identity mismatch');
+                            }
+                            if (stored.status !== 'closed') {
+                              throw new Error('bound Session is not closed yet');
+                            }
+                            const resumed = await resumeSession(input.sessionId, activeSessions);
+                            if (!resumed.ok) {
+                              throw new Error(`bound Session resume failed: ${resumed.error}`);
+                            }
+                            if (resumed.recoveryPending === true) {
+                              while ((!resumed.ds.worker
+                                  || resumed.ds.worker.killed
+                                  || resumed.ds.workerReady !== true)
+                                  && Date.now() < deadline) {
+                                await new Promise<void>(resolve => setTimeout(resolve, 100));
+                              }
+                              if (!resumed.ds.worker
+                                  || resumed.ds.worker.killed
+                                  || resumed.ds.workerReady !== true) {
+                                throw new Error('bound Session remote resume did not become ready');
+                              }
+                            }
+                          }
+                          break;
+                        } catch (error) {
+                          const message = error instanceof Error ? error.message : String(error);
+                          const closing = message.includes('canonical Session is no longer closed')
+                            || message.includes('bound Session is not closed yet')
+                            || message.endsWith('bound Session resume failed: not_closed');
+                          if (!closing || Date.now() >= deadline) throw error;
+                          await new Promise<void>(resolve => setTimeout(resolve, 250));
+                        }
+                      }
+                      const resumed = findActiveBySessionId(input.sessionId);
+                      if (!resumed) throw new Error('bound Session resume did not install a local owner');
+                      return resumed;
+                    },
                   },
                 ),
               ),

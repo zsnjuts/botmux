@@ -160,6 +160,29 @@ describe('delegated schedule add route', () => {
     }));
   });
 
+  it('derives a bound Session from the authenticated live route instead of caller input', async () => {
+    const h = harness();
+    h.body.task.bindSession = true;
+    expect((await h.run()).status).toBe(201);
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      params: expect.objectContaining({
+        executionPosition: 'topic',
+        rootMessageId: 'om_root',
+        boundSessionId: 'target-session',
+      }),
+    }));
+  });
+
+  it('rejects a caller-supplied bound Session id', async () => {
+    const h = harness();
+    h.body.task.boundSessionId = 'session-other';
+    expect(await h.run()).toMatchObject({
+      status: 400,
+      value: { error: 'schedule_delegation_scope_invalid' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
   it('persists bytedcli run scope and self-management only when target policy supports both', async () => {
     const h = harness();
     h.scope.readGlobalConfig = () => ({ scheduleDelegation: {
@@ -282,6 +305,19 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
     expect(await h.run()).toMatchObject({ status: 201, value: { task: {
       chatId: 'oc_chat', rootMessageId: 'om_root', workingDir: '/repo',
     } } });
+  });
+
+  it('binds a Remote Runner topic task to its exact current logical Session', async () => {
+    const h = directHumanHarness();
+    h.body.remoteRunnerSessionTool = true;
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = 'om_root';
+    h.body.task.bindSession = true;
+    expect((await h.run()).status).toBe(201);
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      rootMessageId: 'om_root',
+      boundSessionId: 'target-session',
+    }));
   });
 
   it.each([

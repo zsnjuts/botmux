@@ -209,6 +209,7 @@ export type RemoteRunnerSessionToolRequest =
       prompt: string;
       name?: string;
       position?: 'top-level' | 'topic' | 'new-topic';
+      bindSession?: boolean;
       followActive?: boolean;
       topicTitle?: string;
       silent?: boolean;
@@ -833,7 +834,7 @@ export function normalizeRemoteRunnerSessionToolRequest(
 
   if (raw.tool === 'schedule.add') {
     const allowed = new Set([
-      'tool', 'schedule', 'prompt', 'name', 'position', 'followActive',
+      'tool', 'schedule', 'prompt', 'name', 'position', 'bindSession', 'followActive',
       'topicTitle', 'silent', 'model', 'reasoningEffort', 'calendar',
       'calendarDayType',
     ]);
@@ -858,6 +859,7 @@ export function normalizeRemoteRunnerSessionToolRequest(
     if (!schedule || !prompt
       || (raw.name !== undefined && !name)
       || (position !== undefined && !['top-level', 'topic', 'new-topic'].includes(position))
+      || (raw.bindSession !== undefined && typeof raw.bindSession !== 'boolean')
       || (raw.followActive !== undefined && typeof raw.followActive !== 'boolean')
       || (raw.topicTitle !== undefined && !topicTitle)
       || (raw.silent !== undefined && typeof raw.silent !== 'boolean')
@@ -868,6 +870,8 @@ export function normalizeRemoteRunnerSessionToolRequest(
       return undefined;
     }
     const resolvedPosition = position ?? 'top-level';
+    if (raw.bindSession === true && resolvedPosition !== 'topic') return undefined;
+    if (raw.bindSession === true && raw.followActive === true) return undefined;
     if (raw.followActive === true && resolvedPosition !== 'topic') return undefined;
     if (topicTitle && resolvedPosition !== 'new-topic') return undefined;
     if (topicTitle && Array.from(topicTitle).length > 200) return undefined;
@@ -877,6 +881,7 @@ export function normalizeRemoteRunnerSessionToolRequest(
       prompt,
       ...(name ? { name } : {}),
       ...(position ? { position: position as 'top-level' | 'topic' | 'new-topic' } : {}),
+      ...(raw.bindSession !== undefined ? { bindSession: raw.bindSession } : {}),
       ...(raw.followActive !== undefined ? { followActive: raw.followActive } : {}),
       ...(topicTitle ? { topicTitle } : {}),
       ...(raw.silent !== undefined ? { silent: raw.silent } : {}),

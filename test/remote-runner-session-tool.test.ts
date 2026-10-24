@@ -57,12 +57,13 @@ describe('remote runner session tool host bridge', () => {
       prompt: '提醒我复查构建',
       name: '构建复查',
       position: 'topic',
+      bindSession: true,
       silent: true,
       model: 'gpt-5.6-sol',
       reasoningEffort: 'high',
     }, 'session-1', 'oc_current')).toEqual([
       'schedule', 'add', '--schedule=10m', '--prompt=提醒我复查构建',
-      '--name=构建复查', '--topic', '--silent',
+      '--name=构建复查', '--topic', '--bind-session', '--silent',
       '--model=gpt-5.6-sol', '--reasoning-effort=high',
       '--remote-runner-session-tool',
     ]);

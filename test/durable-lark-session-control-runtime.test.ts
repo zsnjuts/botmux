@@ -142,6 +142,79 @@ afterEach(() => {
 });
 
 describe('durable Lark session control runtime', () => {
+  it('directly resumes a bound closed Session on the requesting replica with durable fencing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-direct-resume-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'closed-owner' });
+    const canonical = session({ status: 'closed', closedAt: '2026-10-09T01:00:00.000Z' });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+
+    const facade = createDurableSessionFacade({ store, ownerId: 'schedule-owner' });
+    let persisted: Session | undefined;
+    let active: DaemonSession | undefined;
+    const resumeSession = vi.fn(async () => {
+      persisted = { ...structuredClone(canonical), status: 'active', closedAt: undefined };
+      active = {
+        session: persisted,
+        worker: { killed: false } as any,
+        workerPort: 1234,
+        workerToken: 'token',
+        larkAppId: 'cli_test',
+        chatId: 'oc_chat',
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: 0,
+        cliVersion: 'test',
+        lastMessageAt: 0,
+        hasHistory: true,
+        workingDir: '/tmp',
+      };
+      return { ok: true as const, ds: active };
+    });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => active ? [active] : [],
+      findActiveSession: id => active?.session.sessionId === id ? active : undefined,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: id => persisted?.sessionId === id ? persisted : undefined,
+      materializeClosedSession: value => {
+        persisted = structuredClone(value);
+        return persisted;
+      },
+      canOperate: () => false,
+      closeSession: vi.fn(),
+      resumeSession,
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: error => error,
+      now: () => 20,
+    });
+
+    const input = {
+      operationId: 'schedule-bound-resume:task0001:run-1:session-1',
+      sessionId: 'session-1',
+      rootId: 'om_root',
+    };
+    await expect(runtime.resumeTrustedDirect(input)).resolves.toBeUndefined();
+    expect(resumeSession).toHaveBeenCalledOnce();
+    expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
+      .toMatchObject({
+        session: { sessionId: 'session-1', status: 'active' },
+        controls: [{ source: 'trusted-host', action: 'resume', operationId: input.operationId }],
+      });
+    await expect(runtime.resumeTrustedDirect(input)).resolves.toBeUndefined();
+    expect(resumeSession).toHaveBeenCalledOnce();
+    await facade.stop();
+    await store.close();
+  });
+
   it('closes a never-started canonical remote Session from trusted host state', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-unstarted-'));
     tempDirs.push(dir);

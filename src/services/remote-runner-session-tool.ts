@@ -79,6 +79,7 @@ export function remoteRunnerSessionToolArgs(
         `--prompt=${request.prompt}`,
         ...(request.name ? [`--name=${request.name}`] : []),
         position === 'topic' ? '--topic' : position === 'new-topic' ? '--new-topic' : '--top-level',
+        ...(request.bindSession ? ['--bind-session'] : []),
         ...(request.followActive ? ['--follow-active'] : []),
         ...(request.topicTitle ? [`--topic-title=${request.topicTitle}`] : []),
         ...(request.silent ? ['--silent'] : []),

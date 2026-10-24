@@ -5,11 +5,16 @@ import { sessionAnchorId, sessionKey } from '../core/types.js';
 import type { Session } from '../types.js';
 import type { DurableCoordinationStore, DurableJson } from './durable-coordination.js';
 import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
-import { durableInteractiveSessionControlPartition } from './durable-lark-session-control.js';
+import {
+  durableDirectSessionControlEvent,
+  durableInteractiveSessionControlPartition,
+  parseDurableSessionControlClaim,
+} from './durable-lark-session-control.js';
 import type {
   DurableSessionControlDispatchOptions,
   DurableSessionControlReconcileResult,
 } from './durable-session-control-dispatch.js';
+import { createDurableSessionControlDispatch } from './durable-session-control-dispatch.js';
 import {
   DurableSessionControlDeferredError,
   DurableSessionControlOwnerHandoffError,
@@ -105,6 +110,16 @@ export interface DurableLarkSessionControlRuntime {
   authorizeBeforeAck(data: unknown): Promise<boolean>;
   pendingCardBeforeAck(data: unknown): Promise<Record<string, unknown> | undefined>;
   resolve: DurableSessionControlDispatchOptions['resolve'];
+  /** Execute a daemon-authenticated resume on this replica without racing the
+   * shared Inbox consumer. The same durable Session lease, control operation,
+   * reconciliation and canonical commit are still used; only the transport
+   * into that state machine is direct. */
+  resumeTrustedDirect(input: {
+    operationId: string;
+    sessionId: string;
+    rootId: string;
+    signal?: AbortSignal;
+  }): Promise<void>;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -1079,5 +1094,54 @@ export function createDurableLarkSessionControlRuntime(
     };
   };
 
-  return { ownedPartitionKeys, authorizeBeforeAck, pendingCardBeforeAck, resolve };
+  const resumeTrustedDirect: DurableLarkSessionControlRuntime['resumeTrustedDirect'] = async input => {
+    const live = options.findActiveSession(input.sessionId);
+    if (live?.session.status === 'active'
+        && live.larkAppId === options.larkAppId
+        && sessionAnchorId(live) === input.rootId) {
+      const canonical = await options.store.readSession(sessionKey(input.rootId, options.larkAppId));
+      const canonicalSession = canonical
+        ? parseDurablePrimarySessionRecord(canonical).session
+        : undefined;
+      if (canonicalSession?.sessionId === input.sessionId
+          && canonicalSession.status === 'active') return;
+    }
+    const createdAt = now();
+    const event = durableDirectSessionControlEvent({
+      source: 'trusted-host',
+      larkAppId: options.larkAppId,
+      operationId: input.operationId,
+      action: 'resume',
+      sessionId: input.sessionId,
+      rootId: input.rootId,
+      now: createdAt,
+    });
+    const claim = {
+      event,
+      workerId: `trusted-direct:${options.facade().ownerId}`,
+      claimEpoch: 1,
+      claimUntil: createdAt + 60_000,
+      attempts: 1,
+    };
+    const control = parseDurableSessionControlClaim(claim);
+    const dispatch = createDurableSessionControlDispatch({
+      store: options.store,
+      sessionOwnerId: options.facade().ownerId,
+      resolve,
+    });
+    const controller = input.signal ? undefined : new AbortController();
+    const signal = input.signal ?? controller!.signal;
+    const result = await dispatch(control, { claim, signal });
+    if (result.kind === 'ignored') {
+      throw new Error(`trusted bound Session resume was ignored: ${result.reason}`);
+    }
+  };
+
+  return {
+    ownedPartitionKeys,
+    authorizeBeforeAck,
+    pendingCardBeforeAck,
+    resolve,
+    resumeTrustedDirect,
+  };
 }
