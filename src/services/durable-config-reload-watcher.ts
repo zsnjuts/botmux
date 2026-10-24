@@ -22,6 +22,9 @@ export interface DurableConfigReloadWatcherOptions {
   apply(inspection: DurableConfigInspection): Promise<void>;
   initialApplied?: DurableConfigInspection;
   intervalMs?: number;
+  /** Automatic retry cadence while the CAS is blocked or the provider fails.
+   *  Explicit `checkNow()` calls bypass this delay. */
+  blockedRetryMs?: number;
   now?: () => number;
   onStatus?: (status: DurableConfigReloadWatcherStatus) => void;
   onError?: (error: unknown) => void;
@@ -31,6 +34,14 @@ function interval(value: number | undefined): number {
   const result = value ?? 500;
   if (!Number.isSafeInteger(result) || result < 100 || result > 60_000) {
     throw new Error('durable config reload intervalMs must be an integer between 100 and 60000');
+  }
+  return result;
+}
+
+function blockedRetryInterval(value: number | undefined, intervalMs: number): number {
+  const result = value ?? Math.max(10_000, intervalMs);
+  if (!Number.isSafeInteger(result) || result < intervalMs || result > 60_000) {
+    throw new Error('durable config reload blockedRetryMs must be an integer between intervalMs and 60000');
   }
   return result;
 }
@@ -59,6 +70,7 @@ export function startDurableConfigReloadWatcher(
   options: DurableConfigReloadWatcherOptions,
 ): DurableConfigReloadWatcher {
   const intervalMs = interval(options.intervalMs);
+  const blockedRetryMs = blockedRetryInterval(options.blockedRetryMs, intervalMs);
   const now = options.now ?? Date.now;
   const initial = appliedIdentity(options.initialApplied);
   let appliedRecordRevision = initial.revision;
@@ -71,6 +83,7 @@ export function startDurableConfigReloadWatcher(
   let stopped = false;
   let running: Promise<void> | undefined;
   let timer: NodeJS.Timeout | undefined;
+  let nextAutomaticCheckAt = 0;
 
   const publish = (next: DurableConfigReloadWatcherStatus): void => {
     current = next;
@@ -86,6 +99,7 @@ export function startDurableConfigReloadWatcher(
     try {
       inspection = await options.inspect();
     } catch (error) {
+      nextAutomaticCheckAt = now() + blockedRetryMs;
       const message = errorText(error);
       publish({
         state: 'error',
@@ -97,6 +111,7 @@ export function startDurableConfigReloadWatcher(
       return;
     }
     if (inspection.status !== 'in_sync' || inspection.recordRevision === undefined) {
+      nextAutomaticCheckAt = now() + blockedRetryMs;
       publish({
         state: 'blocked',
         inspection,
@@ -106,6 +121,7 @@ export function startDurableConfigReloadWatcher(
       });
       return;
     }
+    nextAutomaticCheckAt = 0;
     if (inspection.recordRevision === appliedRecordRevision
         && inspection.fileSha256 === appliedFileSha256) {
       publish({
@@ -129,6 +145,7 @@ export function startDurableConfigReloadWatcher(
         appliedAt: now(),
       });
     } catch (error) {
+      nextAutomaticCheckAt = now() + blockedRetryMs;
       const message = errorText(error);
       publish({
         state: 'error',
@@ -147,7 +164,10 @@ export function startDurableConfigReloadWatcher(
     return running;
   };
   const ready = checkNow();
-  timer = setInterval(() => { void checkNow(); }, intervalMs);
+  timer = setInterval(() => {
+    if (nextAutomaticCheckAt > now()) return;
+    void checkNow();
+  }, intervalMs);
   timer.unref?.();
 
   return {

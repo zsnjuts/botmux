@@ -16,6 +16,7 @@ let dir = '';
 const secret = 'durable-config-cas-test-secret';
 const inspect = vi.fn();
 const reconcile = vi.fn();
+const rebindPath = vi.fn();
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-config-cas-ipc-'));
@@ -37,7 +38,17 @@ beforeEach(async () => {
     fileSha256: 'b'.repeat(64),
     pathMatches: true,
   });
-  setDurableConfigCoordinator({ inspect, reconcile, run: vi.fn() } as any);
+  rebindPath.mockResolvedValue({
+    scope: 'global',
+    status: 'in_sync',
+    recordRevision: 8,
+    committedSha256: 'a'.repeat(64),
+    fileSha256: 'a'.repeat(64),
+    boundPathSha256: 'c'.repeat(64),
+    currentPathSha256: 'c'.repeat(64),
+    pathMatches: true,
+  });
+  setDurableConfigCoordinator({ inspect, reconcile, rebindPath, run: vi.fn() } as any);
   server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
 
@@ -49,6 +60,7 @@ afterEach(async () => {
   setDurableConfigCoordinator(undefined);
   inspect.mockReset();
   reconcile.mockReset();
+  rebindPath.mockReset();
   delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
   if (dir) rmSync(dir, { recursive: true, force: true });
   dir = '';
@@ -118,6 +130,60 @@ describe('durable config CAS IPC', () => {
       path: process.env.BOTMUX_GLOBAL_CONFIG_FILE,
       expectedCommittedSha256,
       expectedFileSha256,
+    });
+  });
+
+  it('rebinds only the explicitly confirmed revision, path hashes and content hashes', async () => {
+    const body = {
+      expectedRecordRevision: 7,
+      expectedBoundPathSha256: 'b'.repeat(64),
+      expectedCurrentPathSha256: 'c'.repeat(64),
+      expectedCommittedSha256: 'a'.repeat(64),
+      expectedFileSha256: 'a'.repeat(64),
+    };
+    const unsigned = await fetch(
+      `http://127.0.0.1:${server!.port}/api/durable-config-cas/rebind-path?scope=global`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    );
+    expect(unsigned.status).toBe(401);
+    expect(rebindPath).not.toHaveBeenCalled();
+
+    const missing = await fetchDaemonIpc(
+      server!.port,
+      '/api/durable-config-cas/rebind-path?scope=global',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' },
+      secret,
+    );
+    expect(missing.status).toBe(400);
+    expect(rebindPath).not.toHaveBeenCalled();
+
+    const response = await fetchDaemonIpc(
+      server!.port,
+      '/api/durable-config-cas/rebind-path?scope=global',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      secret,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      inspection: {
+        status: 'in_sync',
+        recordRevision: 8,
+        boundPathSha256: 'c'.repeat(64),
+      },
+    });
+    expect(rebindPath).toHaveBeenCalledWith({
+      scope: 'global',
+      path: process.env.BOTMUX_GLOBAL_CONFIG_FILE,
+      ...body,
     });
   });
 });

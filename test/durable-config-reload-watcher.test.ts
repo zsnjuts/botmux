@@ -20,6 +20,7 @@ function inspection(
     recordVersion: 2,
     phase: status === 'prepared' ? 'prepared' : 'committed',
     committedSha256: fileSha256,
+    currentPathSha256: 'f'.repeat(64),
     pathMatches: true,
   };
 }
@@ -129,5 +130,98 @@ describe('durable config reload watcher', () => {
     await first;
     expect(apply).toHaveBeenCalledTimes(1);
     await watcher.stop();
+  });
+
+  it('backs off automatic polling while a generation is blocked', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const blocked = inspection(5, 'e'.repeat(64), 'path_mismatch');
+    const inspect = vi.fn(async () => blocked);
+    const watcher = startDurableConfigReloadWatcher({
+      inspect,
+      apply: async () => undefined,
+      intervalMs: 100,
+      blockedRetryMs: 1_000,
+      now: () => now,
+    });
+    try {
+      await watcher.ready;
+      expect(inspect).toHaveBeenCalledTimes(1);
+      now = 900;
+      await vi.advanceTimersByTimeAsync(900);
+      expect(inspect).toHaveBeenCalledTimes(1);
+      now = 1_000;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(inspect).toHaveBeenCalledTimes(2);
+      await watcher.checkNow();
+      expect(inspect).toHaveBeenCalledTimes(3);
+    } finally {
+      await watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('backs off automatic inspection errors and resumes at the deadline', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const recovered = inspection(6, 'f'.repeat(64));
+    const inspect = vi.fn()
+      .mockRejectedValueOnce(new Error('provider unavailable'))
+      .mockResolvedValue(recovered);
+    const apply = vi.fn(async () => undefined);
+    const watcher = startDurableConfigReloadWatcher({
+      inspect,
+      apply,
+      intervalMs: 100,
+      blockedRetryMs: 1_000,
+      now: () => now,
+    });
+    try {
+      await watcher.ready;
+      expect(watcher.status()).toMatchObject({ state: 'error', error: 'provider unavailable' });
+      now = 900;
+      await vi.advanceTimersByTimeAsync(900);
+      expect(inspect).toHaveBeenCalledTimes(1);
+      now = 1_000;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(inspect).toHaveBeenCalledTimes(2);
+      expect(apply).toHaveBeenCalledWith(recovered);
+      expect(watcher.status()).toMatchObject({ state: 'in_sync', appliedRecordRevision: 6 });
+    } finally {
+      await watcher.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('backs off automatic apply errors and retries the generation at the deadline', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const next = inspection(7, '7'.repeat(64));
+    const inspect = vi.fn(async () => next);
+    const apply = vi.fn()
+      .mockRejectedValueOnce(new Error('reload failed'))
+      .mockResolvedValueOnce(undefined);
+    const watcher = startDurableConfigReloadWatcher({
+      inspect,
+      apply,
+      intervalMs: 100,
+      blockedRetryMs: 1_000,
+      now: () => now,
+    });
+    try {
+      await watcher.ready;
+      expect(watcher.status()).toMatchObject({ state: 'error', error: 'reload failed' });
+      now = 900;
+      await vi.advanceTimersByTimeAsync(900);
+      expect(apply).toHaveBeenCalledTimes(1);
+      now = 1_000;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(inspect).toHaveBeenCalledTimes(2);
+      expect(apply).toHaveBeenCalledTimes(2);
+      expect(watcher.status()).toMatchObject({ state: 'in_sync', appliedRecordRevision: 7 });
+    } finally {
+      await watcher.stop();
+      vi.useRealTimers();
+    }
   });
 });
