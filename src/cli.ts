@@ -7380,6 +7380,11 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               --expected-bound-path-sha <sha256> --expected-current-path-sha <sha256>
               --expected-committed-sha <sha256> --expected-file-sha <sha256> --yes
               显式迁移已核实的旧路径身份；路径、revision 或内容漂移时拒绝
+  config-cas rebind-and-reconcile --bot <appId> --scope <scope>
+              --expected-record-revision <revision>
+              --expected-bound-path-sha <sha256> --expected-current-path-sha <sha256>
+              --expected-committed-sha <sha256> --expected-file-sha <sha256> --yes
+              原子恢复已核实的路径与内容双漂移；任一前置条件变化时拒绝
   upgrade     升级到最新版本（别名：update）
               支持可选 target：canary / beta / rc 等频道，或具体版本号（默认 latest）
   dashboard current

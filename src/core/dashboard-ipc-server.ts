@@ -179,6 +179,7 @@ import { globalConfigPath, readGlobalConfig } from '../global-config.js';
 import { groupContextSettingsStorePath } from '../services/group-context-settings-store.js';
 import {
   inspectDurableConfig,
+  rebindAndReconcileDurableConfig,
   rebindDurableConfigPath,
   reconcileDurableConfig,
 } from '../services/durable-config-mutation.js';
@@ -771,6 +772,46 @@ ipcRoute('POST', '/api/durable-config-cas/rebind-path', requireBoundBot(async (r
   }
   try {
     const inspection = await rebindDurableConfigPath({
+      scope,
+      path: durableConfigPath(scope),
+      expectedRecordRevision: Number(body.expectedRecordRevision),
+      expectedBoundPathSha256: body.expectedBoundPathSha256,
+      expectedCurrentPathSha256: body.expectedCurrentPathSha256,
+      expectedCommittedSha256: body.expectedCommittedSha256,
+      expectedFileSha256: body.expectedFileSha256,
+    });
+    jsonRes(res, 200, { ok: true, inspection });
+  } catch (error) {
+    const detail = ipcErrorText(error);
+    jsonRes(res, durableConfigErrorStatus(detail), { ok: false, error: detail });
+  }
+}));
+
+ipcRoute('POST', '/api/durable-config-cas/rebind-and-reconcile', requireBoundBot(async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'durable_config_cas_unauthorized' });
+  }
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  const scope = durableConfigScope(url.searchParams.get('scope'));
+  if (!scope) return jsonRes(res, 400, { ok: false, error: 'invalid_scope' });
+  const body = await readJsonBodyOrBadJson<{
+    expectedRecordRevision?: unknown;
+    expectedBoundPathSha256?: unknown;
+    expectedCurrentPathSha256?: unknown;
+    expectedCommittedSha256?: unknown;
+    expectedFileSha256?: unknown;
+  }>(req, res);
+  if (body === BAD_JSON) return;
+  if (!Number.isSafeInteger(body.expectedRecordRevision)
+      || Number(body.expectedRecordRevision) < 1
+      || typeof body.expectedBoundPathSha256 !== 'string'
+      || typeof body.expectedCurrentPathSha256 !== 'string'
+      || typeof body.expectedCommittedSha256 !== 'string'
+      || typeof body.expectedFileSha256 !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'expected_rebind_reconcile_proof_required' });
+  }
+  try {
+    const inspection = await rebindAndReconcileDurableConfig({
       scope,
       path: durableConfigPath(scope),
       expectedRecordRevision: Number(body.expectedRecordRevision),

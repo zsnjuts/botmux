@@ -27,6 +27,15 @@ export type DurableConfigCasCommand = DurableConfigCasCommandBase & (
       expectedFileSha256: string;
       yes: true;
     }
+  | {
+      action: 'rebind-and-reconcile';
+      expectedRecordRevision: number;
+      expectedBoundPathSha256: string;
+      expectedCurrentPathSha256: string;
+      expectedCommittedSha256: string;
+      expectedFileSha256: string;
+      yes: true;
+    }
 );
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -40,9 +49,10 @@ function valueAfter(args: string[], index: number, flag: string): string {
 
 export function parseDurableConfigCasArgs(args: string[]): DurableConfigCasCommand {
   const action = args[0];
-  if (action !== 'inspect' && action !== 'reconcile' && action !== 'rebind-path') {
+  if (action !== 'inspect' && action !== 'reconcile'
+      && action !== 'rebind-path' && action !== 'rebind-and-reconcile') {
     throw new Error(
-      'usage: botmux config-cas inspect|reconcile|rebind-path --bot <appId> '
+      'usage: botmux config-cas inspect|reconcile|rebind-path|rebind-and-reconcile --bot <appId> '
       + '[--scope bots|global|group-context] '
       + '[--expected-record-revision <revision> '
       + '--expected-bound-path-sha <sha256> --expected-current-path-sha <sha256> '
@@ -88,7 +98,7 @@ export function parseDurableConfigCasArgs(args: string[]): DurableConfigCasComma
     if (arg === '--expected-record-revision') {
       const value = valueAfter(args, index, arg);
       if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
-        throw new Error('config-cas rebind-path requires a positive --expected-record-revision');
+        throw new Error(`config-cas ${action} requires a positive --expected-record-revision`);
       }
       expectedRecordRevision = Number(value);
       index += 1;
@@ -135,13 +145,13 @@ export function parseDurableConfigCasArgs(args: string[]): DurableConfigCasComma
     };
   }
   if (!expectedRecordRevision) {
-    throw new Error('config-cas rebind-path requires a positive --expected-record-revision');
+    throw new Error(`config-cas ${action} requires a positive --expected-record-revision`);
   }
   if (!expectedBoundPathSha256 || !DIGEST.test(expectedBoundPathSha256)) {
-    throw new Error('config-cas rebind-path requires a lowercase --expected-bound-path-sha');
+    throw new Error(`config-cas ${action} requires a lowercase --expected-bound-path-sha`);
   }
   if (!expectedCurrentPathSha256 || !DIGEST.test(expectedCurrentPathSha256)) {
-    throw new Error('config-cas rebind-path requires a lowercase --expected-current-path-sha');
+    throw new Error(`config-cas ${action} requires a lowercase --expected-current-path-sha`);
   }
   return {
     action,
@@ -162,9 +172,9 @@ export function durableConfigCasRequest(command: DurableConfigCasCommand): {
 } {
   const path = `${DURABLE_CONFIG_CAS_ROUTE}?scope=${encodeURIComponent(command.scope)}`;
   if (command.action === 'inspect') return { path, init: { method: 'GET' } };
-  if (command.action === 'rebind-path') {
+  if (command.action === 'rebind-path' || command.action === 'rebind-and-reconcile') {
     return {
-      path: `${DURABLE_CONFIG_CAS_ROUTE}/rebind-path?scope=${encodeURIComponent(command.scope)}`,
+      path: `${DURABLE_CONFIG_CAS_ROUTE}/${command.action}?scope=${encodeURIComponent(command.scope)}`,
       init: {
         method: 'POST',
         headers: { 'content-type': 'application/json' },

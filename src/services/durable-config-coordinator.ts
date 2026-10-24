@@ -83,6 +83,7 @@ export interface DurableConfigCoordinator {
     expectedCurrentPathSha256: string;
     expectedCommittedSha256: string;
     expectedFileSha256: string;
+    reconcileContent?: boolean;
   }): Promise<DurableConfigInspection>;
   run<T>(input: {
     scope: DurableConfigScope;
@@ -463,7 +464,11 @@ export function createDurableConfigCoordinator(input: {
       expectedCurrentPathSha256,
       expectedCommittedSha256,
       expectedFileSha256,
+      reconcileContent = false,
     }): Promise<DurableConfigInspection> {
+      if (typeof reconcileContent !== 'boolean') {
+        throw new Error('durable config reconcileContent is invalid');
+      }
       if (!Number.isSafeInteger(expectedRecordRevision) || expectedRecordRevision < 1) {
         throw new Error('durable config expectedRecordRevision is invalid');
       }
@@ -522,8 +527,12 @@ export function createDurableConfigCoordinator(input: {
           if (file.sha256 !== expectedFileSha256) {
             throw new Error('durable_config_rebind_file_sha_mismatch');
           }
-          if (current.contentSha256 !== file.sha256) {
+          const contentDrifted = current.contentSha256 !== file.sha256;
+          if (!reconcileContent && contentDrifted) {
             throw new Error('durable_config_rebind_content_drift');
+          }
+          if (reconcileContent && !contentDrifted) {
+            throw new Error('durable_config_rebind_reconcile_not_drifted');
           }
           const beforeCommitPath = await configPathIdentity(path);
           if (beforeCommitPath.pathSha256 !== pathSha256) {
@@ -534,6 +543,8 @@ export function createDurableConfigCoordinator(input: {
           const rebound: DurableConfigCasValue = {
             ...current,
             operationId,
+            baseSha256: current.contentSha256,
+            contentSha256: file.sha256,
             pathSha256,
             updatedAt: committedAt,
             audit: appendAudit(current, {
@@ -544,10 +555,12 @@ export function createDurableConfigCoordinator(input: {
               // path hashes distinguish this from content reconciliation.
               outcome: 'reconciled_external',
               baseSha256: current.contentSha256,
-              contentSha256: current.contentSha256,
+              contentSha256: file.sha256,
               basePathSha256: current.pathSha256,
               pathSha256,
-              changedPaths: ['<path-identity-rebind>'],
+              changedPaths: reconcileContent
+                ? ['<external-reconcile>', '<path-identity-rebind>']
+                : ['<path-identity-rebind>'],
               committedAt,
             }),
           };

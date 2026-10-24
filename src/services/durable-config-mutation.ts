@@ -45,6 +45,18 @@ export function rebindDurableConfigPath(input: {
   return requireCoordinator().rebindPath(input);
 }
 
+export function rebindAndReconcileDurableConfig(input: {
+  scope: DurableConfigScope;
+  path: string;
+  expectedRecordRevision: number;
+  expectedBoundPathSha256: string;
+  expectedCurrentPathSha256: string;
+  expectedCommittedSha256: string;
+  expectedFileSha256: string;
+}): Promise<DurableConfigInspection> {
+  return requireCoordinator().rebindPath({ ...input, reconcileContent: true });
+}
+
 export async function runDurableConfigMutation<T>(input: {
   scope: DurableConfigScope;
   path: string;
