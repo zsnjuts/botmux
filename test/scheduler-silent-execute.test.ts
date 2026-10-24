@@ -1112,9 +1112,9 @@ describe('executeScheduledTask — follow-active landing', () => {
 });
 
 describe('executeScheduledTask — live-session injection', () => {
-  function liveSession(lastScreenStatus?: string): DaemonSession {
+  function liveSession(lastScreenStatus?: string, sessionId = 'sess-live'): DaemonSession {
     const session: Session = {
-      sessionId: 'sess-live', chatId: CHAT, rootMessageId: ROOT, title: 'live',
+      sessionId, chatId: CHAT, rootMessageId: ROOT, title: 'live',
       status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
     };
     store.set(session.sessionId, session);
@@ -1128,6 +1128,81 @@ describe('executeScheduledTask — live-session injection', () => {
       lastScreenStatus: lastScreenStatus as any,
     };
   }
+
+  it('restores and reuses the exact closed Session selected by a bound topic task', async () => {
+    const active = new Map<string, DaemonSession>();
+    const resumed = liveSession('idle', 'sess-bound');
+    const resumeBoundSession = vi.fn(async () => {
+      active.set(sessionKey(ROOT, APP), resumed);
+      return resumed;
+    });
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      executionPosition: 'topic',
+      boundSessionId: 'sess-bound',
+      silent: true,
+    }), active, refreshCliVersion, undefined, {
+      scheduledTurnId: 'schedule:task0001:12345678-1234-4abc-8def-1234567890ab',
+      resumeBoundSession,
+    });
+
+    expect(resumeBoundSession).toHaveBeenCalledWith({
+      sessionId: 'sess-bound',
+      larkAppId: APP,
+      chatId: CHAT,
+      rootMessageId: ROOT,
+      turnId: 'schedule:task0001:12345678-1234-4abc-8def-1234567890ab',
+    });
+    expect(active.get(sessionKey(ROOT, APP))).toBe(resumed);
+    expect(sendWorkerInputMock).toHaveBeenCalledWith(
+      resumed,
+      expect.anything(),
+      'schedule:task0001:12345678-1234-4abc-8def-1234567890ab',
+      expect.any(Object),
+    );
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect([...store.keys()]).toEqual(['sess-bound']);
+  });
+
+  it('fails closed when a bound Session cannot be restored instead of creating a replacement', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      executionPosition: 'topic',
+      boundSessionId: 'sess-bound',
+      silent: true,
+    }), active, refreshCliVersion)).rejects.toThrow(/cannot restore bound Session/);
+
+    expect(active.size).toBe(0);
+    expect(store.size).toBe(0);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+  });
+
+  it('does not replace another Session occupying the bound topic anchor', async () => {
+    const active = new Map<string, DaemonSession>();
+    const occupant = liveSession('idle', 'sess-other');
+    active.set(sessionKey(ROOT, APP), occupant);
+    const resumeBoundSession = vi.fn();
+
+    await expect(executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      executionPosition: 'topic',
+      boundSessionId: 'sess-bound',
+      silent: true,
+    }), active, refreshCliVersion, undefined, {
+      resumeBoundSession,
+    })).rejects.toThrow(/occupied by sess-other/);
+
+    expect(resumeBoundSession).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(occupant);
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
 
   it.each(['live', 'cold'] as const)('preserves retained routing and prompts when identity preparation rejects (%s)', async mode => {
     const active = new Map<string, DaemonSession>();

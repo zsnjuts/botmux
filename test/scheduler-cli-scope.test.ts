@@ -59,4 +59,17 @@ describe('botmux schedule add flag validation', () => {
       expect(run.stderr, position).toContain('--follow-active');
     }
   }, 240_000);
+
+  it('requires --bind-session to target the exact current fixed-topic Session', () => {
+    for (const flags of [
+      ['--bind-session', '--top-level'],
+      ['--bind-session', '--new-topic'],
+      ['--bind-session', '--topic', '--follow-active'],
+      ['--bind-session', '--topic'],
+    ]) {
+      const run = scheduleAdd(...flags);
+      expect(run.status, flags.join(' ')).toBe(1);
+      expect(run.stderr, flags.join(' ')).toContain('--bind-session');
+    }
+  }, 360_000);
 });

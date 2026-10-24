@@ -66,7 +66,7 @@ import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
-import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
+import { parseScheduledTurnId, trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -4344,6 +4344,19 @@ export async function executeScheduledTask(
   additionalPrompt?: string,
   runtime?: {
     prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+    /** Stable id supplied by the scheduler's durable run claim. Retries of the
+     *  same claimed run must reuse it. */
+    scheduledTurnId?: string;
+    /** Restore the exact logical Session selected by a bound task. The
+     *  callback owns local-vs-primary lifecycle fencing and must return only
+     *  after this replica has the active, runnable owner registered. */
+    resumeBoundSession?: (input: {
+      sessionId: string;
+      larkAppId: string;
+      chatId: string;
+      rootMessageId: string;
+      turnId: string;
+    }) => Promise<DaemonSession>;
   },
 ): Promise<void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
@@ -4397,7 +4410,11 @@ export async function executeScheduledTask(
   // Every fire gets a stable identity before it enters a worker queue. Besides
   // silent-output suppression, this identifies the exact shared-topic reply
   // target when a chat-scope session already has another turn queued.
-  const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+  const suppliedTurnId = runtime?.scheduledTurnId?.trim();
+  if (suppliedTurnId && parseScheduledTurnId(suppliedTurnId) !== task.id) {
+    throw new Error(`scheduled turn ${suppliedTurnId} does not belong to task ${task.id}`);
+  }
+  const scheduledTurnId = suppliedTurnId ?? `schedule:${task.id}:${randomUUID()}`;
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -4676,6 +4693,48 @@ export async function executeScheduledTask(
   }
 
   const key = sessionKey(anchor, larkAppId);
+  const boundSessionId = task.boundSessionId?.trim();
+  if (task.boundSessionId !== undefined
+      && (!boundSessionId || boundSessionId.length > 256 || /[\r\n\0]/.test(boundSessionId))) {
+    throw new Error(`Scheduled task ${task.id} has an invalid bound Session id`);
+  }
+  if (boundSessionId) {
+    if (executionPosition !== 'topic'
+        || task.followActive === true
+        || !task.rootMessageId
+        || anchor !== task.rootMessageId) {
+      throw new Error(`Scheduled task ${task.id} has an invalid bound Session route`);
+    }
+    const current = activeSessions.get(key);
+    if (current && current.session.sessionId !== boundSessionId) {
+      throw new Error(
+        `Scheduled task ${task.id} bound Session ${boundSessionId} is occupied by `
+        + `${current.session.sessionId}`,
+      );
+    }
+    if (!current) {
+      if (!runtime?.resumeBoundSession) {
+        throw new Error(`Scheduled task ${task.id} cannot restore bound Session ${boundSessionId}`);
+      }
+      const resumed = await runtime.resumeBoundSession({
+        sessionId: boundSessionId,
+        larkAppId,
+        chatId: task.chatId,
+        rootMessageId: anchor,
+        turnId: scheduledTurnId,
+      });
+      const registered = activeSessions.get(key);
+      if (resumed.session.sessionId !== boundSessionId
+          || resumed.session.status !== 'active'
+          || resumed.larkAppId !== larkAppId
+          || resumed.chatId !== task.chatId
+          || resumed.scope !== 'thread'
+          || resumed.session.rootMessageId !== anchor
+          || registered !== resumed) {
+        throw new Error(`Scheduled task ${task.id} restored a mismatched bound Session`);
+      }
+    }
+  }
   return withActiveSessionKeyLock(activeSessions, key, async () => {
     // Reuse the canonical owner only when it is an actual conversation.  A
     // worker:null entry is also used for deliberately non-runnable states:
@@ -4684,6 +4743,11 @@ export async function executeScheduledTask(
     // let the scheduled prompt overtake (or replace) the opening prompt that
     // owns the reservation.
     const existing = activeSessions.get(key);
+    if (boundSessionId && (!existing
+        || existing.session.sessionId !== boundSessionId
+        || existing.session.status !== 'active')) {
+      throw new Error(`Scheduled task ${task.id} lost bound Session ${boundSessionId}`);
+    }
     if (!existing
       && executionPosition === 'task'
       && anchor.startsWith('schedule-task:')) {

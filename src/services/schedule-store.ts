@@ -98,6 +98,7 @@ export function canonicalScheduleInput(t: {
   chatIds?: readonly string[];
   chatType?: 'group' | 'p2p' | 'topic_group';
   rootMessageId?: string;
+  boundSessionId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
   topicTitle?: string;
@@ -141,6 +142,9 @@ export function canonicalScheduleInput(t: {
     // it is provider input rather than advisory display metadata.
     chatType: t.chatType,
     rootMessageId: t.rootMessageId,
+    // Explicit logical-conversation binding is caller intent. Existing tasks
+    // omit it, preserving their historical canonical hash byte-for-byte.
+    boundSessionId: t.boundSessionId?.trim() || undefined,
     scope: t.scope,
     executionPosition: t.executionPosition,
     topicTitle: t.topicTitle,
@@ -359,6 +363,9 @@ function migrate(raw: any): ScheduledTask | null {
     chatId: targets.chatId,
     chatIds: targets.chatIds,
     rootMessageId: raw.rootMessageId,
+    boundSessionId: typeof raw.boundSessionId === 'string' && raw.boundSessionId.trim()
+      ? raw.boundSessionId.trim()
+      : undefined,
     scope: raw.scope === 'thread' || raw.scope === 'chat' ? raw.scope : undefined,
     executionPosition,
     topicTitle: typeof raw.topicTitle === 'string' && raw.topicTitle.trim()
@@ -636,6 +643,7 @@ export function createTask(params: {
   chatId: string;
   chatIds?: readonly string[];
   rootMessageId?: string;
+  boundSessionId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
   topicTitle?: string;
@@ -701,6 +709,7 @@ export function createTask(params: {
       chatId: targets.chatId,
       chatIds: targets.chatIds,
       rootMessageId: params.rootMessageId,
+      boundSessionId: params.boundSessionId,
       scope: params.scope,
       executionPosition: params.executionPosition,
       topicTitle: params.topicTitle,
@@ -745,7 +754,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'boundSessionId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): boolean {
