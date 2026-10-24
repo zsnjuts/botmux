@@ -135,6 +135,7 @@ import {
   type DurableLarkOutboxTarget,
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
+import { resolveDurablePrimaryOutputClaim } from './services/durable-primary-output-claim.js';
 import {
   claimDurableLarkActiveSession,
   listValidDurablePrimarySessions,
@@ -31831,14 +31832,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         request.daemonSession.larkAppId,
       );
       const current = await durableCoordinationRuntime.store.readSession(canonicalKey);
-      if (!current) throw new Error('durable primary Session snapshot is unavailable');
-      const { admissions } = parseDurablePrimarySessionRecord(current);
-      const admission = admissions.find(entry => entry.messageId === request.turnId);
-      if (!admission) {
-        throw new Error(
-          `durable primary Session snapshot is not committed for turn ${request.turnId}`,
-        );
-      }
+      const scheduledTaskId = parseScheduledTurnId(request.turnId);
+      const inbound = resolveDurablePrimaryOutputClaim({
+        current,
+        turnId: request.turnId,
+        daemonSession: request.daemonSession,
+        authority: scheduledTaskId
+          ? scheduleAuthorityStore?.getRecord(request.daemonSession.larkAppId, scheduledTaskId)
+          : undefined,
+      });
       const message = durableLarkOutboxMessage({
         messageId: `out_${request.providerUuid}`,
         sessionKey: canonicalKey,
@@ -31853,17 +31855,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         daemonSession: request.daemonSession,
         facade: runtime.session,
         store: durableCoordinationRuntime.store,
-        inbound: {
-          eventType: admission.eventId.startsWith('im.message.updated_v1:')
-            ? 'lark.im.message.updated_v1'
-            : 'lark.im.message.receive_v1',
-          eventId: admission.eventId,
-          partitionKey: admission.partitionKey,
-          larkAppId: admission.larkAppId,
-          messageId: admission.messageId,
-          attempts: 1,
-          data: {},
-        },
+        inbound,
         message,
       });
       if (output.kind !== 'accepted') {
