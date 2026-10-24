@@ -40,6 +40,11 @@ export interface DurableSessionFacadeStopResult {
 
 export interface DurableSessionFacade {
   readonly ownerId: string;
+  /** Process-local proof that this facade currently retains the fencing lease
+   * for one active Session lane. Callers still re-acquire the lease before a
+   * mutation; this only prevents standby replicas from advertising another
+   * owner's exact control partition. */
+  ownsLease(sessionKey: string): boolean;
   /** Shadow snapshots may collapse queued updates to the newest value. */
   write(sessionKey: string, value: DurableJson): Promise<DurableSessionFacadeWriteResult>;
   /** Admission writes are FIFO and are never merged across distinct events. */
@@ -367,6 +372,10 @@ export function createDurableSessionFacade(
 
   return {
     ownerId,
+    ownsLease: rawSessionKey => {
+      const sessionKey = validateSessionKey(rawSessionKey);
+      return !terminated && lanes.get(sessionKey)?.lease !== undefined;
+    },
     write: (rawSessionKey, rawValue) => {
       const sessionKey = validateSessionKey(rawSessionKey);
       const value = cloneDurableJson(rawValue);

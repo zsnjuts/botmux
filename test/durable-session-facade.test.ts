@@ -77,6 +77,7 @@ describe('durable session facade', () => {
 
       await expect(facade.writeExact('session-live', { status: 'active' }))
         .resolves.toMatchObject({ kind: 'written' });
+      expect(facade.ownsLease('session-live')).toBe(true);
       await vi.advanceTimersByTimeAsync(400);
       expect(store.renewSessionLease).toHaveBeenCalledOnce();
 
@@ -84,6 +85,8 @@ describe('durable session facade', () => {
         .resolves.toMatchObject({ kind: 'written' });
       await vi.advanceTimersByTimeAsync(1_200);
       expect(store.renewSessionLease).toHaveBeenCalledOnce();
+      await expect(facade.releaseLease('session-live')).resolves.toBe(true);
+      expect(facade.ownsLease('session-live')).toBe(false);
       await facade.stop();
     } finally {
       vi.useRealTimers();

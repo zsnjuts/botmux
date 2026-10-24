@@ -580,6 +580,51 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
+  it('advertises an active control partition only from the replica holding its Session lease', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-active-owner-partition-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const ownerFacade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const standbyFacade = createDurableSessionFacade({ store, ownerId: 'session-standby' });
+    const persisted = session();
+    const active = {
+      session: persisted,
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      streamCardId: 'om_card',
+    } as DaemonSession;
+    await admitDurableLarkSession({ facade: ownerFacade, message: message(), session: persisted });
+    const makeRuntime = (facade: ReturnType<typeof createDurableSessionFacade>) =>
+      createDurableLarkSessionControlRuntime({
+        larkAppId: 'cli_test',
+        privateCard: false,
+        store,
+        facade: () => facade,
+        listActiveSessions: () => [active],
+        findActiveSession: () => active,
+        listPersistedSessions: () => [persisted],
+        getPersistedSession: () => persisted,
+        materializeClosedSession: value => value,
+        canOperate: () => true,
+        closeSession: async () => ({ ok: false, error: 'not called' }),
+        resumeSession: async () => ({ ok: false, error: 'not called' }),
+        buildClosedCard: () => 'closed',
+        buildActiveCard: () => 'active',
+        closeResidualText: () => 'residual',
+        closeRefusedText: () => 'refused',
+        resumeRefusedText: () => 'resume-refused',
+      });
+
+    expect(makeRuntime(ownerFacade).ownedPartitionKeys()).toEqual([
+      'lark-session-control:cli_test:interactive:session-1',
+    ]);
+    expect(makeRuntime(standbyFacade).ownedPartitionKeys()).toEqual([]);
+
+    await ownerFacade.stop();
+    await standbyFacade.stop();
+    await store.close();
+  });
+
   it('authorizes an early display toggle from the local card owner before canonical admission', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-display-pre-admission-'));
     tempDirs.push(dir);
