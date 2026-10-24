@@ -6,6 +6,7 @@ import {
 import {
   startDurableInboxPrimaryConsumer,
   type DurableInboxPrimaryConsumer,
+  type DurableInboxPrimaryRetry,
   type DurableInboxPrimaryStopResult,
 } from './durable-inbox-primary-consumer.js';
 import {
@@ -45,6 +46,7 @@ export interface DurableLarkPrimaryRuntimeOptions {
   onLeadershipAcquired?: (leadership: DurableLarkIngressLeadership) => void | Promise<void>;
   onLeadershipLost?: (reason: unknown) => void | Promise<void>;
   onSessionLeaseLost?: (sessionKey: string, error: Error) => void;
+  onInboxRetried?: (retry: DurableInboxPrimaryRetry) => void | Promise<void>;
   onError?: (error: unknown) => void;
   ingressOwnerId?: string;
   inboxWorkerId?: string;
@@ -136,6 +138,7 @@ export function startDurableLarkPrimaryRuntime(
     ...(options.inboxWorkerId ? { workerId: options.inboxWorkerId } : {}),
     ...(options.inboxIntervalMs === undefined ? {} : { intervalMs: options.inboxIntervalMs }),
     shutdownMs,
+    onRetried: options.onInboxRetried,
     onError: reportError,
   });
   const outbox = startDurableOutboxPump({

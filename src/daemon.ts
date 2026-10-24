@@ -31,6 +31,7 @@ import {
 } from './config.js';
 import {
   globalConfigPath,
+  invalidateGlobalConfigCache,
   readGlobalConfig,
   repoPickerScanOptions,
   isMultiTopicOrchestrationEnabled,
@@ -95,6 +96,7 @@ import {
   botAcceptsSlashFromBots,
   getLoadedConfigPath,
   getLoadedConfigProvenance,
+  hotReloadBotConfigSnapshot,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -150,7 +152,21 @@ import {
   readDurableGroupContextRecalls,
   recordDurableGroupContextRecall,
 } from './services/durable-group-context-recall.js';
-import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  createDurableConfigCoordinator,
+  DURABLE_CONFIG_SCOPES,
+  type DurableConfigInspection,
+  type DurableConfigScope,
+} from './services/durable-config-coordinator.js';
+import {
+  startDurableConfigReloadWatcher,
+  type DurableConfigReloadWatcher,
+  type DurableConfigReloadWatcherStatus,
+} from './services/durable-config-reload-watcher.js';
+import {
+  enqueueDurableInboxRetryNotice,
+  MESSAGE_QUOTA_INFRASTRUCTURE_RETRY,
+} from './services/durable-inbox-retry-notice.js';
 import {
   runDurableConfigMutation,
   setDurableConfigCoordinator,
@@ -191,7 +207,10 @@ import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './servi
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
 import { resolvePricingConfig } from './services/model-pricing.js';
 import { createImgNumberer, extractPostAtParticipants, isPlaceholderOnlyText, messageMentionsBot, parseApiMessage, parseEventMessage, resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
-import { getGroupContextSettings } from './services/group-context-settings-store.js';
+import {
+  getGroupContextSettings,
+  groupContextSettingsStorePath,
+} from './services/group-context-settings-store.js';
 import { setGroupContextSettingsResolver } from './services/group-context-ingest.js';
 import { prepareGroupContextForTurn, captureNativeGroupContextInput } from './services/group-context-runtime.js';
 import { groupContextConversationForTurn } from './services/group-context-location.js';
@@ -370,7 +389,13 @@ import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
-import { t as tr, localeForBot } from './i18n/index.js';
+import {
+  isLocale,
+  localeForBot,
+  setDefaultLocale,
+  t as tr,
+  type Locale,
+} from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,
@@ -777,6 +802,53 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   if (!desc || desc.larkAppId !== larkAppId) return;
   desc.resolvedAllowedUsers = resolved.filter(u => u.startsWith('ou_'));
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+}
+
+function republishConfigReloadStatus(
+  larkAppId: string,
+  scope: DurableConfigScope,
+  status: DurableConfigReloadWatcherStatus,
+): void {
+  const desc = selfDaemonDescriptor;
+  if (!desc || desc.larkAppId !== larkAppId) return;
+  desc.configApplied ??= {};
+  desc.configApplied[scope] = {
+    state: status.state,
+    ...(status.inspection
+      ? {
+          observedStatus: status.inspection.status,
+          ...(status.inspection.recordRevision === undefined
+            ? {}
+            : { observedRecordRevision: status.inspection.recordRevision }),
+          observedFileSha256: status.inspection.fileSha256,
+        }
+      : {}),
+    ...(status.appliedRecordRevision === undefined
+      ? {}
+      : { appliedRecordRevision: status.appliedRecordRevision }),
+    ...(status.appliedFileSha256 === undefined
+      ? {}
+      : { appliedFileSha256: status.appliedFileSha256 }),
+    ...(status.appliedAt === undefined ? {} : { appliedAt: status.appliedAt }),
+    ...(status.error ? { error: status.error } : {}),
+  };
+  try { writeDaemonDescriptor(desc); } catch { /* heartbeat will retry */ }
+}
+
+/** Apply the existing locale reload semantics inside this daemon process. */
+function refreshRuntimeLocale(larkAppId: string): void {
+  const globalLang = readGlobalConfig().lang;
+  const resolvedDefault: Locale = isLocale(globalLang) ? globalLang : 'zh';
+  setDefaultLocale(resolvedDefault);
+  const configuredBotLang = getBot(larkAppId).config.lang;
+  const botLang: Locale | undefined = isLocale(configuredBotLang)
+    ? configuredBotLang
+    : undefined;
+  const workerLocale = botLang ?? resolvedDefault;
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== larkAppId || !ds.worker || ds.worker.killed) continue;
+    try { ds.worker.send({ type: 'set_locale', locale: workerLocale }); } catch { /* worker gone */ }
+  }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
@@ -4689,6 +4761,10 @@ export async function enforceMessageQuotaForCliInput(
      *  所以闸看不到文件内容——但至少能看到「这轮带了什么附件」，让
      *  「禁止上传 .env / 只许图片」这类策略可写。见 hooks.md 的边界说明。 */
     promptAttachments?: Array<{ type: string; name: string }>;
+    /** Durable-primary callers convert infrastructure failures into an explicit
+     * Inbox retry. Legacy callers omit this and keep the historical fail-closed
+     * drop behavior. The reason must remain bounded and provider-neutral. */
+    onRetryableInfrastructureFailure?: (reason: string) => void;
   },
 ): Promise<boolean> {
   if (opts?.listenerAuthorized) {
@@ -4818,8 +4894,13 @@ export async function enforceMessageQuotaForCliInput(
       : undefined;
     quota = await consumeQuota(larkAppId, ev.quotaKey, def, ev.expiredGrantCleanup);
   } catch (err) {
-    logger.warn(`[quota:${larkAppId}] consume failed; dropping message ${messageId.substring(0, 12)}: ${err}`);
+    logger.warn(
+      `[quota:${larkAppId}] consume failed; `
+      + `${opts?.onRetryableInfrastructureFailure ? 'retrying durable Inbox message' : 'dropping message'} `
+      + `${messageId.substring(0, 12)}: ${err}`,
+    );
     abortCharge(larkAppId, messageId);
+    opts?.onRetryableInfrastructureFailure?.(MESSAGE_QUOTA_INFRASTRUCTURE_RETRY);
     return false;
   }
 
@@ -5072,6 +5153,18 @@ interface DaemonDescriptor {
    * never sees them; empty if the bot has no allowlist configured.
    */
   resolvedAllowedUsers: string[];
+  /** Per-process proof that this daemon observed/applied each shared CAS
+   * generation. Hash/revision only; never config bytes or filesystem paths. */
+  configApplied?: Partial<Record<DurableConfigScope, {
+    state: DurableConfigReloadWatcherStatus['state'];
+    observedStatus?: DurableConfigInspection['status'];
+    observedRecordRevision?: number;
+    observedFileSha256?: string;
+    appliedRecordRevision?: number;
+    appliedFileSha256?: string;
+    appliedAt?: number;
+    error?: string;
+  }>>;
 }
 
 function writeDaemonDescriptor(d: DaemonDescriptor): void {
@@ -5120,6 +5213,123 @@ function definitiveEntriesOf(entryStatus?: Map<string, EntryResolveStatus>): str
     if (status === 'definitive') out.push(entry);
   }
   return out;
+}
+
+async function resolveConfigIdentityEntriesForReload(
+  larkAppId: string,
+  rawEntries: string[],
+): Promise<{
+  applied: ReturnType<typeof applyAllowedUsersResolve>;
+  definitiveEntries: string[];
+}> {
+  const literalMap = new Map<string, string>();
+  const literalStatus = new Map<string, EntryResolveStatus>();
+  for (const entry of rawEntries) {
+    if (entry.startsWith('ou_')) {
+      literalMap.set(entry, entry);
+      literalStatus.set(entry, 'resolved');
+    }
+  }
+  if (rawEntries.length === 0 || !rawEntries.some(entryNeedsContactResolve)) {
+    return {
+      applied: applyAllowedUsersResolve({
+        rawEntries,
+        previousResolvedMap: readAllowedUsersCache(larkAppId),
+        resolveResult: {
+          resolved: [...literalMap.values()],
+          map: literalMap,
+          entryStatus: literalStatus,
+        },
+      }),
+      definitiveEntries: [],
+    };
+  }
+  try {
+    const result = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
+    return {
+      applied: applyAllowedUsersResolve({
+        rawEntries,
+        previousResolvedMap: readAllowedUsersCache(larkAppId),
+        resolveResult: result,
+      }),
+      definitiveEntries: definitiveEntriesOf(result.entryStatus),
+    };
+  } catch (error) {
+    const entryStatus = new Map<string, EntryResolveStatus>(literalStatus);
+    for (const entry of rawEntries) {
+      if (entryNeedsContactResolve(entry)) entryStatus.set(entry, 'transient');
+    }
+    return {
+      applied: applyAllowedUsersResolve({
+        rawEntries,
+        previousResolvedMap: readAllowedUsersCache(larkAppId),
+        resolveResult: {
+          resolved: [...literalMap.values()],
+          map: literalMap,
+          entryStatus,
+          errored: true,
+        },
+      }),
+      definitiveEntries: [],
+    };
+  }
+}
+
+/** Re-read one validated bots.json generation and update the live registry. */
+async function reloadRuntimeBotConfigFromDisk(
+  botIndex: number,
+  larkAppId: string,
+): Promise<string[]> {
+  const latest = reloadExactDaemonBotConfig(botIndex, larkAppId, loadBotConfigAtIndex);
+  const live = getBot(larkAppId);
+  const allowed = await resolveConfigIdentityEntriesForReload(
+    larkAppId,
+    latest.allowedUsers ?? [],
+  );
+  const blocked = await resolveConfigIdentityEntriesForReload(
+    larkAppId,
+    latest.blockedUsers ?? [],
+  );
+  const changed = hotReloadBotConfigSnapshot(larkAppId, latest);
+  live.resolvedAllowedUsers = allowed.applied.resolved;
+  live.rawAllowedUserResolution = allowed.applied.map;
+  live.resolvedBlockedUsers = blocked.applied.resolved;
+  const mergedMap = new Map<string, string>([
+    ...allowed.applied.map,
+    ...blocked.applied.map,
+  ]);
+  writeAllowedUsersCache(larkAppId, mergedMap, {
+    deleteEntries: [...allowed.definitiveEntries, ...blocked.definitiveEntries],
+    retainKeys: [...new Set([
+      ...(latest.allowedUsers ?? []),
+      ...(latest.blockedUsers ?? []),
+    ])],
+  });
+  republishResolvedAllowedUsers(larkAppId, live.resolvedAllowedUsers);
+  if (allowed.applied.failed) {
+    logger.warn(
+      `[durable-config:${larkAppId}] hot reload resolved allowedUsers in degraded mode; scheduling retry`,
+    );
+    scheduleAllowedUsersResolveRetry(larkAppId);
+  }
+  if (blocked.applied.failed) {
+    logger.warn(`[durable-config:${larkAppId}] hot reload resolved blockedUsers in degraded mode`);
+  }
+  checkAllowedChatGroupsConfig(live);
+  logger.info(
+    `[durable-config:${larkAppId}] applied bots generation; changed=${changed.changedKeys.join(',') || '(none)'}`,
+  );
+  if (changed.changedKeys.includes('lang')) refreshRuntimeLocale(larkAppId);
+  if (changed.changedKeys.includes('displayName')) {
+    const effective = effectiveBotDisplayName(live);
+    setBotName(effective);
+    const desc = selfDaemonDescriptor;
+    if (desc?.larkAppId === larkAppId && desc.botName !== effective) {
+      desc.botName = effective;
+      try { writeDaemonDescriptor(desc); } catch { /* heartbeat will retry */ }
+    }
+  }
+  return changed.changedKeys;
 }
 
 function notifyAllowedUsersResolveFailure(
@@ -5349,6 +5559,7 @@ interface V3SavedWorkflowImInvocation {
   memberUnionId?: string;
   /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
   botSender?: boolean;
+  onRetryableInfrastructureFailure?: (reason: string) => void;
 }
 
 const v3DistillationGenerationInFlight = new Map<string, Promise<void>>();
@@ -5575,6 +5786,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     teamTrustUnionId,
     memberUnionId,
     botSender,
+    onRetryableInfrastructureFailure,
   } = invocation;
   const command = parseV3SavedWorkflowCommand(content);
   if (!command) return false;
@@ -5636,6 +5848,7 @@ async function handleV3SavedWorkflowCommandIfAny(
       memberUnionId,
       chatType,
       botSender,
+      { onRetryableInfrastructureFailure },
     ),
   });
   if (!policy.ok) {
@@ -22850,17 +23063,20 @@ async function startInitialPassthroughSession(args: {
   /** 本轮 inbound 进入 durable 队列（staging + append）后回调，供调用方翻转
    *  ingress 接纳标记——之后的 repo card / 状态回复失败不得再诱导重发。 */
   onDurablyAdmitted?: () => void;
+  onRetryableInfrastructureFailure?: (reason: string) => void;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, promptResources, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
+    onRetryableInfrastructureFailure,
     routeToCanonicalOwner,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
     promptContent: commandContent || parsed.content,
     promptAttachments: promptResources?.map(r => ({ type: r.type, name: r.name })),
+    onRetryableInfrastructureFailure,
   })) {
     return;
   }
@@ -23555,7 +23771,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       quotaSenderUnionId,
       chatType,
       undefined,
-      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments },
+      {
+        promptContent: birthPromptContent,
+        promptAttachments: birthPromptAttachments,
+        onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
+      },
     )) return;
     quotaConsumedBeforeSessionGroupBirth = true;
     const reborn = await maybeBirthSessionGroup(data, ctx);
@@ -23822,6 +24042,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     teamTrustUnionId,
     memberUnionId: senderUnionId,
     botSender: isBotSenderType,
+    onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
   })) {
     return;
   }
@@ -23900,6 +24121,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
     promptContent: content,
     promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
+    onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
   })) {
     return;
   }
@@ -24617,6 +24839,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
           ownerUnionId: senderUnionId,
           creatorOpenId: senderOpenId,
           onDurablyAdmitted: () => markIngressAdmitted(ctx),
+          onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
             scope,
@@ -26204,6 +26427,7 @@ async function handleThreadReplyAdmitted(
     teamTrustUnionId: threadTeamTrustUnionId,
     memberUnionId: threadSenderUnionId,
     botSender: isBotSenderType || isForeignBot,
+    onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
   })) {
     return;
   }
@@ -26469,7 +26693,11 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
-    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
+    {
+      promptContent: parsed.content,
+      promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
+      onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
+    },
   )) {
     return;
   }
@@ -28208,6 +28436,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
           ownerUnionId: isForeignBotSender ? undefined : data?.sender?.sender_id?.union_id,
           creatorOpenId: senderOpenId,
           onDurablyAdmitted: () => markIngressAdmitted(ctx),
+          onRetryableInfrastructureFailure: reason => retryDurablePrimaryIngress(ctx, reason),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
             scope,
@@ -29408,6 +29637,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const durablePrimaryRuntimes: DurableLarkPrimaryRuntime[] = [];
   const durablePrimaryEventRuntimes: LarkEventDispatcherRuntime[] = [];
   const durableRemoteOrphanReconcilers: DurableRemoteOrphanReconciler[] = [];
+  const durableConfigReloadWatchers: DurableConfigReloadWatcher[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
     ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
@@ -30907,6 +31137,66 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     checkAllowedChatGroupsConfig(bot);
 
+    // Every Pod independently observes the shared CAS revision.  A config
+    // write may land on any replica; polling SQL instead of enumerating local
+    // daemon descriptors is what makes the refresh cross-Pod.
+    if (durableConfigCoordinator) {
+      let appliedGlobalConfig = readGlobalConfig();
+      const scopePaths: Record<DurableConfigScope, string> = {
+        bots: getLoadedConfigPath() ?? '',
+        global: globalConfigPath(),
+        'group-context': groupContextSettingsStorePath(),
+      };
+      for (const scope of DURABLE_CONFIG_SCOPES) {
+        const path = scopePaths[scope];
+        if (!path) throw new Error(`durable ${scope} config path is unavailable`);
+        const initialApplied = await durableConfigCoordinator.inspect({ scope, path });
+        const watcher = startDurableConfigReloadWatcher({
+          initialApplied,
+          intervalMs: 500,
+          inspect: () => durableConfigCoordinator.inspect({ scope, path }),
+          apply: async inspection => {
+            switch (scope) {
+              case 'bots':
+                await reloadRuntimeBotConfigFromDisk(idx, cfg.larkAppId);
+                break;
+              case 'global':
+                {
+                  const previous = appliedGlobalConfig;
+                  invalidateGlobalConfigCache();
+                  // Force parse now so an invalid generation is reported by this
+                  // Pod instead of staying latent until an unrelated request.
+                  const next = readGlobalConfig();
+                  appliedGlobalConfig = next;
+                  if (previous.lang !== next.lang) refreshRuntimeLocale(cfg.larkAppId);
+                  if (previous.dashboard?.crossPrincipalInterruption === true
+                      && next.dashboard?.crossPrincipalInterruption !== true) {
+                    cancelAllCrossPrincipalInterruptionsForFeatureDisable();
+                  }
+                }
+                break;
+              case 'group-context':
+                // Group-context settings are read from the canonical file on
+                // every access.  Observing the committed revision is the apply.
+                void inspection;
+                break;
+              default: {
+                const unsupported: never = scope;
+                throw new Error(`durable config reload scope is unsupported: ${unsupported}`);
+              }
+            }
+          },
+          onStatus: status => republishConfigReloadStatus(cfg.larkAppId, scope, status),
+          onError: error => logger.warn(
+            `[durable-config:${cfg.larkAppId}] ${scope} reload failed: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ),
+        });
+        durableConfigReloadWatchers.push(watcher);
+        await watcher.ready;
+      }
+    }
+
     // apiOnly (core-only) bots never connect to Feishu: skip the open_id probe,
     // the required-scope check, and the WSClient event subscription. They are
     // driven purely over the HTTP control API (trigger → spawn → trigger-result),
@@ -31325,6 +31615,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             store: durableCoordinationRuntime.store,
             larkAppId: cfg.larkAppId,
             handleCanonical: eventRuntime.processDurableMessage,
+            onInboxRetried: async ({ message, result }) => {
+              try {
+                await enqueueDurableInboxRetryNotice({
+                  store: durableCoordinationRuntime.store,
+                  message,
+                  result,
+                  ownerId: `retry-notice:${getDaemonBootId()}`,
+                });
+              } catch (error) {
+                // The retained Inbox row invokes this observer again. The
+                // notice itself is a stable durable Outbox row, so no direct
+                // provider side effect can be duplicated by claim retries.
+                logger.warn(
+                  `[durable-primary:${message.larkAppId}] retry notice failed for `
+                  + `${message.messageId.substring(0, 12)}: `
+                  + `${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            },
             deliverOutbox: (record, context) => deliverDurableLarkOutbox(
               record,
               context,
@@ -32488,6 +32797,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // keepalive (waitAllWithin) holds the loop so a fire-and-forget SIGTERM
     // handler cannot exit mid-wait once workers/services have stopped.
     const remainingBudget = (): number => Math.max(0, shutdownDeadlineMs - Date.now());
+    // Durable coordination components intentionally cap one stop call at five
+    // minutes. Remote-runner deployments may widen the outer daemon drain to
+    // substantially longer than that; passing the outer remainder through used
+    // to fail validation immediately and abort SIGTERM before any runtime could
+    // stop. Preserve the complete outer deadline while respecting each
+    // component's public stop contract.
+    const durableStopBudget = (): number => Math.min(300_000, remainingBudget());
 
     // --- Phase 1: process reaping (orphan prevention) ------------------------
     // Give every live worker PROCESS a normal grace to exit, then SIGKILL any
@@ -32563,7 +32879,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const reconciler of durableRemoteOrphanReconcilers) reconciler.stop();
     closeLinkRefRuntime();
     for (const runtime of durablePrimaryRuntimes) {
-      const stopped = await runtime.stop(remainingBudget());
+      const stopped = await runtime.stop(durableStopBudget());
       if (stopped.kind === 'timed_out') {
         logger.warn('[durable-primary] runtime stop timed out');
       }
@@ -32572,9 +32888,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
     setDurableSessionListHandler(null);
+    for (const watcher of durableConfigReloadWatchers) watcher.terminate();
     setDurableConfigCoordinator(undefined);
-    await durableInboxShadowConsumer?.stop(remainingBudget());
-    const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
+    await durableInboxShadowConsumer?.stop(durableStopBudget());
+    const durableSessionStop = await durableSessionFacade?.stop(durableStopBudget());
     if (durableSessionStop?.kind === 'timed_out') {
       logger.warn(
         `[durable-session] shadow facade stop timed out `
@@ -32585,7 +32902,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }
-    const durableRecallStop = await durableGroupContextRecallFacade?.stop(remainingBudget());
+    const durableRecallStop = await durableGroupContextRecallFacade?.stop(durableStopBudget());
     if (durableRecallStop?.kind === 'timed_out') {
       logger.warn(
         `[durable-recall] facade stop timed out `
@@ -32654,6 +32971,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
     setDurableSessionListHandler(null);
+    for (const watcher of durableConfigReloadWatchers) watcher.terminate();
     setDurableConfigCoordinator(undefined);
     for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const reconciler of durableRemoteOrphanReconcilers) reconciler.stop();

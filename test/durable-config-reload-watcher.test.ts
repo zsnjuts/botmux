@@ -1,0 +1,133 @@
+import { describe, expect, it, vi } from 'vitest';
+import { startDurableConfigReloadWatcher } from '../src/services/durable-config-reload-watcher.js';
+import {
+  DURABLE_CONFIG_SCOPES,
+  type DurableConfigInspection,
+  type DurableConfigScope,
+} from '../src/services/durable-config-coordinator.js';
+
+function inspection(
+  revision: number,
+  fileSha256: string,
+  status: DurableConfigInspection['status'] = 'in_sync',
+  scope: DurableConfigScope = 'bots',
+): DurableConfigInspection {
+  return {
+    scope,
+    status,
+    fileSha256,
+    recordRevision: revision,
+    recordVersion: 2,
+    phase: status === 'prepared' ? 'prepared' : 'committed',
+    committedSha256: fileSha256,
+    pathMatches: true,
+  };
+}
+
+describe('durable config reload watcher', () => {
+  it.each(DURABLE_CONFIG_SCOPES)('observes the complete %s runtime config authority', async scope => {
+    const current = inspection(1, 'a'.repeat(64), 'in_sync', scope);
+    const apply = vi.fn(async () => undefined);
+    const watcher = startDurableConfigReloadWatcher({
+      inspect: async () => current,
+      apply,
+      intervalMs: 60_000,
+    });
+    await watcher.ready;
+    expect(apply).toHaveBeenCalledWith(current);
+    expect(watcher.status()).toMatchObject({
+      state: 'in_sync',
+      appliedRecordRevision: 1,
+      appliedFileSha256: 'a'.repeat(64),
+    });
+    await watcher.stop();
+  });
+
+  it('skips the already-applied generation and hot-applies a later commit once', async () => {
+    const one = inspection(1, 'a'.repeat(64));
+    const two = inspection(2, 'b'.repeat(64));
+    let current = one;
+    const apply = vi.fn(async () => undefined);
+    const watcher = startDurableConfigReloadWatcher({
+      inspect: async () => current,
+      apply,
+      initialApplied: one,
+      intervalMs: 60_000,
+      now: () => 123,
+    });
+    await watcher.ready;
+    expect(apply).not.toHaveBeenCalled();
+    current = two;
+    await watcher.checkNow();
+    await watcher.checkNow();
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply).toHaveBeenCalledWith(two);
+    expect(watcher.status()).toMatchObject({
+      state: 'in_sync',
+      appliedRecordRevision: 2,
+      appliedFileSha256: 'b'.repeat(64),
+      appliedAt: 123,
+    });
+    await watcher.stop();
+  });
+
+  it.each(['content_drift', 'prepared', 'path_mismatch', 'legacy', 'uninitialized'] as const)(
+    'never applies a blocked %s generation',
+    async status => {
+      const blocked = inspection(2, 'b'.repeat(64), status);
+      const apply = vi.fn(async () => undefined);
+      const watcher = startDurableConfigReloadWatcher({
+        inspect: async () => blocked,
+        apply,
+        intervalMs: 60_000,
+      });
+      await watcher.ready;
+      expect(apply).not.toHaveBeenCalled();
+      expect(watcher.status()).toMatchObject({
+        state: 'blocked',
+        error: `durable_config_reload_${status}`,
+      });
+      await watcher.stop();
+    },
+  );
+
+  it('retries the same generation after a local reload failure', async () => {
+    const next = inspection(3, 'c'.repeat(64));
+    const apply = vi.fn()
+      .mockRejectedValueOnce(new Error('reload failed'))
+      .mockResolvedValueOnce(undefined);
+    const errors: string[] = [];
+    const watcher = startDurableConfigReloadWatcher({
+      inspect: async () => next,
+      apply,
+      intervalMs: 60_000,
+      onError: error => errors.push((error as Error).message),
+    });
+    await watcher.ready;
+    expect(watcher.status()).toMatchObject({ state: 'error', error: 'reload failed' });
+    await watcher.checkNow();
+    expect(apply).toHaveBeenCalledTimes(2);
+    expect(errors).toEqual(['reload failed']);
+    expect(watcher.status()).toMatchObject({ state: 'in_sync', appliedRecordRevision: 3 });
+    await watcher.stop();
+  });
+
+  it('serializes concurrent checks', async () => {
+    const next = inspection(4, 'd'.repeat(64));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const apply = vi.fn(async () => gate);
+    const watcher = startDurableConfigReloadWatcher({
+      inspect: async () => next,
+      apply,
+      intervalMs: 60_000,
+    });
+    const first = watcher.ready;
+    const second = watcher.checkNow();
+    expect(second).toBe(first);
+    release();
+    await first;
+    expect(apply).toHaveBeenCalledTimes(1);
+    await watcher.stop();
+  });
+});

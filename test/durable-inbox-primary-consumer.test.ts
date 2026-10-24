@@ -208,6 +208,7 @@ describe('durable inbox primary consumer', () => {
     const store = inboxStore({ claims: [busy], retried });
     const errors: unknown[] = [];
     const commits: DurableInboxPrimaryDispatchResult[] = [];
+    const retries: string[] = [];
     const consumer = startDurableInboxPrimaryConsumer({
       store,
       workerId: 'primary-boot',
@@ -218,6 +219,7 @@ describe('durable inbox primary consumer', () => {
       now: () => 9_000,
       dispatch: async () => ({ kind: 'retry', reason: 'session has an unfinished turn' }),
       onCommitted: ({ result }) => commits.push(result),
+      onRetried: ({ result }) => retries.push(result.reason),
       onError: error => errors.push(error),
     });
     await consumer.ready;
@@ -226,7 +228,31 @@ describe('durable inbox primary consumer', () => {
     expect(retried).toHaveLength(1);
     expect(retried[0].visibleAt).toBe(9_750);
     expect(commits).toHaveLength(0);
+    expect(retries).toEqual(['session has an unfinished turn']);
     expect(errors).toHaveLength(0);
+    await consumer.stop();
+  });
+
+  it('keeps the Inbox queued when the post-retry observer fails', async () => {
+    const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+    const store = inboxStore({ claims: [claim('om_retry_notice')], retried });
+    const errors: string[] = [];
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      dispatch: async () => ({ kind: 'retry', reason: 'message_quota_infrastructure_unavailable' }),
+      onRetried: async () => { throw new Error('notice unavailable'); },
+      onError: error => errors.push((error as Error).message),
+    });
+    await consumer.ready;
+
+    expect(retried).toHaveLength(1);
+    expect(store.completeInboxClaim).not.toHaveBeenCalled();
+    expect(errors).toEqual([
+      expect.stringContaining('retry observer failed'),
+    ]);
     await consumer.stop();
   });
 

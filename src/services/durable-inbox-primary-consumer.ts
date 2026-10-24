@@ -28,6 +28,11 @@ export interface DurableInboxPrimaryCommit {
   result: DurableInboxPrimaryDispatchResult;
 }
 
+export interface DurableInboxPrimaryRetry {
+  message: DurableLarkMessageClaim;
+  result: Extract<DurableInboxPrimaryDispatchResult, { kind: 'retry' }>;
+}
+
 export interface DurableInboxPrimaryStopResult {
   kind: 'stopped' | 'timed_out';
   inFlight: number;
@@ -59,6 +64,9 @@ export interface DurableInboxPrimaryConsumerOptions {
   shutdownMs?: number;
   now?: () => number;
   onCommitted?: (commit: DurableInboxPrimaryCommit) => void;
+  /** Runs only after the claim is durably returned to queued.  Failures are
+   * observational: they never complete or poison the retained Inbox row. */
+  onRetried?: (retry: DurableInboxPrimaryRetry) => void | Promise<void>;
   onError?: (error: unknown) => void;
 }
 
@@ -198,6 +206,15 @@ export function startDurableInboxPrimaryConsumer(
         });
         if (retried.kind === 'stale') {
           loseOwnership(new Error(`durable inbox primary retry lost claim ${claim.event.eventId}`));
+          return;
+        }
+        try {
+          await options.onRetried?.({ message, result });
+        } catch (error) {
+          reportError(new Error(
+            `durable inbox primary retry observer failed for ${claim.event.eventId}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ));
         }
         return;
       }

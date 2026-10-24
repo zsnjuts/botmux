@@ -16,12 +16,21 @@ const RECORD_VERSION = 2;
 const MAX_AUDIT_ENTRIES = 64;
 const LEASE_DURATION_MS = 300_000;
 
-export type DurableConfigScope = 'bots' | 'global' | 'group-context';
+/**
+ * Complete set of runtime-mutable config authorities protected by durable CAS.
+ *
+ * Keep consumers on this tuple instead of copying string lists. Adding a new
+ * authority must therefore also update every exhaustive path/apply mapping,
+ * otherwise TypeScript fails the build instead of silently omitting cross-Pod
+ * propagation.
+ */
+export const DURABLE_CONFIG_SCOPES = ['bots', 'global', 'group-context'] as const;
+export type DurableConfigScope = typeof DURABLE_CONFIG_SCOPES[number];
 
 interface ConfigAuditEntry {
   operationId: string;
   writerId: string;
-  outcome: 'committed' | 'recovered_changed' | 'recovered_unchanged' | 'failed_changed' | 'failed_unchanged';
+  outcome: 'committed' | 'reconciled_external' | 'recovered_changed' | 'recovered_unchanged' | 'failed_changed' | 'failed_unchanged';
   baseSha256: string;
   contentSha256: string;
   changedPaths: string[];
@@ -54,11 +63,32 @@ type ParsedDurableConfigCasValue = LegacyDurableConfigCasValue | DurableConfigCa
 type DurableConfigStore = DurableSessionLeaseStore & DurableAuxiliaryStateStore;
 
 export interface DurableConfigCoordinator {
+  inspect(input: {
+    scope: DurableConfigScope;
+    path: string;
+  }): Promise<DurableConfigInspection>;
+  reconcile(input: {
+    scope: DurableConfigScope;
+    path: string;
+    expectedCommittedSha256: string;
+    expectedFileSha256: string;
+  }): Promise<DurableConfigInspection>;
   run<T>(input: {
     scope: DurableConfigScope;
     path: string;
     mutation: () => Promise<T>;
   }): Promise<T>;
+}
+
+export interface DurableConfigInspection {
+  scope: DurableConfigScope;
+  status: 'uninitialized' | 'legacy' | 'prepared' | 'path_mismatch' | 'content_drift' | 'in_sync';
+  fileSha256: string;
+  recordRevision?: number;
+  recordVersion?: number;
+  phase?: 'prepared' | 'committed';
+  committedSha256?: string;
+  pathMatches?: boolean;
 }
 
 function sha256(content: Buffer): string {
@@ -188,7 +218,7 @@ function parseAudit(value: unknown): ConfigAuditEntry[] {
       throw new Error(`durable config audit[${index}] is invalid`);
     }
     const raw = entry as Record<string, unknown>;
-    if (!['committed', 'recovered_changed', 'recovered_unchanged', 'failed_changed', 'failed_unchanged']
+    if (!['committed', 'reconciled_external', 'recovered_changed', 'recovered_unchanged', 'failed_changed', 'failed_unchanged']
       .includes(String(raw.outcome))) {
       throw new Error(`durable config audit[${index}] outcome is invalid`);
     }
@@ -259,6 +289,35 @@ function appendAudit(value: ParsedDurableConfigCasValue, entry: ConfigAuditEntry
   return [...value.audit, entry].slice(-MAX_AUDIT_ENTRIES);
 }
 
+function inspection(
+  scope: DurableConfigScope,
+  fileSha256: string,
+  record: DurableAuxiliaryStateRecord | undefined,
+  current: ParsedDurableConfigCasValue | undefined,
+  pathSha256: string,
+): DurableConfigInspection {
+  if (!record || !current) return { scope, status: 'uninitialized', fileSha256 };
+  const common = {
+    scope,
+    fileSha256,
+    recordRevision: record.revision,
+    recordVersion: current.version,
+    phase: current.phase,
+    committedSha256: current.contentSha256,
+  } as const;
+  if (current.version === LEGACY_RECORD_VERSION) {
+    return { ...common, status: 'legacy' };
+  }
+  const pathMatches = current.pathSha256 === pathSha256;
+  if (!pathMatches) return { ...common, status: 'path_mismatch', pathMatches };
+  if (current.phase === 'prepared') return { ...common, status: 'prepared', pathMatches };
+  return {
+    ...common,
+    status: current.contentSha256 === fileSha256 ? 'in_sync' : 'content_drift',
+    pathMatches,
+  };
+}
+
 export function createDurableConfigCoordinator(input: {
   store: DurableConfigStore;
   ownerId: string;
@@ -283,6 +342,91 @@ export function createDurableConfigCoordinator(input: {
   }
 
   return {
+    async inspect({ scope, path }): Promise<DurableConfigInspection> {
+      const { pathSha256 } = await configPathIdentity(path);
+      const file = await snapshot(scope, path);
+      const record = await input.store.readAuxiliaryState(stateKey(scope));
+      const current = record ? parseRecord(record, scope) : undefined;
+      return inspection(scope, file.sha256, record, current, pathSha256);
+    },
+
+    async reconcile({
+      scope,
+      path,
+      expectedCommittedSha256,
+      expectedFileSha256,
+    }): Promise<DurableConfigInspection> {
+      digest(expectedCommittedSha256, 'expectedCommittedSha256');
+      digest(expectedFileSha256, 'expectedFileSha256');
+      const { pathSha256 } = await configPathIdentity(path);
+      const previous = localTails.get(scope) ?? Promise.resolve();
+      let releaseLocal!: () => void;
+      const localGate = new Promise<void>(resolve => { releaseLocal = resolve; });
+      const localTail = previous.catch(() => undefined).then(() => localGate);
+      localTails.set(scope, localTail);
+      await previous.catch(() => undefined);
+      try {
+        const key = stateKey(scope);
+        const acquired = await input.store.acquireSessionLease({
+          sessionKey: key,
+          ownerId,
+          leaseDurationMs: LEASE_DURATION_MS,
+        });
+        if (acquired.kind !== 'acquired') throw new Error('durable_config_busy');
+        const lease = acquired.lease;
+        try {
+          const file = await snapshot(scope, path);
+          const record = await input.store.readAuxiliaryState(key);
+          if (!record) throw new Error('durable_config_reconcile_uninitialized');
+          const current = parseRecord(record, scope);
+          if (current.version !== RECORD_VERSION || current.phase !== 'committed') {
+            throw new Error('durable_config_reconcile_requires_committed_v2');
+          }
+          if (current.pathSha256 !== pathSha256) {
+            throw new Error('durable_config_path_mismatch');
+          }
+          if (current.contentSha256 !== expectedCommittedSha256) {
+            throw new Error('durable_config_reconcile_committed_sha_mismatch');
+          }
+          if (file.sha256 !== expectedFileSha256) {
+            throw new Error('durable_config_reconcile_file_sha_mismatch');
+          }
+          if (current.contentSha256 === file.sha256) {
+            throw new Error('durable_config_reconcile_not_drifted');
+          }
+          const operationId = randomUUID();
+          const committedAt = now();
+          const reconciled: DurableConfigCasValue = {
+            ...current,
+            operationId,
+            baseSha256: current.contentSha256,
+            contentSha256: file.sha256,
+            updatedAt: committedAt,
+            audit: appendAudit(current, {
+              operationId,
+              writerId: ownerId,
+              outcome: 'reconciled_external',
+              baseSha256: current.contentSha256,
+              contentSha256: file.sha256,
+              changedPaths: ['<external-reconcile>'],
+              committedAt,
+            }),
+          };
+          const written = await commit({
+            lease,
+            expectedRevision: record.revision,
+            value: reconciled,
+          });
+          return inspection(scope, file.sha256, written, reconciled, pathSha256);
+        } finally {
+          await input.store.releaseSessionLease(lease).catch(() => undefined);
+        }
+      } finally {
+        releaseLocal();
+        if (localTails.get(scope) === localTail) localTails.delete(scope);
+      }
+    },
+
     async run<T>({ scope, path, mutation }: {
       scope: DurableConfigScope;
       path: string;

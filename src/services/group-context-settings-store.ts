@@ -32,7 +32,7 @@ interface GroupContextSettingsRegistry {
   configs: Record<string, GroupContextSettings>;
 }
 
-function storePath(dataDir: string): string {
+export function groupContextSettingsStorePath(dataDir: string = config.session.dataDir): string {
   const configured = process.env[GROUP_CONTEXT_SETTINGS_FILE_ENV]?.trim();
   if (configured) {
     if (!isAbsolute(configured)) {
@@ -108,7 +108,7 @@ export function getGroupContextSettings(
   void appId;
   if (!GROUP_CHAT_ID_PATTERN.test(chatId)) return { ...DEFAULT_GROUP_CONTEXT_SETTINGS };
   try {
-    const path = storePath(dataDir);
+    const path = groupContextSettingsStorePath(dataDir);
     const configs = readRegistry(path).configs;
     const settings = Object.hasOwn(configs, chatId) ? configs[chatId] : undefined;
     return { ...(settings ?? DEFAULT_GROUP_CONTEXT_SETTINGS) };
@@ -147,7 +147,7 @@ export async function setGroupContextSettings(
 ): Promise<GroupContextSettings> {
   if (!GROUP_CHAT_ID_PATTERN.test(chatId)) throw new Error('invalid group chat ID');
   validatePatch(patch);
-  const path = storePath(dataDir);
+  const path = groupContextSettingsStorePath(dataDir);
   return runDurableConfigMutation({
     scope: 'group-context',
     path,

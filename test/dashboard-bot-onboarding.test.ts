@@ -68,6 +68,12 @@ const immediateCriticalScopePolling = {
 function installPrimaryBotsMutation(path: string, calls: string[]) {
   vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
   setDurableConfigCoordinator({
+    inspect: async input => ({
+      scope: input.scope,
+      status: 'uninitialized',
+      fileSha256: '0'.repeat(64),
+    }),
+    reconcile: async () => { throw new Error('not used'); },
     run: async input => input.mutation(),
   });
   return async <T>(mutation: () => T | Promise<T>): Promise<T> => {

@@ -31,6 +31,16 @@ export interface OnlineDaemonInfo {
   botmuxVersion?: string;
   botName?: string;
   cliId?: string;
+  configApplied?: Record<string, {
+    state?: string;
+    observedStatus?: string;
+    observedRecordRevision?: number;
+    observedFileSha256?: string;
+    appliedRecordRevision?: number;
+    appliedFileSha256?: string;
+    appliedAt?: number;
+    error?: string;
+  }>;
   pid?: number;
   lastHeartbeat?: number;
 }
@@ -108,6 +118,9 @@ export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } =
           : {}),
         ...(typeof d.botName === 'string' && d.botName.trim() ? { botName: d.botName.trim() } : {}),
         ...(typeof d.cliId === 'string' && d.cliId.trim() ? { cliId: d.cliId.trim() } : {}),
+        ...(d.configApplied && typeof d.configApplied === 'object'
+          ? { configApplied: d.configApplied }
+          : {}),
         pid: d.pid,
         lastHeartbeat: d.lastHeartbeat,
       });

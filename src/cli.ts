@@ -7370,6 +7370,11 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   env-policy get|set <JSON>|unset [--bot <name|appId>]
               查看或配置本 bot 的进程环境继承（仅显示模式/变量名）
   status      查看 daemon 状态
+  config-cas inspect --bot <appId> [--scope bots|global|group-context]
+              只读检查 primary 配置文件与 durable CAS 是否一致（仅输出哈希）
+  config-cas reconcile --bot <appId> --scope <scope>
+              --expected-committed-sha <sha256> --expected-file-sha <sha256> --yes
+              以双 SHA 前置条件显式接纳已核实的带外配置；不会自动接受漂移
   upgrade     升级到最新版本（别名：update）
               支持可选 target：canary / beta / rc 等频道，或具体版本号（默认 latest）
   dashboard current
@@ -18766,6 +18771,31 @@ switch (command) {
   case 'restart': await cmdRestart(); break;
   case 'logs':    await cmdLogs(); break;
   case 'status':  await cmdStatus(); break;
+  case 'config-cas': {
+    try {
+      if (isolatedCliProcess() || isSessionScopedCliProcess()) {
+        throw new Error('config-cas is available only from a trusted host shell');
+      }
+      const { durableConfigCasRequest, parseDurableConfigCasArgs } = await import('./cli/durable-config-cas.js');
+      const parsed = parseDurableConfigCasArgs(process.argv.slice(3));
+      const daemon = findDaemon(parsed.larkAppId);
+      if (!daemon) throw new Error('target bot daemon is unavailable');
+      const request = durableConfigCasRequest(parsed);
+      const response = await fetchDaemonIpc(
+        daemon.ipcPort,
+        request.path,
+        { ...request.init, signal: AbortSignal.timeout(15_000) },
+        loadDaemonIpcSecret(),
+      );
+      const body = await response.json();
+      process.stdout.write(`${JSON.stringify(body)}\n`);
+      if (!response.ok) process.exitCode = 1;
+    } catch (error) {
+      console.error(`botmux config-cas: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
+    break;
+  }
   case 'codex-instances': {
     const { runCodexInstancesCommand } = await import('./cli/codex-instances.js');
     await runCodexInstancesCommand(process.argv.slice(3));
