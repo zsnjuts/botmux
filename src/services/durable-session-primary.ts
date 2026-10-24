@@ -151,7 +151,8 @@ function parseControl(
   }
   const action = raw.action;
   if (action !== 'close' && action !== 'resume'
-      && action !== 'toggle_display' && action !== 'handoff') {
+      && action !== 'toggle_display' && action !== 'handoff'
+      && action !== 'terminalize_orphan') {
     throw new Error(`durable primary Session ${recordSessionKey} has an invalid control action`);
   }
   const result = raw.result;

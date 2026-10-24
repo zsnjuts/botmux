@@ -8,7 +8,10 @@ import {
   parseDurableSessionControlClaim,
   type DurableLarkSessionControlClaim,
 } from './durable-lark-session-control.js';
-import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
+import {
+  DurableSessionControlDeferredError,
+  DurableSessionControlOwnerHandoffError,
+} from './durable-session-control-errors.js';
 
 export type DurableSessionControlDispatchResult =
   | { kind: 'settled' }
@@ -40,6 +43,9 @@ export interface DurableSessionControlConsumerOptions {
   retryDelayMs?: number;
   /** Fast requeue used only when a prefix failover raced the exact owner. */
   ownerHandoffRetryDelayMs?: number;
+  /** Slow retry for provider-authority probes that intentionally made no
+   * mutation because the remote was live or its state was inconclusive. */
+  deferredRetryDelayMs?: number;
   /** Give an exact local owner time to claim before cluster-prefix failover. */
   fallbackClaimIntervalMs?: number;
   concurrency?: number;
@@ -110,6 +116,11 @@ function timeoutPromise(ms: number): { promise: Promise<false>; cancel(): void }
   };
 }
 
+function deferredRetryBackoff(baseMs: number, attempts: number): number {
+  const exponent = Math.min(Math.max(attempts - 1, 0), 6);
+  return Math.min(3_600_000, baseMs * (2 ** exponent));
+}
+
 /**
  * Owner-routed control consumer。Inbox claim 只保证 lane/partition FIFO；真正的
  * Session fencing、外部副作用 attempt 和 canonical Session 提交由 dispatch 回调完成。
@@ -144,6 +155,12 @@ export function startDurableSessionControlConsumer(
     10,
     5_000,
   );
+  const deferredRetryDelayMs = boundedInteger(
+    options.deferredRetryDelayMs ?? 60_000,
+    'deferredRetryDelayMs',
+    1_000,
+    3_600_000,
+  );
   const fallbackClaimIntervalMs = boundedInteger(
     options.fallbackClaimIntervalMs ?? 1_000,
     'fallbackClaimIntervalMs',
@@ -166,6 +183,7 @@ export function startDurableSessionControlConsumer(
   let stopPromise: Promise<DurableSessionControlConsumerStopResult> | undefined;
   let partitionCursor = 0;
   let lastFallbackClaimAt = now();
+  let fallbackWindowOpen = false;
 
   const reportError = (error: unknown): void => {
     try { options.onError?.(error); } catch { /* observers cannot alter claim state */ }
@@ -245,7 +263,9 @@ export function startDurableSessionControlConsumer(
       reportError(error);
       const delayMs = error instanceof DurableSessionControlOwnerHandoffError
         ? ownerHandoffRetryDelayMs
-        : retryDelayMs;
+        : error instanceof DurableSessionControlDeferredError
+          ? deferredRetryBackoff(deferredRetryDelayMs, claim.attempts)
+          : retryDelayMs;
       const retried = await options.store.retryInboxClaim({
         claim,
         visibleAt: now() + delayMs,
@@ -265,7 +285,28 @@ export function startDurableSessionControlConsumer(
       let claim: InboxClaim | undefined;
       try {
         const partitionKeys = nextOwnedPartitionBatch();
-        if (partitionKeys.length > 0) {
+        let prefixClaimAttempted = false;
+        if (partitionKeyPrefix
+            && now() - lastFallbackClaimAt >= fallbackClaimIntervalMs) {
+          // Give exact owners the initial interval, then reserve one periodic
+          // prefix-first probe. If locally owned partitions are continuously
+          // retryable, probing the prefix only after an exact miss starves
+          // canonical-only failover controls forever. Opening the fallback
+          // window also lets other idle slots use the prefix after an exact
+          // miss. Without that second path, even one locally owned partition
+          // keeps a large canonical-only backlog serialized behind this
+          // single periodic probe.
+          fallbackWindowOpen = true;
+          lastFallbackClaimAt = now();
+          prefixClaimAttempted = true;
+          claim = await options.store.claimNextInbox({
+            workerId: slotWorkerId,
+            lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+            partitionKeyPrefix,
+            leaseDurationMs,
+          });
+        }
+        if (!claim && partitionKeys.length > 0) {
           claim = await options.store.claimNextInbox({
             workerId: slotWorkerId,
             lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
@@ -273,11 +314,7 @@ export function startDurableSessionControlConsumer(
             leaseDurationMs,
           });
         }
-        if (!claim && partitionKeyPrefix
-            && now() - lastFallbackClaimAt >= fallbackClaimIntervalMs) {
-          // Prefix fallback is a failover path, not an equal-priority race with
-          // the exact owner. Only one slot probes it per interval.
-          lastFallbackClaimAt = now();
+        if (!claim && partitionKeyPrefix && fallbackWindowOpen && !prefixClaimAttempted) {
           claim = await options.store.claimNextInbox({
             workerId: slotWorkerId,
             lane: DURABLE_INBOX_LANE_SESSION_CONTROL,

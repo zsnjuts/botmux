@@ -6900,6 +6900,7 @@ type RemoteClosePreparation =
         | 'remote_runner_worker_missing'
         | 'remote_runner_close_reconciliation_required'
         | 'remote_runner_durable_close_failed'
+        | 'remote_orphan_proof_invalid'
         | 'remote_shutdown_fence_in_progress'
         // mojo reuses this preparation contract: same problem (a remote,
         // credential-bearing session that must be proven gone before the row is
@@ -7654,8 +7655,8 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
     ds.remoteCloseState = undefined;
     const accepted = forkImpl(ds, '', {
       resume: true,
-      remoteResumeMode: 'close-control',
     }, {
+      remoteResumeMode: 'close-control',
       // A close request must not leave a delayed wake callback behind after it
       // has already returned failure. This also disables marginal-memory
       // reclaim/re-entry, which shares the same explicit no-defer gate.
@@ -9211,7 +9212,7 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; remoteOrphanProof?: true; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -9231,6 +9232,21 @@ export async function closeSession(
   const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
   const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
   const isOwnedRemoteRunnerClose = isOwnedClose && closeFrozenBackendType === 'remote-runner';
+  if (opts?.remoteOrphanProof) {
+    const remote = normalizeRemoteRunnerBackendState(ds?.session.remoteBackendState);
+    const storedRemote = normalizeRemoteRunnerBackendState(stored?.remoteBackendState);
+    if (!isOwnedRemoteRunnerClose || !ds || !stored || ds.session.status !== 'active'
+        || stored.status !== 'active' || ds.workerReady !== true
+        || !remote || !storedRemote || remote.remoteSessionId || storedRemote.remoteSessionId
+        || remote.generation < 1 || storedRemote.generation !== remote.generation) {
+      return {
+        ok: false,
+        alreadyClosed: false,
+        error: 'remote_orphan_proof_invalid',
+        retryable: true,
+      };
+    }
+  }
   const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
   if (closeJournal && !isOwnedMojoClose) {
     // Never let a Mojo cancellation journal silently disappear through another
@@ -9323,7 +9339,7 @@ export async function closeSession(
     ? await prepareRiffExplicitClose(ds, stored)
     : isOwnedMojoClose
       ? await prepareMojoExplicitClose(ds, stored)
-      : isOwnedRemoteRunnerClose
+      : isOwnedRemoteRunnerClose && !opts?.remoteOrphanProof
         ? await prepareRemoteRunnerExplicitClose(ds, stored)
         : { ok: true };
   if (!prepared.ok) {
@@ -9473,7 +9489,13 @@ export async function closeSession(
   if (ds) {
     disposeOrdinaryTurnRecovery(ds.session);
     disposeReadonlyTaskContinuation(ds.session);
-    killWorker(ds, {
+    if (opts?.remoteOrphanProof) {
+      // The provider has already atomically closed its durable state after an
+      // authoritative read-only missing proof. Retire only this temporary
+      // observer; sending the generic close IPC would issue a second cancel and
+      // advance provider lineage again.
+      retireWorkerProcessOnly(ds, 'remote_orphan_terminalized');
+    } else killWorker(ds, {
       ...(codexArchiveReleaseTicket ? { codexCleanupRelease: codexArchiveReleaseTicket.request } : {}),
       ...(preparedRemoteRequestId ? { remoteCloseCommitRequestId: preparedRemoteRequestId } : {}),
       // The prepare above already proved this cancel; the durable row cleared the
@@ -13181,9 +13203,6 @@ export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
 
 export type ForkResumeOrTurnId = boolean | string | {
   resume?: boolean;
-  /** Explicit close reactivation asks a Remote Runner provider to replace the
-   * cancelled remote generation instead of reattaching it. */
-  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control';
   turnId?: string;
   dispatchAttempt?: number;
   /** The opening prompt is a claimed durable-primary Inbox row and must ACK
@@ -13219,6 +13238,14 @@ export interface WorkerAdmissionBlockedNotice {
 }
 export type ForkWorkerOptions = {
   onAdmission?: (admission: WorkerForkAdmission) => void;
+  /**
+   * Privileged Remote Runner lifecycle intent for this exact worker spawn.
+   * Keep it outside ForkResumeOrTurnId: that object also carries replayable
+   * turn/admission metadata and may be rewritten while recovering a queued
+   * activation. A close, rebuild or orphan proof must never silently degrade
+   * into an ordinary reattach when that happens.
+   */
+  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control' | 'orphan-reconcile';
   /** Replace the direct provider reply when the caller owns a durable output lane. */
   onAdmissionBlocked?: (notice: WorkerAdmissionBlockedNotice) => void;
   /** Called once when an admitted worker exits before its ready boundary. */
@@ -13581,7 +13608,7 @@ export function forkWorker(
     && promptInput !== null
     && promptInput.codexAppSteerable === true;
   let resume = false;
-  let remoteResumeMode: 'reattach' | 'rebuild' | 'close-control' | undefined;
+  const remoteResumeMode = opts.remoteResumeMode;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
   let initDurablePrimaryInbox: true | undefined;
@@ -13594,7 +13621,6 @@ export function forkWorker(
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
     resume = resumeOrTurnId.resume === true;
-    remoteResumeMode = resumeOrTurnId.remoteResumeMode;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
     initDurablePrimaryInbox = resumeOrTurnId.durablePrimaryInbox;
@@ -18240,8 +18266,20 @@ function setupWorkerHandlers(
         // 现在统一走失败卡。仍然刻意**不**碰已经有可见卡片的路径：`failed` 的
         // 结构化终态由 Channel B 的 final_output 卡承载（还带半截答案），在这里
         // 再发一张就是重复通知。
-        const structuredFailedOwnsNotice = !isClaudeProviderFailure && msg.status === 'failed'
-          && !(msg.errorCode === CODEX_CAPACITY_ERROR_CODE && recoveryOwnsTerminal && !recoveryHandled);
+        // Remote Runner always emits a structured final_output diagnostic
+        // before its failed/ambiguous terminal (including recovered-turn
+        // takeover failures). Let that single durable output own the visible
+        // notice; posting another generic terminal card would duplicate the
+        // same failure after a Pod handoff. Other structured backends do not
+        // universally provide an ambiguous final_output, so keep their
+        // historical fallback-card behavior.
+        const remoteRunnerFailureOwnsNotice = !isClaudeProviderFailure
+          && msg.status === 'ambiguous'
+          && (ds.session.backendType === 'remote-runner' || ds.session.cliId === 'remote-runner');
+        const structuredFailedOwnsNotice = remoteRunnerFailureOwnsNotice
+          || (!isClaudeProviderFailure && msg.status === 'failed'
+            && !(msg.errorCode === CODEX_CAPACITY_ERROR_CODE
+              && recoveryOwnsTerminal && !recoveryHandled));
         const shouldPostFailureCard = shouldNotifyTurnFailure({
           status: msg.status,
           ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),

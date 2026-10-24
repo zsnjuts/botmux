@@ -55,9 +55,9 @@ provider 的 stderr 不参与协议；BotMux 只累计其字节数用于错误�
 `turnId` 可以同时携带，也可以由 BotMux 从原命令精确恢复。这个结果是已关联的明确失败，不会被当作
 ACK 超时或未知执行结果，且不会毒化后续 turn。
 
-`resume.resumeMode` 区分两种恢复：缺省或 `reattach` 表示 daemon/worker 重启后接管仍存活的远端资源；
+`resume.resumeMode` 区分恢复与控制意图：缺省或 `reattach` 表示 daemon/worker 重启后接管仍存活的远端资源；
 `rebuild` 表示用户显式关闭后重新打开，旧远端资源已被取消，provider 必须创建新资源、推进
-`generation`，并在可能时保留 `agentThreadId`。BotMux 会拒绝未推进 generation 的 rebuild `ready`。
+`generation`，并在可能时保留 `agentThreadId`；`close-control` 只恢复足以执行 cancel 的控制面，不接收模型 turn；`orphan-reconcile` 则只允许协商了 `orphan_reconciliation` 的 provider 对已经提交、但失去 owner 的 turn 做权威只读检查。后者只有在绑定的远端资源已明确消失时才能返回 `ready`，并须推进 `generation`、清除 `remoteSessionId`，形成不可与旧 compute 混淆的 terminal lineage；远端仍存活、查询失败或状态不唯一必须返回 `failure`，不得创建新资源或重放 turn。BotMux 会拒绝未推进 generation 的 rebuild `ready`。
 
 `status: busy` 前不得发送 `progress`、`outbound_message`、`session_tool` 或 `final`。ACK 后的终态 `failure`
 必须携带 `turnId`；可以同时重复原 turn 的 `requestId`，但该值必须精确匹配。只带 `requestId`
@@ -262,6 +262,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 - `providerState` 是最多 64 KiB、深度受限的普通 JSON。它可以保存恢复定位信息，但不得保存任何凭据。
 - provider 可通过 `lineage_changed` 在 turn 执行期间更新状态，也可在 `final`、`ready`、`status` 中附带状态。BotMux 在接受后立即持久化。
 - 普通 daemon/worker 重启发送 `resumeMode: "reattach"`（省略时同义），允许接管仍存活的远端资源；用户显式关闭后点击恢复发送 `resumeMode: "rebuild"`，provider 必须新建远端资源并在 `ready` 中推进 `generation`。Node worker 或其 Remote Runner backend 在新的 ready state 落盘前退出时，BotMux 会在远端 lineage 未变化的前提下把逻辑 Session 恢复为 closed，并回收仅剩的本地 worker；若 lineage 已变化则保持保护状态并要求显式对账，不能伪装成恢复成功。
+- `orphan_reconciliation` 是独立的可选安全能力，不属于普通 `turn_recovery`。协调层可为无 owner 的 canonical active Session 排入稳定 control operation，但只有 provider 能证明已提交 turn 的绑定远端资源明确消失时才能返回 `orphan-reconcile` ready；BotMux 随后以同一个 durable operation 提交 canonical closed 和唯一失败终态。任何不明确结果都保持 active，既不重放 prompt，也不把本地 worker 缺失当作远端缺失证明。
 
 ## 关闭与进程退出
 

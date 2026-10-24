@@ -213,7 +213,7 @@ export interface SpawnOpts {
   strictEnvReattach?: boolean;
   /** Why a Remote Runner state is being resumed. Explicit reactivation may
    * require the provider to replace a resource that was previously cancelled. */
-  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control';
+  remoteResumeMode?: 'reattach' | 'rebuild' | 'close-control' | 'orphan-reconcile';
   /**
    * Per-bot shell override (BotConfig.launchShell). When set, the persistent
    * backends (tmux/zellij/zmx) launch the CLI under this shell instead of `$SHELL`
@@ -392,6 +392,10 @@ export interface SessionBackend {
   ): boolean;
   /** Provider handshake/startup is complete and turns may be accepted. */
   onReady?(cb: () => void): void;
+  /** Await the same provider startup boundary exposed by onReady. Backends
+   * whose spawn() is asynchronous use this to keep the worker-level ready IPC
+   * behind their own handshake and durable-state publication. */
+  waitUntilReady?(): Promise<void>;
   /** Durable, provider-neutral lineage/runtime state changed. */
   onBackendState?(cb: (state: RemoteRunnerBackendState) => void): void;
   /** Provider-native usage observed at a generation-fenced turn boundary. */

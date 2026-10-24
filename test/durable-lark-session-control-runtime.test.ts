@@ -11,6 +11,7 @@ import { createDurableSessionFacade } from '../src/services/durable-session-faca
 import { createDurableSessionControlDispatch } from '../src/services/durable-session-control-dispatch.js';
 import {
   durableDirectSessionControlEvent,
+  durableInteractiveSessionControlPartition,
   durableLarkSessionControlEvent,
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
@@ -64,7 +65,7 @@ function control(action: 'close' | 'resume' = 'close') {
   const event = durableLarkSessionControlEvent({
     larkAppId: 'cli_test',
     eventId: durableLarkSessionControlEventId('cli_test', `evt_${action}`),
-    partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+    partitionKey: durableInteractiveSessionControlPartition('cli_test', 'session-1'),
     data,
     now: 2,
   });
@@ -95,7 +96,7 @@ function displayControl(target: 'hidden' | 'screenshot' = 'screenshot') {
   const event = durableLarkSessionControlEvent({
     larkAppId: 'cli_test',
     eventId: durableLarkSessionControlEventId('cli_test', `evt_display_${target}`),
-    partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+    partitionKey: durableInteractiveSessionControlPartition('cli_test', 'session-1'),
     data,
     now: 2,
   });
@@ -111,7 +112,7 @@ function displayControl(target: 'hidden' | 'screenshot' = 'screenshot') {
 
 function directControl(
   source: 'lark-command' | 'trusted-host',
-  action: 'close' | 'resume' | 'handoff' = 'close',
+  action: 'close' | 'resume' | 'handoff' | 'terminalize_orphan' = 'close',
   retiringOwnerId = 'retiring-owner',
 ) {
   const event = durableDirectSessionControlEvent({
@@ -318,7 +319,7 @@ describe('durable Lark session control runtime', () => {
     });
     operatorAllowed = true;
     expect(runtime.ownedPartitionKeys()).toEqual([
-      'lark-session-control:cli_test:session-1',
+      'lark-session-control:cli_test:interactive:session-1',
     ]);
     const dispatch = createDurableSessionControlDispatch({
       store,
@@ -346,7 +347,7 @@ describe('durable Lark session control runtime', () => {
     });
     now = 11;
     expect(runtime.ownedPartitionKeys()).toEqual([
-      'lark-session-control:cli_test:session-1',
+      'lark-session-control:cli_test:interactive:session-1',
     ]);
     await facade.stop();
     await store.close();
@@ -669,7 +670,7 @@ describe('durable Lark session control runtime', () => {
     expect(materializeClosedSession).toHaveBeenCalledOnce();
     expect(resumeSession).toHaveBeenCalledWith('session-1');
     expect(runtime.ownedPartitionKeys()).toEqual([
-      'lark-session-control:cli_test:session-1',
+      'lark-session-control:cli_test:interactive:session-1',
     ]);
     const canonical = await store.readSession('om_root::cli_test');
     expect(parseDurablePrimarySessionRecord(canonical!)).toMatchObject({
@@ -1397,6 +1398,411 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
+  it('terminalizes a submitted canonical orphan only after provider missing proof', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-orphan-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    const canonical = session({
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+        remoteSessionId: 'remote-expired',
+        agentThreadId: 'thread-existing',
+        providerState: { sessionKey: 'logical-session' },
+      },
+    });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'orphan-owner' });
+    let persisted: Session | undefined;
+    let active: DaemonSession | undefined;
+    const takeOverActiveSession = vi.fn(async (_key: string, value: Session) => {
+      persisted = {
+        ...structuredClone(value),
+        remoteBackendState: {
+          ...value.remoteBackendState!,
+          generation: value.remoteBackendState!.generation + 1,
+          remoteSessionId: undefined,
+        },
+      };
+      active = {
+        session: persisted,
+        larkAppId: 'cli_test',
+        chatId: 'oc_chat',
+        streamCardId: 'om_card',
+        worker: { killed: false },
+        workerReady: true,
+        initConfig: { remoteResumeMode: 'orphan-reconcile' },
+      } as unknown as DaemonSession;
+      return { session: persisted, owner: active };
+    });
+    const terminalizeOrphanSession = vi.fn(async () => {
+      persisted = { ...persisted!, status: 'closed', closedAt: '2026-10-23T00:01:00.000Z' };
+      active = undefined;
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false };
+    });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => active ? [active] : [],
+      findActiveSession: () => active,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
+      takeOverActiveSession,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'ordinary close must not run' }),
+      terminalizeOrphanSession,
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      isResumeReady: ds => !!ds.worker && !ds.worker.killed && ds.workerReady === true,
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      buildOrphanedCard: () => '{"orphan":"terminal"}',
+      orphanedNoticeText: () => 'orphan terminalized',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = directControl('trusted-host', 'terminalize_orphan');
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(takeOverActiveSession).toHaveBeenCalledWith(
+      'om_root::cli_test',
+      expect.objectContaining({ sessionId: 'session-1', status: 'active' }),
+      { remoteResumeMode: 'orphan-reconcile' },
+    );
+    expect(terminalizeOrphanSession).toHaveBeenCalledWith('session-1');
+    expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
+      .toMatchObject({
+        session: { status: 'closed', remoteBackendState: { generation: 3 } },
+        controls: [{
+          source: 'trusted-host',
+          action: 'terminalize_orphan',
+          operationId: input.control.operationId,
+        }],
+      });
+    const digest = createHash('sha256').update(input.control.operationId).digest('hex');
+    expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
+      .toMatchObject({
+        content: '{"orphan":"terminal"}',
+        terminalUpdateFallback: {
+          target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+          providerUuid: `bcf_${digest.slice(0, 40)}`,
+        },
+      });
+    await facade.stop();
+    await store.close();
+  });
+
+  it('retires a stranded recovered-turn owner before obtaining fresh missing proof', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-stranded-owner-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    const canonical = session({
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      lastFailedTurn: {
+        turnId: 'om_recovered',
+        userPrompt: 'original prompt',
+        cliInput: 'original input',
+        failedAt: '2026-10-23T00:01:00.000Z',
+        errorCode: 'provider_takeover_failed',
+        status: 'ambiguous',
+        retryCount: 0,
+        recoveredRemoteTurn: true,
+      },
+      remoteBackendState: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+        remoteSessionId: 'remote-expired',
+      },
+    });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'orphan-owner' });
+    let persisted: Session = structuredClone(canonical);
+    let active: DaemonSession | undefined = {
+      session: persisted,
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      worker: { killed: false },
+      workerReady: true,
+    } as unknown as DaemonSession;
+    const abandonOrphanTakeover = vi.fn(() => {
+      active = undefined;
+      persisted = { ...persisted, status: 'closed' };
+    });
+    const takeOverActiveSession = vi.fn(async (_key: string, value: Session) => {
+      persisted = {
+        ...structuredClone(value),
+        remoteBackendState: {
+          ...value.remoteBackendState!,
+          generation: value.remoteBackendState!.generation + 1,
+          remoteSessionId: undefined,
+        },
+      };
+      active = {
+        session: persisted,
+        larkAppId: 'cli_test',
+        chatId: 'oc_chat',
+        worker: { killed: false },
+        workerReady: true,
+        initConfig: { remoteResumeMode: 'orphan-reconcile' },
+      } as unknown as DaemonSession;
+      return { session: persisted, owner: active };
+    });
+    const terminalizeOrphanSession = vi.fn(async () => {
+      persisted.status = 'closed';
+      active!.session.status = 'closed';
+      return { ok: true };
+    });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test', privateCard: false, store, facade: () => facade,
+      listActiveSessions: () => active ? [active] : [], findActiveSession: () => active,
+      listPersistedSessions: () => [persisted], getPersistedSession: () => persisted,
+      materializeClosedSession: value => value, takeOverActiveSession, abandonOrphanTakeover,
+      canOperate: () => false, closeSession: async () => ({ ok: false, error: 'not called' }),
+      terminalizeOrphanSession,
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      isResumeReady: ds => ds.workerReady === true,
+      buildClosedCard: () => 'closed', buildActiveCard: () => 'active',
+      buildOrphanedCard: () => '{"orphan":"terminal"}',
+      closeResidualText: () => 'residual', closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = directControl('trusted-host', 'terminalize_orphan');
+    const dispatch = createDurableSessionControlDispatch({
+      store, sessionOwnerId: facade.ownerId, resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(abandonOrphanTakeover).toHaveBeenCalledExactlyOnceWith('session-1');
+    expect(takeOverActiveSession).toHaveBeenCalledWith(
+      'om_root::cli_test',
+      expect.objectContaining({ sessionId: 'session-1', status: 'active' }),
+      { remoteResumeMode: 'orphan-reconcile' },
+    );
+    expect(terminalizeOrphanSession).toHaveBeenCalledExactlyOnceWith('session-1');
+    await facade.stop();
+    await store.close();
+  });
+
+  it('rejects a same-session replacement as orphan proof for another owner', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-orphan-owner-race-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    const canonical = session({
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+        remoteSessionId: 'remote-expired',
+      },
+    });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'orphan-owner' });
+    const proofOwner = {
+      session: {
+        ...structuredClone(canonical),
+        remoteBackendState: {
+          ...canonical.remoteBackendState!,
+          generation: 3,
+          remoteSessionId: undefined,
+        },
+      },
+      larkAppId: 'cli_test', chatId: 'oc_chat', worker: { killed: false }, workerReady: false,
+      initConfig: { remoteResumeMode: 'orphan-reconcile' },
+    } as unknown as DaemonSession;
+    const replacement = {
+      session: structuredClone(canonical),
+      larkAppId: 'cli_test', chatId: 'oc_chat', worker: { killed: false }, workerReady: true,
+      initConfig: { remoteResumeMode: 'reattach' },
+    } as unknown as DaemonSession;
+    const abandonOrphanTakeover = vi.fn();
+    const terminalizeOrphanSession = vi.fn(async () => ({ ok: true as const }));
+    let activeLookups = 0;
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test', privateCard: false, store, facade: () => facade,
+      listActiveSessions: () => [replacement],
+      findActiveSession: () => (++activeLookups === 1 ? undefined : replacement),
+      listPersistedSessions: () => [], getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      takeOverActiveSession: async () => ({ session: proofOwner.session, owner: proofOwner }),
+      abandonOrphanTakeover,
+      canOperate: () => false, closeSession: async () => ({ ok: false, error: 'not called' }),
+      terminalizeOrphanSession,
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      isResumeReady: ds => ds.workerReady === true,
+      buildClosedCard: () => 'closed', buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual', closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = directControl('trusted-host', 'terminalize_orphan');
+    const resolved = await runtime.resolve(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    });
+    if (resolved.kind !== 'target') throw new Error('expected orphan target');
+
+    await expect(resolved.target.execute(new AbortController().signal)).resolves.toEqual({
+      kind: 'not_applied',
+      error: 'orphan reconciliation owner changed before proof completed',
+    });
+    expect(abandonOrphanTakeover).toHaveBeenCalledExactlyOnceWith('session-1', proofOwner);
+    expect(terminalizeOrphanSession).not.toHaveBeenCalled();
+    await facade.stop();
+    await store.close();
+  });
+
+  it('leaves an unproven orphan active without committing a lifecycle result', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-orphan-refused-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    const canonical = session({
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+        remoteSessionId: 'remote-live-or-unknown',
+      },
+    });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'orphan-owner' });
+    const takeOverActiveSession = vi.fn(async () => {
+      throw new Error('provider refused or could not prove missing');
+    });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test', privateCard: false, store, facade: () => facade,
+      listActiveSessions: () => [], findActiveSession: () => undefined,
+      listPersistedSessions: () => [], getPersistedSession: () => undefined,
+      materializeClosedSession: value => value, takeOverActiveSession,
+      canOperate: () => false, closeSession: async () => ({ ok: false, error: 'not called' }),
+      terminalizeOrphanSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed', buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual', closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = directControl('trusted-host', 'terminalize_orphan');
+    const dispatch = createDurableSessionControlDispatch({
+      store, sessionOwnerId: facade.ownerId, resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).rejects.toThrow(/provider refused/);
+    expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
+      .toMatchObject({ session: { status: 'active' }, controls: [] });
+    await facade.stop();
+    await store.close();
+  });
+
+  it('does not treat a locally abandoned row with live remote lineage as orphan proof', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-orphan-abandoned-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    const canonical = session({
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+        remoteSessionId: 'remote-live-or-unknown',
+      },
+    });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'orphan-owner' });
+    let now = 0;
+    let persisted: Session | undefined;
+    let active: DaemonSession | undefined;
+    const takeOverActiveSession = vi.fn(async (_key: string, value: Session) => {
+      persisted = structuredClone(value);
+      active = {
+        session: persisted,
+        larkAppId: 'cli_test',
+        chatId: 'oc_chat',
+        worker: { killed: false },
+        workerReady: false,
+        initConfig: { remoteResumeMode: 'orphan-reconcile' },
+      } as unknown as DaemonSession;
+      return { session: persisted, owner: active };
+    });
+    const abandonOrphanTakeover = vi.fn(() => {
+      persisted = { ...persisted!, status: 'closed' };
+      active = undefined;
+    });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test', privateCard: false, store, facade: () => facade,
+      listActiveSessions: () => active ? [active] : [], findActiveSession: () => active,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: () => persisted, materializeClosedSession: value => value,
+      takeOverActiveSession, abandonOrphanTakeover,
+      canOperate: () => false, closeSession: async () => ({ ok: false, error: 'not called' }),
+      terminalizeOrphanSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      isResumeReady: ds => ds.workerReady === true,
+      buildClosedCard: () => 'closed', buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual', closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+      resumeReadinessTimeoutMs: 100,
+      resumeReadinessPollMs: 10,
+      now: () => now,
+      wait: async ms => { now += ms; },
+    });
+    const input = directControl('trusted-host', 'terminalize_orphan');
+    const resolved = await runtime.resolve(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    });
+    if (resolved.kind !== 'target') throw new Error('expected orphan target');
+
+    await expect(resolved.target.execute(new AbortController().signal)).resolves.toMatchObject({
+      kind: 'not_applied',
+    });
+    expect(abandonOrphanTakeover).toHaveBeenCalledOnce();
+    expect(persisted).toMatchObject({
+      status: 'closed',
+      remoteBackendState: { remoteSessionId: 'remote-live-or-unknown' },
+    });
+    await expect(resolved.target.execute(new AbortController().signal)).resolves.toMatchObject({
+      kind: 'not_applied',
+    });
+    expect(takeOverActiveSession).toHaveBeenCalledTimes(2);
+    await facade.stop();
+    await store.close();
+  });
+
   it('classifies an occupied active-session takeover as an owner handoff', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-owner-handoff-'));
     tempDirs.push(dir);
@@ -1471,6 +1877,7 @@ describe('durable Lark session control runtime', () => {
       closeResidualText: () => 'residual',
       closeRefusedText: () => 'refused',
       resumeRefusedText: () => 'resume-refused',
+      now: () => 10,
     });
     const input = directControl('trusted-host', 'handoff', facade.ownerId);
 
@@ -1478,6 +1885,58 @@ describe('durable Lark session control runtime', () => {
       claim: input.claim,
       signal: new AbortController().signal,
     })).rejects.toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    await facade.stop();
+    await store.close();
+  });
+
+  it('settles a stale trusted handoff so newer lifecycle controls can advance', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-stale-handoff-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'peer-owner' });
+    const canonical = session({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'tae-traex',
+        generation: 1,
+        remoteSessionId: 'remote-session-1',
+        providerState: { sessionKey: 'bmx1-' + 'a'.repeat(40) },
+      },
+    });
+    await admitDurableLarkSession({ facade, message: message(), session: canonical });
+    const takeOverActiveSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      takeOverActiveSession,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'not_local' }),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+      now: () => 300_003,
+    });
+    const input = directControl('trusted-host', 'handoff', 'retiring-owner');
+
+    await expect(runtime.resolve(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'stale remote handoff exceeded its recovery horizon',
+    });
+    expect(takeOverActiveSession).not.toHaveBeenCalled();
     await facade.stop();
     await store.close();
   });
@@ -1543,6 +2002,7 @@ describe('durable Lark session control runtime', () => {
       closeRefusedText: () => 'refused',
       resumeRefusedText: () => 'resume-refused',
       resumeReadinessStabilityMs: 0,
+      now: () => 10,
     });
     const input = directControl('trusted-host', 'handoff', 'retiring-owner');
     const dispatch = createDurableSessionControlDispatch({

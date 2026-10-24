@@ -201,6 +201,13 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Injects the raw typed close result into the durable card-control runtime; '
       + 'that runtime durably replies with refusal/residual details before settling.',
   },
+  'daemon.ts::terminalizeOrphanSession::closeSession': {
+    category: 'impossible_by_invariant',
+    why: 'Passes remoteOrphanProof, whose close precondition requires an owned Remote Runner '
+      + 'with already-cleared remote lineage. closeSession can only construct a residual for '
+      + 'an owned Mojo close, so this mutually exclusive path can return closed or a typed refusal, '
+      + 'and the durable control runtime keeps every refusal not_applied.',
+  },
   'daemon.ts::closeCompletedSession::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Listener auto-close waits for final delivery outside the Bot mutation gate; '

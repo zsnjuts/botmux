@@ -172,6 +172,49 @@ describe('remote runner explicit close', () => {
     });
   });
 
+  it('commits a provider-proven orphan terminal without issuing a second cancel', async () => {
+    const { ds, worker } = createFixture(true);
+    ds.session.remoteBackendState = {
+      version: 1,
+      provider: 'test-provider',
+      generation: 2,
+      agentThreadId: 'thread-1',
+    };
+    sessionStore.updateSession(ds.session);
+
+    await expect(closeSession(ds.session.sessionId, {
+      awaitWorkerExit: false,
+      cardVisibility: 'private',
+      remoteOrphanProof: true,
+    })).resolves.toMatchObject({ ok: true, outcome: 'closed' });
+    expect(worker!.send.mock.calls.map(([message]) => message.type))
+      .not.toContain('close');
+    expect(worker!.send.mock.calls.map(([message]) => message.type))
+      .not.toContain('close_commit');
+    expect(worker!.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(sessionStore.getSession(ds.session.sessionId)).toMatchObject({
+      status: 'closed',
+      remoteBackendState: { generation: 2, agentThreadId: 'thread-1' },
+    });
+  });
+
+  it('rejects an orphan proof while the local provider state still names a remote', async () => {
+    const { ds, worker } = createFixture(true);
+
+    await expect(closeSession(ds.session.sessionId, {
+      awaitWorkerExit: false,
+      cardVisibility: 'private',
+      remoteOrphanProof: true,
+    })).resolves.toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'remote_orphan_proof_invalid',
+      retryable: true,
+    });
+    expect(worker!.send).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
+  });
+
   it('allows a live pre-ready worker to close before backend state is persisted', async () => {
     const { ds } = createFixture(true);
     ds.workerReady = false;
@@ -379,7 +422,11 @@ describe('remote runner explicit close', () => {
       target: DaemonSession,
       prompt: unknown,
       resume: unknown,
-      opts: { deferDuringDeviceIsolation?: boolean; onAdmission?: (value: 'accepted') => void },
+      opts: {
+        remoteResumeMode?: 'close-control';
+        deferDuringDeviceIsolation?: boolean;
+        onAdmission?: (value: 'accepted') => void;
+      },
     ) => {
       const worker = createFakeWorker();
       target.worker = worker as never;
@@ -395,9 +442,9 @@ describe('remote runner explicit close', () => {
     expect(fork.mock.calls[0]?.[1]).toBe('');
     expect(fork.mock.calls[0]?.[2]).toEqual({
       resume: true,
-      remoteResumeMode: 'close-control',
     });
     expect(fork.mock.calls[0]?.[3]).toMatchObject({
+      remoteResumeMode: 'close-control',
       deferDuringDeviceIsolation: false,
       onAdmission: expect.any(Function),
     });

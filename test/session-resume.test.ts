@@ -60,6 +60,9 @@ vi.mock('../src/core/worker-pool.js', () => ({
   sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  retireWorkerProcessOnly: vi.fn((ds: any) => {
+    if (ds.worker) ds.worker.killed = true;
+  }),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   ensureReadonlyTaskContinuationAttached: vi.fn(),
   // Default: promotion succeeds. A specific test overrides this to false to
@@ -145,7 +148,7 @@ vi.mock('../src/bot-registry.js', () => ({
       cliId: 'claude-code',
       workingDir: '~',
       workingDirs: ['~'],
-      remoteRunner: { requiredCapabilities: ['turn_recovery'] },
+      remoteRunner: { requiredCapabilities: ['turn_recovery', 'orphan_reconciliation'] },
       get backendType() { return daemonConfig.backendType === 'tmux' ? 'tmux' : undefined; },
     },
     botName: 'TestBot',
@@ -206,6 +209,7 @@ import {
   killStalePids,
   promoteQueuedActivationTail,
   restoreUsageLimitRuntimeState,
+  retireWorkerProcessOnly,
   setActiveSessionSafe,
   setActiveSessionIfActive,
   withActiveSessionKeyLock,
@@ -226,6 +230,7 @@ beforeEach(() => {
   vi.mocked(closeSession).mockClear();
   vi.mocked(closeSessionForBackgroundCleanup).mockClear();
   vi.mocked(forkWorker).mockReset();
+  vi.mocked(retireWorkerProcessOnly).mockClear();
   vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(promoteQueuedActivationTail).mockReset();
   vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
@@ -288,7 +293,8 @@ describe('takeOverDurableActiveRemoteSession', () => {
     const map = new Map<string, DaemonSession>();
     vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
       expect(prompt).toBe('');
-      expect(resume).toEqual({ resume: true, remoteResumeMode: 'reattach' });
+      expect(resume).toEqual({ resume: true });
+      expect(opts).toEqual(expect.objectContaining({ remoteResumeMode: 'reattach' }));
       ds.worker = { killed: false };
       opts?.onAdmission?.('accepted');
       return true;
@@ -362,6 +368,52 @@ describe('takeOverDurableActiveRemoteSession', () => {
     expect(forkWorker).not.toHaveBeenCalled();
     expect(sessionStore.getOwnedSession(canonical.sessionId)?.pid).toBe(123);
   });
+
+  it('retires a stale local owner before starting an orphan-reconcile provider', async () => {
+    const canonical = activeRemoteCanonical();
+    const key = sessionKey('om_remote_root', 'app_test');
+    const stale = {
+      session: structuredClone(canonical),
+      worker: { killed: false },
+      workerPort: null,
+      workerToken: null,
+      larkAppId: 'app_test',
+      chatId: canonical.chatId,
+      chatType: 'group' as const,
+      scope: 'thread' as const,
+      spawnedAt: Date.parse(canonical.createdAt),
+      cliVersion: '1.0.0-test',
+      lastMessageAt: Date.parse(canonical.lastMessageAt),
+      hasHistory: true,
+      workingDir: '/tmp/proj',
+      displayMode: 'hidden' as const,
+    } as DaemonSession;
+    const map = new Map<string, DaemonSession>([[key, stale]]);
+    sessionStore.updateSession(stale.session);
+    vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
+      expect(prompt).toBe('');
+      expect(resume).toEqual({ resume: true });
+      expect(opts).toEqual(expect.objectContaining({ remoteResumeMode: 'orphan-reconcile' }));
+      ds.worker = { killed: false };
+      opts?.onAdmission?.('accepted');
+      return true;
+    });
+
+    const result = await takeOverDurableActiveRemoteSession(
+      canonical,
+      map,
+      { remoteResumeMode: 'orphan-reconcile' },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(retireWorkerProcessOnly).toHaveBeenCalledExactlyOnceWith(
+      stale,
+      'remote_orphan_reconciliation_requires_fresh_provider',
+    );
+    expect(map.get(key)).not.toBe(stale);
+    expect(forkWorker).toHaveBeenCalledOnce();
+    expect(sessionStore.getOwnedSession(canonical.sessionId)?.status).toBe('active');
+  });
 });
 
 describe('resumeSession', () => {
@@ -433,7 +485,8 @@ describe('resumeSession', () => {
         ds.worker = { killed: false };
         opts?.onAdmission?.('accepted');
         expect(prompt).toBe('');
-        expect(resume).toEqual({ resume: true, remoteResumeMode: 'rebuild' });
+        expect(resume).toEqual({ resume: true });
+        expect(opts).toEqual(expect.objectContaining({ remoteResumeMode: 'rebuild' }));
         return true;
       });
 

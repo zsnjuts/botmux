@@ -3,9 +3,11 @@ import { DURABLE_INBOX_LANE_SESSION_CONTROL, type InboxClaim } from '../src/serv
 import { normalizeCardActionData } from '../src/im/lark/card-action-data.js';
 import {
   durableDirectSessionControlEvent,
+  durableInteractiveSessionControlPartition,
   durableLarkSessionControlEvent,
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
+  durableRemoteOrphanControlPartition,
   parseDurableLarkSessionControlClaim,
   parseDurableSessionControlClaim,
 } from '../src/services/durable-lark-session-control.js';
@@ -42,7 +44,7 @@ function displayControl(target: 'hidden' | 'screenshot' = 'screenshot') {
 function claim(event = durableLarkSessionControlEvent({
   larkAppId: 'cli_test',
   eventId: durableLarkSessionControlEventId('cli_test', 'evt_control_1'),
-  partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+  partitionKey: durableInteractiveSessionControlPartition('cli_test', 'session-1'),
   data: rawControl(),
   now: 10,
 })): InboxClaim {
@@ -60,7 +62,7 @@ describe('durable Lark session control envelope', () => {
     const parsed = parseDurableLarkSessionControlClaim(claim());
     expect(parsed).toMatchObject({
       operationId: 'card.action.trigger:cli_test:evt_control_1',
-      partitionKey: 'lark-session-control:cli_test:session-1',
+      partitionKey: 'lark-session-control:cli_test:interactive:session-1',
       larkAppId: 'cli_test',
       action: 'close',
       sessionId: 'session-1',
@@ -88,7 +90,7 @@ describe('durable Lark session control envelope', () => {
       expect(parseDurableSessionControlClaim(claim(event))).toMatchObject({
         source,
         operationId: `${source}.session-control:cli_test:om_command`,
-        partitionKey: 'lark-session-control:cli_test:session-1',
+        partitionKey: 'lark-session-control:cli_test:interactive:session-1',
         action: 'close',
         sessionId: 'session-1',
         rootId: 'om_root',
@@ -139,6 +141,37 @@ describe('durable Lark session control envelope', () => {
     })).toThrow(/trusted host source/);
   });
 
+  it('isolates background orphan controls from the explicit lifecycle FIFO partition', () => {
+    const event = durableDirectSessionControlEvent({
+      source: 'trusted-host',
+      larkAppId: 'cli_test',
+      operationId: 'trusted-host.remote-orphan:cli_test:session-1:2',
+      action: 'terminalize_orphan',
+      sessionId: 'session-1',
+      rootId: 'om_root',
+      cardMessageId: 'om_card',
+      now: 10,
+    });
+    expect(event.partitionKey).toBe(
+      durableRemoteOrphanControlPartition('cli_test', 'session-1'),
+    );
+    expect(parseDurableSessionControlClaim(claim(event))).toMatchObject({
+      source: 'trusted-host',
+      action: 'terminalize_orphan',
+      partitionKey: 'lark-session-control:cli_test:orphan:session-1',
+      sessionId: 'session-1',
+    });
+    expect(parseDurableSessionControlClaim(claim({
+      ...event,
+      partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+    }))).toMatchObject({
+      source: 'trusted-host',
+      action: 'terminalize_orphan',
+      partitionKey: 'lark-session-control:cli_test:session-1',
+      sessionId: 'session-1',
+    });
+  });
+
   it('rejects a command control without a Lark user principal', () => {
     expect(() => durableDirectSessionControlEvent({
       source: 'lark-command',
@@ -166,7 +199,7 @@ describe('durable Lark session control envelope', () => {
     const event = durableLarkSessionControlEvent({
       larkAppId: 'cli_test',
       eventId: durableLarkSessionControlEventId('cli_test', 'evt_display_1'),
-      partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+      partitionKey: durableInteractiveSessionControlPartition('cli_test', 'session-1'),
       data: { ...displayControl(), event_id: 'evt_display_1' },
       now: 10,
     });

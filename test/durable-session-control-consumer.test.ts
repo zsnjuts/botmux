@@ -11,7 +11,10 @@ import {
   durableLarkSessionControlPartitionPrefix,
 } from '../src/services/durable-lark-session-control.js';
 import { startDurableSessionControlConsumer } from '../src/services/durable-session-control-consumer.js';
-import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
+import {
+  DurableSessionControlDeferredError,
+  DurableSessionControlOwnerHandoffError,
+} from '../src/services/durable-session-control-errors.js';
 
 const tempDirs: string[] = [];
 
@@ -176,6 +179,70 @@ describe('durable session control consumer', () => {
     await store.close();
   });
 
+  it('uses every slot for canonical-only backlog after the exact-owner grace', async () => {
+    let now = 10;
+    let ownerReads = 0;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    await store.enqueueInbox(controlEvent('session-b', 'evt-b', 2));
+    const dispatched: string[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-prefix-only',
+      ownedPartitionKeys: () => {
+        ownerReads += 1;
+        if (ownerReads === 1) now += 1_000;
+        return [];
+      },
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      dispatch: async control => {
+        dispatched.push(control.sessionId);
+        return { kind: 'settled' };
+      },
+      concurrency: 2,
+      batchSize: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await consumer.ready;
+    expect(new Set(dispatched)).toEqual(new Set(['session-a', 'session-b']));
+    await consumer.stop();
+    await store.close();
+  });
+
+  it('uses idle exact-owner slots to drain canonical-only backlog after the grace', async () => {
+    let now = 10;
+    let ownerReads = 0;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-remote-a', 'evt-remote-a', 1));
+    await store.enqueueInbox(controlEvent('session-remote-b', 'evt-remote-b', 2));
+    const dispatched: string[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-prefix-with-idle-exact',
+      ownedPartitionKeys: () => {
+        ownerReads += 1;
+        if (ownerReads === 1) now += 1_000;
+        return [durableLarkSessionControlPartition('cli_test', 'session-local-idle')];
+      },
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      dispatch: async control => {
+        dispatched.push(control.sessionId);
+        return { kind: 'settled' };
+      },
+      concurrency: 2,
+      batchSize: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await consumer.ready;
+    expect(new Set(dispatched)).toEqual(new Set(['session-remote-a', 'session-remote-b']));
+    await consumer.stop();
+    await store.close();
+  });
+
   it('gives the exact owner one interval before prefix failover can steal a fresh control', async () => {
     let now = 10;
     const store = makeStore(() => now);
@@ -247,6 +314,46 @@ describe('durable session control consumer', () => {
       leaseDurationMs: 100,
     });
     expect(remaining?.event.eventId).toBe('card.action.trigger:cli_test:evt-remote');
+    await store.close();
+  });
+
+  it('periodically probes failover controls even while exact owner work stays available', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-remote', 'evt-remote', 1));
+    await store.enqueueInbox(controlEvent('session-local-a', 'evt-local-a', 2));
+    await store.enqueueInbox(controlEvent('session-local-b', 'evt-local-b', 3));
+    const dispatched: string[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-fair',
+      ownedPartitionKeys: () => [
+        durableLarkSessionControlPartition('cli_test', 'session-local-a'),
+        durableLarkSessionControlPartition('cli_test', 'session-local-b'),
+      ],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      dispatch: async control => {
+        dispatched.push(control.sessionId);
+        if (dispatched.length === 1) now += 1_000;
+        return { kind: 'settled' };
+      },
+      concurrency: 1,
+      batchSize: 2,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await consumer.ready;
+    expect(dispatched).toEqual(['session-local-a', 'session-remote']);
+    await consumer.stop();
+
+    const remaining = await store.claimNextInbox({
+      workerId: 'proof',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-local-b')],
+      leaseDurationMs: 100,
+    });
+    expect(remaining?.event.eventId).toBe('card.action.trigger:cli_test:evt-local-b');
     await store.close();
   });
 
@@ -330,6 +437,46 @@ describe('durable session control consumer', () => {
       partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
       leaseDurationMs: 100,
     })).toMatchObject({ attempts: 2 });
+    await store.close();
+  });
+
+  it('backs off repeated inconclusive orphan proofs instead of hot-looping', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const retryInboxClaim = vi.spyOn(store, 'retryInboxClaim');
+    const first = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-deferred-a',
+      ownedPartitionKeys: () => [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      dispatch: async () => {
+        throw new DurableSessionControlDeferredError('provider proof is inconclusive');
+      },
+      deferredRetryDelayMs: 1_000,
+      intervalMs: 60_000,
+      concurrency: 1,
+      now: () => now,
+    });
+    await first.ready;
+    await first.stop();
+    expect(retryInboxClaim).toHaveBeenLastCalledWith(expect.objectContaining({ visibleAt: 1_010 }));
+
+    now = 1_010;
+    const second = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-deferred-b',
+      ownedPartitionKeys: () => [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      dispatch: async () => {
+        throw new DurableSessionControlDeferredError('provider proof is still inconclusive');
+      },
+      deferredRetryDelayMs: 1_000,
+      intervalMs: 60_000,
+      concurrency: 1,
+      now: () => now,
+    });
+    await second.ready;
+    await second.stop();
+    expect(retryInboxClaim).toHaveBeenLastCalledWith(expect.objectContaining({ visibleAt: 3_010 }));
     await store.close();
   });
 
