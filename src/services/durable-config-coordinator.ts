@@ -33,6 +33,8 @@ interface ConfigAuditEntry {
   outcome: 'committed' | 'reconciled_external' | 'recovered_changed' | 'recovered_unchanged' | 'failed_changed' | 'failed_unchanged';
   baseSha256: string;
   contentSha256: string;
+  basePathSha256?: string;
+  pathSha256?: string;
   changedPaths: string[];
   committedAt: number;
 }
@@ -73,6 +75,15 @@ export interface DurableConfigCoordinator {
     expectedCommittedSha256: string;
     expectedFileSha256: string;
   }): Promise<DurableConfigInspection>;
+  rebindPath(input: {
+    scope: DurableConfigScope;
+    path: string;
+    expectedRecordRevision: number;
+    expectedBoundPathSha256: string;
+    expectedCurrentPathSha256: string;
+    expectedCommittedSha256: string;
+    expectedFileSha256: string;
+  }): Promise<DurableConfigInspection>;
   run<T>(input: {
     scope: DurableConfigScope;
     path: string;
@@ -88,6 +99,8 @@ export interface DurableConfigInspection {
   recordVersion?: number;
   phase?: 'prepared' | 'committed';
   committedSha256?: string;
+  boundPathSha256?: string;
+  currentPathSha256: string;
   pathMatches?: boolean;
 }
 
@@ -231,12 +244,22 @@ function parseAudit(value: unknown): ConfigAuditEntry[] {
     if (!Number.isSafeInteger(committedAt) || committedAt < 0) {
       throw new Error(`durable config audit[${index}] committedAt is invalid`);
     }
+    const basePathSha256 = raw.basePathSha256 === undefined
+      ? undefined
+      : digest(raw.basePathSha256, `audit[${index}].basePathSha256`);
+    const pathSha256 = raw.pathSha256 === undefined
+      ? undefined
+      : digest(raw.pathSha256, `audit[${index}].pathSha256`);
+    if ((basePathSha256 === undefined) !== (pathSha256 === undefined)) {
+      throw new Error(`durable config audit[${index}] path identity is invalid`);
+    }
     return {
       operationId: boundedString(raw.operationId, `audit[${index}].operationId`),
       writerId: boundedString(raw.writerId, `audit[${index}].writerId`),
       outcome: raw.outcome as ConfigAuditEntry['outcome'],
       baseSha256: digest(raw.baseSha256, `audit[${index}].baseSha256`),
       contentSha256: digest(raw.contentSha256, `audit[${index}].contentSha256`),
+      ...(basePathSha256 ? { basePathSha256, pathSha256 } : {}),
       changedPaths: [...raw.changedPaths] as string[],
       committedAt,
     };
@@ -296,7 +319,9 @@ function inspection(
   current: ParsedDurableConfigCasValue | undefined,
   pathSha256: string,
 ): DurableConfigInspection {
-  if (!record || !current) return { scope, status: 'uninitialized', fileSha256 };
+  if (!record || !current) {
+    return { scope, status: 'uninitialized', fileSha256, currentPathSha256: pathSha256 };
+  }
   const common = {
     scope,
     fileSha256,
@@ -304,15 +329,18 @@ function inspection(
     recordVersion: current.version,
     phase: current.phase,
     committedSha256: current.contentSha256,
+    currentPathSha256: pathSha256,
   } as const;
   if (current.version === LEGACY_RECORD_VERSION) {
     return { ...common, status: 'legacy' };
   }
   const pathMatches = current.pathSha256 === pathSha256;
-  if (!pathMatches) return { ...common, status: 'path_mismatch', pathMatches };
-  if (current.phase === 'prepared') return { ...common, status: 'prepared', pathMatches };
+  const path = { boundPathSha256: current.pathSha256, pathMatches };
+  if (!pathMatches) return { ...common, ...path, status: 'path_mismatch' };
+  if (current.phase === 'prepared') return { ...common, ...path, status: 'prepared' };
   return {
     ...common,
+    ...path,
     status: current.contentSha256 === fileSha256 ? 'in_sync' : 'content_drift',
     pathMatches,
   };
@@ -418,6 +446,165 @@ export function createDurableConfigCoordinator(input: {
             value: reconciled,
           });
           return inspection(scope, file.sha256, written, reconciled, pathSha256);
+        } finally {
+          await input.store.releaseSessionLease(lease).catch(() => undefined);
+        }
+      } finally {
+        releaseLocal();
+        if (localTails.get(scope) === localTail) localTails.delete(scope);
+      }
+    },
+
+    async rebindPath({
+      scope,
+      path,
+      expectedRecordRevision,
+      expectedBoundPathSha256,
+      expectedCurrentPathSha256,
+      expectedCommittedSha256,
+      expectedFileSha256,
+    }): Promise<DurableConfigInspection> {
+      if (!Number.isSafeInteger(expectedRecordRevision) || expectedRecordRevision < 1) {
+        throw new Error('durable config expectedRecordRevision is invalid');
+      }
+      digest(expectedBoundPathSha256, 'expectedBoundPathSha256');
+      digest(expectedCurrentPathSha256, 'expectedCurrentPathSha256');
+      digest(expectedCommittedSha256, 'expectedCommittedSha256');
+      digest(expectedFileSha256, 'expectedFileSha256');
+      const previous = localTails.get(scope) ?? Promise.resolve();
+      let releaseLocal!: () => void;
+      const localGate = new Promise<void>(resolve => { releaseLocal = resolve; });
+      const localTail = previous.catch(() => undefined).then(() => localGate);
+      localTails.set(scope, localTail);
+      await previous.catch(() => undefined);
+      try {
+        const key = stateKey(scope);
+        const acquired = await input.store.acquireSessionLease({
+          sessionKey: key,
+          ownerId,
+          leaseDurationMs: LEASE_DURATION_MS,
+        });
+        if (acquired.kind !== 'acquired') throw new Error('durable_config_busy');
+        const lease = acquired.lease;
+        try {
+          // Resolve the current path only after the distributed lease is held:
+          // a queued rebind proof must not survive an alias change while it
+          // waits for another writer.  Re-resolve around the file snapshot and
+          // again before commit so a moving symlink/procfs alias fails closed.
+          const beforeSnapshotPath = await configPathIdentity(path);
+          const file = await snapshot(scope, path);
+          const afterSnapshotPath = await configPathIdentity(path);
+          if (beforeSnapshotPath.pathSha256 !== afterSnapshotPath.pathSha256) {
+            throw new Error('durable_config_rebind_current_path_sha_mismatch');
+          }
+          const pathSha256 = afterSnapshotPath.pathSha256;
+          const record = await input.store.readAuxiliaryState(key);
+          if (!record) throw new Error('durable_config_rebind_uninitialized');
+          if (record.revision !== expectedRecordRevision) {
+            throw new Error('durable_config_rebind_revision_mismatch');
+          }
+          const current = parseRecord(record, scope);
+          if (current.version !== RECORD_VERSION || current.phase !== 'committed') {
+            throw new Error('durable_config_rebind_requires_committed_v2');
+          }
+          if (current.pathSha256 !== expectedBoundPathSha256) {
+            throw new Error('durable_config_rebind_bound_path_sha_mismatch');
+          }
+          if (pathSha256 !== expectedCurrentPathSha256) {
+            throw new Error('durable_config_rebind_current_path_sha_mismatch');
+          }
+          if (current.pathSha256 === pathSha256) {
+            throw new Error('durable_config_rebind_not_mismatched');
+          }
+          if (current.contentSha256 !== expectedCommittedSha256) {
+            throw new Error('durable_config_rebind_committed_sha_mismatch');
+          }
+          if (file.sha256 !== expectedFileSha256) {
+            throw new Error('durable_config_rebind_file_sha_mismatch');
+          }
+          if (current.contentSha256 !== file.sha256) {
+            throw new Error('durable_config_rebind_content_drift');
+          }
+          const beforeCommitPath = await configPathIdentity(path);
+          if (beforeCommitPath.pathSha256 !== pathSha256) {
+            throw new Error('durable_config_rebind_current_path_sha_mismatch');
+          }
+          const operationId = randomUUID();
+          const committedAt = now();
+          const rebound: DurableConfigCasValue = {
+            ...current,
+            operationId,
+            pathSha256,
+            updatedAt: committedAt,
+            audit: appendAudit(current, {
+              operationId,
+              writerId: ownerId,
+              // Reuse the existing audit outcome so older readers can still
+              // parse the record after a rollback.  The marker and optional
+              // path hashes distinguish this from content reconciliation.
+              outcome: 'reconciled_external',
+              baseSha256: current.contentSha256,
+              contentSha256: current.contentSha256,
+              basePathSha256: current.pathSha256,
+              pathSha256,
+              changedPaths: ['<path-identity-rebind>'],
+              committedAt,
+            }),
+          };
+          const written = await commit({
+            lease,
+            expectedRevision: record.revision,
+            value: rebound,
+          });
+          let postCommitFileSha256 = file.sha256;
+          let postCommitFailure: string | undefined;
+          let postCommitError: unknown;
+          try {
+            const postCommitPathBefore = await configPathIdentity(path);
+            const postCommitFile = await snapshot(scope, path);
+            const postCommitPathAfter = await configPathIdentity(path);
+            postCommitFileSha256 = postCommitFile.sha256;
+            if (postCommitPathBefore.pathSha256 !== pathSha256
+                || postCommitPathAfter.pathSha256 !== pathSha256) {
+              postCommitFailure = 'durable_config_rebind_current_path_sha_mismatch';
+            } else if (postCommitFile.sha256 !== file.sha256) {
+              postCommitFailure = 'durable_config_rebind_content_drift';
+            }
+          } catch (error) {
+            postCommitFailure = 'durable_config_rebind_post_commit_verification_failed';
+            postCommitError = error;
+          }
+          if (postCommitFailure) {
+            const rollbackOperationId = randomUUID();
+            const rollbackAt = now();
+            const contentChanged = postCommitFailure === 'durable_config_rebind_content_drift';
+            const rolledBack: DurableConfigCasValue = {
+              ...current,
+              operationId: rollbackOperationId,
+              updatedAt: rollbackAt,
+              audit: appendAudit(current, {
+                operationId: rollbackOperationId,
+                writerId: ownerId,
+                outcome: contentChanged ? 'failed_changed' : 'failed_unchanged',
+                baseSha256: current.contentSha256,
+                contentSha256: contentChanged ? postCommitFileSha256 : current.contentSha256,
+                basePathSha256: current.pathSha256,
+                pathSha256,
+                changedPaths: ['<path-identity-rebind-rolled-back>'],
+                committedAt: rollbackAt,
+              }),
+            };
+            await commit({
+              lease,
+              expectedRevision: written.revision,
+              value: rolledBack,
+            });
+            if (postCommitError !== undefined) {
+              throw new Error(postCommitFailure, { cause: postCommitError });
+            }
+            throw new Error(postCommitFailure);
+          }
+          return inspection(scope, postCommitFileSha256, written, rebound, pathSha256);
         } finally {
           await input.store.releaseSessionLease(lease).catch(() => undefined);
         }
