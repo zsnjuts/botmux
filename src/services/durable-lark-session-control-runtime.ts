@@ -193,7 +193,10 @@ export function createDurableLarkSessionControlRuntime(
   const ownedPartitionKeys = (): string[] => {
     const sessionIds = new Set<string>();
     for (const ds of options.listActiveSessions()) {
-      if (ds.larkAppId === options.larkAppId && ds.session.status === 'active') {
+      const canonicalKey = sessionKey(sessionAnchorId(ds), options.larkAppId);
+      if (ds.larkAppId === options.larkAppId
+          && ds.session.status === 'active'
+          && options.facade().ownsLease(canonicalKey)) {
         sessionIds.add(ds.session.sessionId);
       }
     }
