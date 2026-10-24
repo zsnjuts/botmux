@@ -506,6 +506,7 @@ describe('remote runner protocol', () => {
         prompt: '提醒我复查构建',
         name: '--chat-id=oc_other',
         position: 'topic',
+        bindSession: true,
         silent: true,
         reasoningEffort: 'high',
       },
@@ -517,6 +518,7 @@ describe('remote runner protocol', () => {
         schedule: '10m',
         prompt: '提醒我复查构建',
         position: 'topic',
+        bindSession: true,
       },
     });
     for (const controllerOpenId of ['ou_', 'ou_bad value', 'developer', 42]) {
@@ -564,6 +566,8 @@ describe('remote runner protocol', () => {
       { tool: 'schedule.add', schedule: '10m', prompt: 'x', workdir: '/tmp' },
       { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'topic', topicTitle: 'bad' },
       { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'top-level', followActive: true },
+      { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'top-level', bindSession: true },
+      { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'topic', bindSession: true, followActive: true },
       { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'new-topic', topicTitle: 'x'.repeat(201) },
       { tool: 'schedule.update', taskId: 'deadbeef' },
       { tool: 'schedule.remove', taskId: 'not-an-id' },

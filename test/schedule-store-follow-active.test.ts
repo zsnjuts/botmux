@@ -56,6 +56,19 @@ afterEach(() => {
 });
 
 describe('schedule-store followActive', () => {
+  it('persists, reloads and hashes a bound logical Session as canonical input', async () => {
+    const first = await freshImport();
+    const id = first.createTask({ ...TASK_PARAMS, boundSessionId: 'session-bound-1' }).id;
+    const plain = JSON.stringify(first.canonicalScheduleInput({ ...TASK_PARAMS }));
+    const bound = JSON.stringify(first.canonicalScheduleInput({
+      ...TASK_PARAMS,
+      boundSessionId: 'session-bound-1',
+    }));
+    expect(bound).not.toBe(plain);
+    const second = await freshImport();
+    expect(second.getTask(id)?.boundSessionId).toBe('session-bound-1');
+  });
+
   it('createTask persists followActive only as literal true', async () => {
     const { createTask } = await freshImport();
     expect(createTask({ ...TASK_PARAMS, followActive: true }).followActive).toBe(true);

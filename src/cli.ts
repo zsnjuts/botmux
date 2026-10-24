@@ -7483,6 +7483,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        两者都只在本任务新建会话那次执行生效；配 --new-topic 则每次生效
        --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
        --topic --root-msg-id <om_...>  固定在指定话题下执行
+       --bind-session                  与 --topic 同用；绑定当前逻辑 Session，关闭后到点恢复同一 sessionId
        --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
        --new-topic [--topic-title ...] 每次创建新话题和独立会话；非静默标题按任务时区支持 {{date:-1d}} / {{owner}}
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
@@ -8331,9 +8332,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       const prompt = t.prompt ?? '';
       const chatId = t.chatId ?? '—';
       const rootId = t.rootMessageId ?? '—';
-      console.log(`${status} [${t.id}] ${display} | ${t.name}${t.silent ? ' 🔇静默' : ''}${t.followActive ? ' ↷跟随活跃话题' : ''}`);
+      console.log(`${status} [${t.id}] ${display} | ${t.name}${t.silent ? ' 🔇静默' : ''}${t.followActive ? ' ↷跟随活跃话题' : ''}${t.boundSessionId ? ' 🔗绑定会话' : ''}`);
       console.log(`   prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
       console.log(`   chat: ${chatId.slice(0, 12)}…   thread: ${rootId.slice(0, 16)}…`);
+      if (t.boundSessionId) console.log(`   session: ${t.boundSessionId}`);
       if (t.calendar !== undefined) {
         const { previewTaskCalendar } = await import('./services/work-calendar.js');
         console.log(`   calendar: ${t.calendar} ${JSON.stringify(previewTaskCalendar(t, t.larkAppId ?? scheduleStore.getScheduleScope() ?? undefined))}`);
@@ -8345,7 +8347,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [positionalSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
+    const [positionalSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--bind-session', '--silent', '--follow-active']);
     const structuredSchedule = argValue(rest, '--schedule');
     if (trustedRemoteRunnerRelay && (structuredSchedule === undefined || positionalSchedule !== undefined || promptParts.length > 0)) {
       console.error('botmux schedule refused: the Remote Runner relay requires structured schedule/prompt values');
@@ -8357,7 +8359,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     const rawSchedule = trustedRemoteRunnerRelay ? structuredSchedule : positionalSchedule;
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT [--bind-session] | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -8402,6 +8404,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const wantsNewTopic = rest.includes('--new-topic') || legacyDeliver === 'new-topic';
     const wantsTopLevel = rest.includes('--top-level');
     const wantsTopic = rest.includes('--topic');
+    const wantsBindSession = rest.includes('--bind-session');
     const wantsFollowActive = rest.includes('--follow-active');
     // --follow-active is a refinement of topic execution: the task starts in
     // the current (or --root-msg-id) topic and re-targets at every fire.
@@ -8411,6 +8414,14 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     if ([wantsNewTopic, wantsTopLevel, wantsTopic].filter(Boolean).length > 1) {
       console.error('--top-level、--topic 与 --new-topic 只能选择一个。');
+      process.exit(1);
+    }
+    if (wantsBindSession && (!wantsTopic || wantsFollowActive || wantsTopLevel || wantsNewTopic)) {
+      console.error('--bind-session 只能与固定 --topic 同用，不能与 --follow-active / --top-level / --new-topic 组合。');
+      process.exit(1);
+    }
+    if (wantsBindSession && !cur?.sessionId) {
+      console.error('--bind-session 必须从目标 Bot 的当前话题 Session 内创建。');
       process.exit(1);
     }
     const requestedDeliver = legacyDeliver;
@@ -8469,6 +8480,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         : '话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
       process.exit(1);
     }
+    if (wantsBindSession && (executionPosition !== 'topic' || wantsFollowActive)) {
+      console.error('--bind-session 只能与固定 --topic 同用，不能与 --follow-active / --top-level / --new-topic 组合。');
+      process.exit(1);
+    }
+    if (wantsBindSession && (!cur?.sessionId
+        || cur.larkAppId !== larkAppId
+        || cur.chatId !== chatId
+        || cur.scope === 'chat'
+        || cur.rootMessageId !== rootMessageId)) {
+      console.error('--bind-session 必须从目标 Bot 的当前话题 Session 内创建，不能绑定手填或跨 Bot/跨话题落点。');
+      process.exit(1);
+    }
     const topicTitle = argValue(rest, '--topic-title');
     if (topicTitle && executionPosition !== 'new-topic') {
       console.error('--topic-title 仅可与 --new-topic 一起使用。');
@@ -8512,6 +8535,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               chatId,
               rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
               executionPosition,
+              ...(wantsBindSession ? { bindSession: true } : {}),
               larkAppId,
               deliver,
               silent,
@@ -8548,6 +8572,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             workingDir, chatId,
             rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
             executionPosition, larkAppId, silent, model, reasoningEffort,
+            ...(wantsBindSession ? { bindSession: true } : {}),
             deliver,
             calendar,
             calendarDayType: normalizedDayType,
@@ -8582,6 +8607,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   下次执行: ${next}`);
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   执行位置: ${executionPosition === 'new-topic' ? '每次新话题' : executionPosition === 'top-level' ? '群消息顶层' : '话题下'}`);
+    if (task.boundSessionId) console.log(`   绑定会话: ${task.boundSessionId}（closed 时恢复同一逻辑 Session）`);
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
     if (wantsFollowActive) console.log(`   跟随活跃话题: 上次落点没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');

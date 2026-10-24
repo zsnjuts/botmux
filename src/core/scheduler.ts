@@ -938,6 +938,7 @@ export function addTask(params: {
   chatId: string;
   chatIds?: readonly string[];
   rootMessageId?: string;
+  boundSessionId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
   topicTitle?: string;
@@ -997,10 +998,21 @@ export function addTask(params: {
   if (executionPosition === 'topic' && !params.rootMessageId?.trim()) {
     throw new Error('topic_root_required');
   }
+  const boundSessionId = params.boundSessionId?.trim();
+  if (params.boundSessionId !== undefined
+      && (!boundSessionId || boundSessionId.length > 256 || /[\r\n\0]/.test(boundSessionId))) {
+    throw new Error('invalid_bound_session_id');
+  }
+  if (boundSessionId && executionPosition !== 'topic') {
+    throw new Error('bound_session_requires_topic');
+  }
   // Following the active topic only makes sense when the task lands in a
   // topic at all; at top level / new-topic there is nothing to follow.
   if (params.followActive === true && executionPosition !== 'topic') {
     throw new Error('follow_active_requires_topic');
+  }
+  if (boundSessionId && params.followActive === true) {
+    throw new Error('bound_session_follow_active_conflict');
   }
   const topicTitle = normalizeTopicTitle(params.topicTitle, {
     executionPosition,
@@ -1028,6 +1040,7 @@ export function addTask(params: {
     // is written back by the first fire / restart recovery, so a root supplied
     // at creation (foreign to this task) must never be persisted.
     rootMessageId: executionPosition === 'topic' ? params.rootMessageId : undefined,
+    boundSessionId,
     scope,
     executionPosition,
     topicTitle,
@@ -1084,6 +1097,12 @@ export function commitDelegatedTask(input: {
   const position = params.executionPosition ?? (params.rootMessageId ? 'topic' : 'top-level');
   if (position !== 'top-level' && position !== 'topic') throw new Error('delegated_schedule_position_denied');
   if (position === 'topic' && !params.rootMessageId?.trim()) throw new Error('topic_root_required');
+  const boundSessionId = params.boundSessionId?.trim();
+  if (params.boundSessionId !== undefined
+      && (!boundSessionId || boundSessionId.length > 256 || /[\r\n\0]/.test(boundSessionId))) {
+    throw new Error('invalid_bound_session_id');
+  }
+  if (boundSessionId && position !== 'topic') throw new Error('bound_session_requires_topic');
   if (params.followActive || params.deliver === 'new-topic') throw new Error('delegated_schedule_position_denied');
   const createdAt = new Date().toISOString();
   const task: ScheduledTask = {
@@ -1095,6 +1114,7 @@ export function commitDelegatedTask(input: {
     workingDir: params.workingDir,
     chatId: targets.chatId,
     rootMessageId: position === 'topic' ? params.rootMessageId : undefined,
+    boundSessionId: position === 'topic' ? boundSessionId : undefined,
     scope: position === 'topic' ? 'thread' : 'chat',
     executionPosition: position,
     topicTitle: normalizeTopicTitle(params.topicTitle, {
@@ -1545,6 +1565,18 @@ export function updateTask(
     // there is no topic to follow at top level / new-topic.
     patch.followActive = undefined;
     eventPatch.followActive = false;
+  }
+  if (task.boundSessionId && (
+    nextPosition !== 'topic'
+    || nextFollowActive === true
+    || primaryChatChanged
+    || rootAfterPatch !== task.rootMessageId?.trim()
+  )) {
+    // The binding is an exact (app, chat, topic, Session) lineage contract.
+    // Moving the task invalidates that proof; degrade visibly to route-only
+    // rather than resuming the old Session into a different destination.
+    patch.boundSessionId = undefined;
+    eventPatch.boundSessionId = null;
   }
   if (targetUpdate) {
     patch.chatId = targets.chatId;

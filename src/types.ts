@@ -1557,6 +1557,12 @@ export interface ScheduledTask {
   /** Root message id of the topic where the task was created. When set,
    *  execution replies into this thread instead of creating a new one. */
   rootMessageId?: string;
+  /** Exact logical Botmux Session selected when the task was created with
+   *  session binding. Unlike rootMessageId (a delivery anchor), this is a
+   *  conversation-lineage contract: a fire must reuse this Session while it
+   *  is active/dormant, or restore this same closed Session before dispatch.
+   *  Missing means route-only legacy behaviour. */
+  boundSessionId?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   /** Low-level session scope retained for compatibility. `thread` replies
    *  under rootMessageId; `chat` starts at group top level and then follows
