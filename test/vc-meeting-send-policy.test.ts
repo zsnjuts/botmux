@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  classifyVcMeetingManagedTurn,
   evaluateVcMeetingManagedOriginClaim,
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -78,6 +79,38 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'vc-send-policy-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 describe('evaluateVcMeetingManagedSend', () => {
+  it('keeps an ordinary durable admission attempt outside the VC authority domain', () => {
+    const origin = {
+      receiverSessionId: 'ordinary-session',
+      receiverSession: false,
+      turnId: 'ordinary-turn',
+      dispatchAttempt: 2,
+    };
+    expect(classifyVcMeetingManagedTurn(dir, origin)).toEqual({ kind: 'ordinary' });
+    expect(evaluateVcMeetingManagedSend(dir, origin)).toEqual({ ok: true, kind: 'ordinary' });
+  });
+
+  it('keeps receiver markers and persisted receipts in the VC authority domain', () => {
+    expect(classifyVcMeetingManagedTurn(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'missing-receipt', dispatchAttempt: 1,
+    })).toEqual({ kind: 'receiver_session' });
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'missing-receipt', dispatchAttempt: 1,
+    })).toMatchObject({ ok: false, errorCode: 'receipt_not_found' });
+
+    seed('listener_thread');
+    expect(classifyVcMeetingManagedTurn(dir, {
+      receiverSessionId: 'ordinary-session', receiverSession: false,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toEqual({ kind: 'durable_receipt' });
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'ordinary-session', receiverSession: false,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({ ok: false, errorCode: 'origin_mismatch' });
+  });
+
   it('trusts a host relay marker only when the CLI is a direct child of the recorded worker', () => {
     expect(isTrustedVcMeetingHostRelayParent(true, 4242, 4242)).toBe(true);
     expect(isTrustedVcMeetingHostRelayParent(true, 4242, 9999)).toBe(false);
