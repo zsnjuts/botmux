@@ -1,9 +1,20 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { type ChildProcess } from 'node:child_process';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
+import {
+  FleetSupervisor,
+  dashboardStartupTimeoutMs,
+  pidAlive,
+  probeDashboardStartupReadiness,
+  type FleetBotSpec,
+} from '../src/core/fleet-supervisor.js';
+import {
+  DASHBOARD_STARTUP_NONCE_ENV,
+  resolveDashboardSelfNonce,
+} from '../src/core/dashboard-startup-readiness.js';
 import { readFleetState } from '../src/core/fleet-state-store.js';
 import { resolveEntrySpawn, entryForSubcommand, ENTRY_SUBCOMMANDS } from '../src/core/self-spawn.js';
 import { resolveDashboardSpec, resolveFleetMembers, DASHBOARD_PROCESS_NAME } from '../src/core/fleet-runtime.js';
@@ -86,6 +97,75 @@ describe('dashboard launcher — wiring (pure, no HOME)', () => {
     expect(ENTRY_SUBCOMMANDS.has('__dashboard')).toBe(true);
     expect(entryForSubcommand('__dashboard')).toBe('dashboard');
   });
+
+  it('bounds the configurable dashboard startup readiness timeout', () => {
+    expect(dashboardStartupTimeoutMs({ BOTMUX_DASHBOARD_STARTUP_TIMEOUT_MS: '12000' })).toBe(12_000);
+    expect(dashboardStartupTimeoutMs({ BOTMUX_DASHBOARD_STARTUP_TIMEOUT_MS: '9999' })).toBe(90_000);
+    expect(dashboardStartupTimeoutMs({ BOTMUX_DASHBOARD_STARTUP_TIMEOUT_MS: 'oops' })).toBe(90_000);
+  });
+
+  it('uses the supervisor nonce for Dashboard self-identification and rejects malformed values', () => {
+    const supplied = '0123456789abcdef0123456789abcdef';
+    expect(resolveDashboardSelfNonce({ [DASHBOARD_STARTUP_NONCE_ENV]: supplied })).toBe(supplied);
+    expect(resolveDashboardSelfNonce({ [DASHBOARD_STARTUP_NONCE_ENV]: 'not-a-valid-nonce' }))
+      .toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('probes the published port and requires the exact Dashboard child identity', async () => {
+    const root = tmp();
+    mkdirSync(join(root, '.botmux'), { recursive: true });
+    const nonce = '0123456789abcdef0123456789abcdef';
+    let responseBody = '{"ok":true}';
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(responseBody);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test server has no TCP port');
+    writeFileSync(join(root, '.botmux', '.dashboard-port'), String(address.port));
+    try {
+      const env = {
+        HOME: root,
+        BOTMUX_DASHBOARD_HOST: '0.0.0.0',
+        [DASHBOARD_STARTUP_NONCE_ENV]: nonce,
+      };
+      // daemon IPC exposes the same { ok: true } health JSON, so that shape is
+      // not proof that the exact Dashboard child reached readiness.
+      await expect(probeDashboardStartupReadiness(env)).resolves.toBe(false);
+      responseBody = nonce;
+      await expect(probeDashboardStartupReadiness(env)).resolves.toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+    }
+  });
+
+  it('bounds the whole readiness exchange when a service stalls mid-body', async () => {
+    const root = tmp();
+    mkdirSync(join(root, '.botmux'), { recursive: true });
+    const nonce = 'fedcba9876543210fedcba9876543210';
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.write(nonce.slice(0, 1));
+      // Deliberately never end: a socket inactivity timeout is insufficient if
+      // a wrong service trickles bytes, while the wall-clock deadline must win.
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test server has no TCP port');
+    writeFileSync(join(root, '.botmux', '.dashboard-port'), String(address.port));
+    const startedAt = Date.now();
+    try {
+      await expect(probeDashboardStartupReadiness({
+        HOME: root,
+        [DASHBOARD_STARTUP_NONCE_ENV]: nonce,
+      })).resolves.toBe(false);
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+    }
+  });
 });
 
 describe('FleetSupervisor manages the dashboard like a bot daemon (live)', () => {
@@ -141,6 +221,94 @@ describe('FleetSupervisor manages the dashboard like a bot daemon (live)', () =>
       return (p?.restarts ?? 0) >= 2;
     });
     expect(restarted).toBe(true);
+    await sup.stopAll();
+  });
+
+  it('restarts a dashboard that stays alive but never becomes reachable', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logs: string[] = [];
+    const sup = new FleetSupervisor({
+      statePath,
+      distDir: fakeDist(root, STAY_DASHBOARD),
+      daemonEnv: {},
+      cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 },
+      dashboardStartupTimeoutMs: 100,
+      dashboardReadinessPollMs: 10,
+      dashboardReadinessProbe: async () => false,
+      log: (message) => logs.push(message),
+    });
+    sup.start([dashboardSpec]);
+    expect(await waitFor(() =>
+      (readFleetState(statePath)?.procs.find((x) => x.name === 'botmux-dashboard')?.restarts ?? 0) >= 1,
+    2_000)).toBe(true);
+    expect(logs.some((line) => line.includes('did not become reachable'))).toBe(true);
+    await sup.stopAll();
+  });
+
+  it('keeps a dashboard that becomes reachable before the startup deadline', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    let probes = 0;
+    const sup = new FleetSupervisor({
+      statePath,
+      distDir: fakeDist(root, STAY_DASHBOARD),
+      daemonEnv: {},
+      cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 },
+      dashboardStartupTimeoutMs: 200,
+      dashboardReadinessPollMs: 10,
+      dashboardReadinessProbe: async () => ++probes >= 2,
+      log: () => {},
+    });
+    sup.start([dashboardSpec]);
+    expect(await waitFor(() => probes >= 2)).toBe(true);
+    await delay(250);
+    const state = readFleetState(statePath)?.procs.find((x) => x.name === 'botmux-dashboard');
+    expect(state?.status).toBe('online');
+    expect(state?.restarts).toBe(0);
+    await sup.stopAll();
+  });
+
+  it('ignores an in-flight readiness result from a replaced Dashboard generation', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    let probes = 0;
+    let resolveFirstProbe: ((ready: boolean) => void) | undefined;
+    const sup = new FleetSupervisor({
+      statePath,
+      distDir: fakeDist(root, STAY_DASHBOARD),
+      daemonEnv: {},
+      cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 },
+      dashboardStartupTimeoutMs: 200,
+      dashboardReadinessPollMs: 10,
+      dashboardReadinessProbe: async () => {
+        probes += 1;
+        if (probes === 1) {
+          return new Promise<boolean>((resolve) => { resolveFirstProbe = resolve; });
+        }
+        return true;
+      },
+      log: () => {},
+    });
+    sup.start([dashboardSpec]);
+    expect(await waitFor(() => probes === 1)).toBe(true);
+    const first = readFleetState(statePath)!.procs.find((x) => x.name === 'botmux-dashboard')!;
+    process.kill(first.pid, 'SIGKILL');
+    expect(await waitFor(() => {
+      const current = readFleetState(statePath)?.procs.find((x) => x.name === 'botmux-dashboard');
+      return !!current && current.restarts === 1 && current.pid !== first.pid && probes >= 2;
+    })).toBe(true);
+    const replacement = readFleetState(statePath)!.procs.find((x) => x.name === 'botmux-dashboard')!;
+
+    resolveFirstProbe?.(false);
+    await delay(250);
+    const afterStaleResult = readFleetState(statePath)!.procs.find((x) => x.name === 'botmux-dashboard')!;
+    expect(afterStaleResult.pid).toBe(replacement.pid);
+    expect(afterStaleResult.restarts).toBe(1);
+    expect(pidAlive(replacement.pid)).toBe(true);
     await sup.stopAll();
   });
 

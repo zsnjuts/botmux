@@ -398,6 +398,7 @@ import {
   parseAutostartWrite,
 } from './dashboard/autostart-api.js';
 import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { resolveDashboardSelfNonce } from './core/dashboard-startup-readiness.js';
 
 // The dashboard is an independent long-lived PM2 app and can be resurrected
 // from a stale dump.pm2 without passing through cli.ts pm2Env(). Its start/stop
@@ -670,7 +671,10 @@ function dashboardPortAvailable(port: number): Promise<boolean> {
 // confirm a loopback request to our just-bound wildcard port reaches THIS
 // process and not a shadow holding 127.0.0.1:port. The value is meaningless to
 // anyone else, so exposing it is safe.
-const DASHBOARD_SELF_NONCE = randomBytes(16).toString('hex');
+// A supervised Dashboard receives a fresh nonce from FleetSupervisor so its
+// startup watchdog can prove that the responding port belongs to this exact
+// child generation. Standalone/legacy launch paths keep the random fallback.
+const DASHBOARD_SELF_NONCE = resolveDashboardSelfNonce(process.env);
 
 /**
  * Post-bind loopback identity check handed to listenWithProbe (verifyBound).
