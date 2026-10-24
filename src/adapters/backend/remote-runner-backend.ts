@@ -845,6 +845,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       message.mention,
       message.mentions ?? [],
       message.images ?? [],
+      message.scheduleRemoveSelf ?? false,
     ])).digest('hex');
   }
 
@@ -865,6 +866,14 @@ export class RemoteRunnerBackend implements SessionBackend {
           || !this.requiredCapabilities.includes('outbound_message_final'))) {
       this.failProtocol(
         'remote runner emitted a final outbound message without explicit host and provider capability',
+      );
+      return;
+    }
+    if (message.scheduleRemoveSelf
+        && (!this.providerCapabilities.has('outbound_message_schedule_self_cleanup')
+          || !this.requiredCapabilities.includes('outbound_message_schedule_self_cleanup'))) {
+      this.failProtocol(
+        'remote runner requested scheduled self-cleanup without explicit host and provider capability',
       );
       return;
     }

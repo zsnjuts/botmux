@@ -186,6 +186,92 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_final' }) + 
     ]);
   });
 
+  it('binds scheduled self-cleanup to the ordinary final-send path and verifies the receipt', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-cleanup-test-'));
+    roots.push(root);
+    const observed = join(root, 'observed.json');
+    const fixture = join(root, 'fixture.mjs');
+    writeFileSync(fixture, `#!/usr/bin/env node
+import fs from 'node:fs';
+fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify(process.argv.slice(2)));
+process.stdout.write(JSON.stringify({
+  success: true,
+  messageId: 'om_final_cleanup',
+  scheduleSelfCleanup: { requested: true, taskId: 'd2e2cb52', removed: true },
+}) + '\\n');
+`);
+    chmodSync(fixture, 0o755);
+
+    await expect(sendRemoteRunnerOutboundMessage({
+      operationId: 'operation-final-cleanup',
+      turnId: 'schedule:d2e2cb52:00000000-0000-4000-8000-000000000000',
+      generation: 2,
+      content: '最终正文',
+      responseKind: 'final',
+      mention: 'none',
+      scheduleRemoveSelf: true,
+    }, {
+      sessionId: 'session-final-cleanup',
+      turnId: 'schedule:d2e2cb52:00000000-0000-4000-8000-000000000000',
+      cliPath: fixture,
+      env: { PATH: process.env.PATH },
+    })).resolves.toEqual({
+      outcome: 'delivered',
+      messageId: 'om_final_cleanup',
+      scheduleSelfCleanup: { requested: true, taskId: 'd2e2cb52', removed: true },
+    });
+
+    expect(JSON.parse(readFileSync(observed, 'utf8'))).toEqual([
+      'send', '--remote-runner-outbound',
+      '--response-kind', 'final',
+      '--schedule-remove-self',
+      '--no-mention',
+      '--content-file', expect.any(String),
+      '--session-id', 'session-final-cleanup',
+    ]);
+  });
+
+  it('preserves a proven final delivery when scheduled cleanup was not proven', () => {
+    expect(classifyRemoteRunnerOutboundHostResult(
+      0,
+      `${JSON.stringify({ success: true, messageId: 'om_missing_cleanup' })}\n`,
+      '',
+      'd2e2cb52',
+    )).toEqual({
+      outcome: 'delivered',
+      messageId: 'om_missing_cleanup',
+      scheduleSelfCleanup: {
+        requested: true,
+        taskId: 'd2e2cb52',
+        removed: false,
+        error: 'scheduled self-cleanup result was missing or invalid',
+      },
+    });
+    expect(classifyRemoteRunnerOutboundHostResult(
+      0,
+      `${JSON.stringify({
+        success: true,
+        messageId: 'om_mismatched_cleanup',
+        scheduleSelfCleanup: {
+          requested: true,
+          taskId: 'deadbeef',
+          removed: true,
+        },
+      })}\n`,
+      '',
+      'd2e2cb52',
+    )).toEqual({
+      outcome: 'delivered',
+      messageId: 'om_mismatched_cleanup',
+      scheduleSelfCleanup: {
+        requested: true,
+        taskId: 'd2e2cb52',
+        removed: false,
+        error: 'scheduled self-cleanup result was missing or invalid',
+      },
+    });
+  });
+
   it('does not inherit either LinkRef mode variable for a disabled turn', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-disabled-link-ref-'));
     roots.push(root);

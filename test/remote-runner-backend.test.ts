@@ -151,6 +151,72 @@ describe('RemoteRunnerBackend', () => {
     }), {});
   });
 
+  it('accepts scheduled final cleanup only after its own bilateral capability negotiation', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: [
+        'outbound_message',
+        'outbound_message_final',
+        'outbound_message_schedule_self_cleanup',
+      ],
+    }, 'session-final-cleanup');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const delivery = vi.fn(async () => ({
+      outcome: 'delivered' as const,
+      messageId: 'om_final_cleanup',
+      scheduleSelfCleanup: {
+        requested: true as const,
+        taskId: 'd2e2cb52',
+        removed: true,
+      },
+    }));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-final-cleanup', content: 'final-cleanup' });
+    await expect(final).resolves.toBe('');
+    expect(delivery).toHaveBeenCalledWith(expect.objectContaining({
+      responseKind: 'final',
+      scheduleRemoveSelf: true,
+      content: 'scheduled payload',
+    }), {});
+  });
+
+  it('does not duplicate a delivered final when scheduled cleanup remains unproven', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: [
+        'outbound_message',
+        'outbound_message_final',
+        'outbound_message_schedule_self_cleanup',
+      ],
+    }, 'session-final-cleanup-unproven');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    backend.onOutboundMessage(async () => ({
+      outcome: 'delivered',
+      messageId: 'om_final_cleanup',
+      scheduleSelfCleanup: {
+        requested: true,
+        taskId: 'd2e2cb52',
+        removed: false,
+        error: 'cleanup receipt unavailable',
+      },
+    }));
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({
+      turnId: 'turn-final-cleanup-unproven',
+      content: 'final-cleanup',
+    });
+    await expect(final).resolves.toBe('');
+  });
+
   it('keeps the provider final when a negotiated final outbound delivery is rejected', async () => {
     const backend = new RemoteRunnerBackend({
       expectedProvider: 'outbound-test',
@@ -196,6 +262,27 @@ describe('RemoteRunnerBackend', () => {
     await ready;
 
     await backend.submitTurn({ turnId: 'turn-final-outbound', content: 'final-outbound' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(delivery).not.toHaveBeenCalled();
+  });
+
+  it('rejects scheduled final cleanup when the host did not require its capability', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: ['outbound_message', 'outbound_message_final'],
+    }, 'session-final-cleanup-host-disabled');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const delivery = vi.fn();
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-final-cleanup', content: 'final-cleanup' });
     await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
       code: 'remote_runner_protocol_error',
     })]));

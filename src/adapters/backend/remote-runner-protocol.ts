@@ -32,6 +32,7 @@ export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
   'outbound_message',
   'outbound_message_explicit_mention',
   'outbound_message_final',
+  'outbound_message_schedule_self_cleanup',
 ] as const;
 
 /** Optional provider-to-host access to a small BotMux session tool surface.
@@ -159,12 +160,24 @@ export interface RemoteRunnerOutboundMessage {
   mention: RemoteRunnerOutboundMention;
   mentions?: string[];
   images?: RemoteRunnerOutboundImage[];
+  /** Ask the ordinary host final-send path to remove the exact scheduled task
+   * only after its final delivery is durably recorded. */
+  scheduleRemoveSelf?: true;
+}
+
+export interface RemoteRunnerScheduleSelfCleanup {
+  requested: true;
+  taskId: string;
+  removed: boolean;
+  replay?: boolean;
+  error?: string;
 }
 
 export type RemoteRunnerOutboundMessageResult =
   | {
       outcome: 'delivered';
       messageId: string;
+      scheduleSelfCleanup?: RemoteRunnerScheduleSelfCleanup;
     }
   | {
       outcome: 'rejected' | 'unknown';
@@ -358,6 +371,7 @@ export type RemoteRunnerEvent =
       mention: RemoteRunnerOutboundMention;
       mentions?: string[];
       images?: RemoteRunnerOutboundImage[];
+      scheduleRemoveSelf?: true;
     })
   | (RemoteRunnerEventBase & {
       type: 'session_tool';
@@ -988,6 +1002,11 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       ? mentions !== undefined && mentions.length > 0
       : ['none', 'requester'].includes(mention)
         && raw.mentions === undefined;
+    const scheduleRemoveSelf = raw.scheduleRemoveSelf === true
+      ? true
+      : raw.scheduleRemoveSelf === undefined
+        ? undefined
+        : null;
     if (!operationId || !ID_RE.test(operationId)
         || !turnId || !ID_RE.test(turnId)
         || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
@@ -996,6 +1015,8 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         || Buffer.byteLength(raw.content, 'utf8') > MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
         || !['progress', 'auxiliary', 'final'].includes(String(raw.responseKind))
         || !mentionShapeValid
+        || scheduleRemoveSelf === null
+        || (scheduleRemoveSelf === true && raw.responseKind !== 'final')
         || images === undefined) {
       return undefined;
     }
@@ -1011,6 +1032,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       mention: mention as RemoteRunnerOutboundMention,
       ...(mention === 'explicit' ? { mentions } : {}),
       ...(images.length ? { images } : {}),
+      ...(scheduleRemoveSelf ? { scheduleRemoveSelf } : {}),
     };
   }
 

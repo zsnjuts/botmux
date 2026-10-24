@@ -67,6 +67,10 @@ export function normalizeRemoteRunnerConfig(value: unknown): RemoteRunnerConfig 
         && !requiredCapabilities.includes('outbound_message')) {
       throw new Error('remoteRunner.requiredCapabilities outbound_message_final requires outbound_message');
     }
+    if (requiredCapabilities.includes('outbound_message_schedule_self_cleanup')
+        && !requiredCapabilities.includes('outbound_message_final')) {
+      throw new Error('remoteRunner.requiredCapabilities outbound_message_schedule_self_cleanup requires outbound_message_final');
+    }
   }
 
   const handshakeTimeoutMs = optionalTimeout(raw.handshakeTimeoutMs, 'handshakeTimeoutMs');
