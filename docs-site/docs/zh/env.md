@@ -30,6 +30,7 @@
 |------|------|------|
 | `BOTMUX_DASHBOARD_HOST` | `0.0.0.0` | dashboard HTTP 绑定地址 |
 | `BOTMUX_DASHBOARD_PORT` | `7891` | dashboard HTTP 端口 |
+| `BOTMUX_DASHBOARD_STARTUP_TIMEOUT_MS` | `90000` | Dashboard 子进程存活但始终未通过本次 spawn 的 readiness 自检时的启动自愈预算；合法范围 10 秒–10 分钟。超时后 supervisor 只终止并重启该 Dashboard child，沿用有界重启策略，不影响 bot daemon。 |
 | `BOTMUX_DASHBOARD_EXTERNAL_HOST` | `WEB_EXTERNAL_HOST` 或自动探测 | CLI 输出 URL 用的 host |
 | `BOTMUX_PUBLIC_URL` | _(未设置)_ | 自建反代对外基址（`scheme://host[:port]`）。没接中心平台、但自己用 nginx 等把 dashboard 反代到单一公网/内网域名时设它，dashboard / 卡片终端链接改吐 `<基址>/…`、`<基址>/s/<sessionId>`，走 dashboard 前门、无需 per-bot 端口。未设回退本地 `host:port`。必须写在 `~/.botmux/.env`（会话内发起的重启只读文件、不继承 shell） |
 | `BOTMUX_DEVBOX_AUTO_EXPORT` | `1` | 在 Merlin Devbox 且 Dashboard 端口可导出时，自动创建或复用私有短链。中心平台或 `BOTMUX_PUBLIC_URL` 已配置时不执行。设为 `0` 或 `false` 可关闭：写在 `~/.botmux/.env` 或在启动 fleet 的 shell 里 export 均可（dashboard 走 allowlist 从文件读，CLI 自己不 dotenv、直接兜读该文件，两侧对同一个开关给出同一答案）。失败或超时会静默回退本机 URL。 |

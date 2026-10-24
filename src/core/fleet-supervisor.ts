@@ -12,11 +12,18 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { openSync, closeSync, mkdirSync } from 'node:fs';
+import { openSync, closeSync, mkdirSync, readFileSync } from 'node:fs';
+import { get as httpGet } from 'node:http';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import {
+  createDashboardStartupNonce,
+  DASHBOARD_STARTUP_NONCE_ENV,
+  dashboardStartupNonce,
+} from './dashboard-startup-readiness.js';
 import {
   builtinFleetEntryMatches,
   inspectFleetProcess,
@@ -119,6 +126,88 @@ export interface FleetSupervisorOptions {
   log?: (msg: string) => void;
   /** Injected for process-identity edge-case tests. */
   processIdentityRuntime?: FleetProcessIdentityRuntime;
+  /** Dashboard-only startup readiness budget. Tests may shorten it; production
+   *  defaults to BOTMUX_DASHBOARD_STARTUP_TIMEOUT_MS or 90 seconds. */
+  dashboardStartupTimeoutMs?: number;
+  /** Dashboard readiness poll interval; injected by live tests. */
+  dashboardReadinessPollMs?: number;
+  /** Dashboard readiness probe; injected by tests to avoid a real listener. */
+  dashboardReadinessProbe?: (env: NodeJS.ProcessEnv) => Promise<boolean>;
+}
+
+const DEFAULT_DASHBOARD_STARTUP_TIMEOUT_MS = 90_000;
+const DEFAULT_DASHBOARD_READINESS_POLL_MS = 1_000;
+const DASHBOARD_PROBE_TIMEOUT_MS = 800;
+
+export function dashboardStartupTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const parsed = Number(env.BOTMUX_DASHBOARD_STARTUP_TIMEOUT_MS);
+  return Number.isSafeInteger(parsed) && parsed >= 10_000 && parsed <= 600_000
+    ? parsed
+    : DEFAULT_DASHBOARD_STARTUP_TIMEOUT_MS;
+}
+
+function dashboardProbeHost(env: NodeJS.ProcessEnv): string {
+  const raw = env.BOTMUX_DASHBOARD_HOST?.trim();
+  if (!raw || raw === '0.0.0.0' || raw === '::' || raw === '[::]') return '127.0.0.1';
+  return raw.startsWith('[') && raw.endsWith(']') ? raw.slice(1, -1) : raw;
+}
+
+function dashboardProbePort(env: NodeJS.ProcessEnv): number {
+  const home = env.HOME?.trim() || homedir();
+  try {
+    const persisted = Number(readFileSync(join(home, '.botmux', '.dashboard-port'), 'utf-8').trim());
+    if (Number.isSafeInteger(persisted) && persisted >= 1 && persisted <= 65_535) return persisted;
+  } catch { /* dashboard has not published its bound port yet */ }
+  const configured = Number(env.BOTMUX_DASHBOARD_PORT);
+  return Number.isSafeInteger(configured) && configured >= 1 && configured <= 65_535
+    ? configured
+    : 7_891;
+}
+
+/** Probe the exact Dashboard generation's existing self-identification route,
+ *  not merely an open TCP port or `/__health`: daemon IPC exposes the same
+ *  health JSON, while a stale Dashboard belongs to a different spawn nonce. */
+export function probeDashboardStartupReadiness(env: NodeJS.ProcessEnv): Promise<boolean> {
+  const expectedNonce = dashboardStartupNonce(env);
+  if (!expectedNonce) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const finish = (ready: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      resolve(ready);
+    };
+    const req = httpGet({
+      host: dashboardProbeHost(env),
+      port: dashboardProbePort(env),
+      path: '/__selfcheck',
+    }, (res) => {
+      let body = '';
+      res.setEncoding('utf-8');
+      res.on('data', (chunk: string) => {
+        body += chunk;
+        if (body.length > 128) {
+          res.destroy();
+          finish(false);
+        }
+      });
+      res.on('end', () => {
+        finish(res.statusCode === 200 && body === expectedNonce);
+      });
+      res.on('error', () => finish(false));
+    });
+    req.on('error', () => finish(false));
+    // node:http's request timeout is an inactivity timeout. A wrong service can
+    // keep a request alive forever by trickling bytes, so bound the whole
+    // exchange (headers + body) with an independent wall-clock deadline.
+    deadline = setTimeout(() => {
+      req.destroy();
+      finish(false);
+    }, DASHBOARD_PROBE_TIMEOUT_MS);
+    deadline.unref?.();
+  });
 }
 
 /** True if a pid is alive (kill -0). pid<=1 is never a real supervised child. */
@@ -133,6 +222,10 @@ export class FleetSupervisor {
   /** Per-name generation the live child was spawned with — guards stale exits. */
   private readonly liveGeneration = new Map<string, number>();
   private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly dashboardReadinessWatchdogs = new Map<string, {
+    generation: number;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   /** Names an operator explicitly stopped (stop-bot). Their SIGTERM would look
    *  like a crash to onChildExit, so we suppress the restart for exactly one exit
    *  and mark them stopped. Cleared when the bot is explicitly started again. */
@@ -426,6 +519,67 @@ export class FleetSupervisor {
     }
   }
 
+  private clearDashboardReadinessWatchdog(name: string, generation?: number): void {
+    const current = this.dashboardReadinessWatchdogs.get(name);
+    if (!current || (generation !== undefined && current.generation !== generation)) return;
+    clearTimeout(current.timer);
+    this.dashboardReadinessWatchdogs.delete(name);
+  }
+
+  private armDashboardReadinessWatchdog(
+    spec: FleetBotSpec,
+    child: ChildProcess,
+    generation: number,
+    childEnv: NodeJS.ProcessEnv,
+  ): void {
+    if ((spec.entry ?? 'daemon') !== 'dashboard') return;
+    this.clearDashboardReadinessWatchdog(spec.name);
+    const timeoutMs = this.opts.dashboardStartupTimeoutMs
+      ?? dashboardStartupTimeoutMs(childEnv);
+    const pollMs = this.opts.dashboardReadinessPollMs
+      ?? DEFAULT_DASHBOARD_READINESS_POLL_MS;
+    const probe = this.opts.dashboardReadinessProbe
+      ?? probeDashboardStartupReadiness;
+    const startedAt = Date.now();
+    const record = {
+      generation,
+      timer: undefined as unknown as ReturnType<typeof setTimeout>,
+    };
+    const poll = async () => {
+      if (
+        this.stopping
+        || this.dashboardReadinessWatchdogs.get(spec.name) !== record
+        || this.liveGeneration.get(spec.name) !== generation
+        || this.children.get(spec.name) !== child
+        || child.exitCode !== null
+        || child.signalCode !== null
+      ) {
+        this.clearDashboardReadinessWatchdog(spec.name, generation);
+        return;
+      }
+      let ready = false;
+      try { ready = await probe(childEnv); } catch { ready = false; }
+      if (this.dashboardReadinessWatchdogs.get(spec.name) !== record) return;
+      if (ready) {
+        this.log(`${spec.name} readiness confirmed`);
+        this.clearDashboardReadinessWatchdog(spec.name, generation);
+        return;
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        this.log(
+          `${spec.name} stayed alive but did not become reachable within ${timeoutMs}ms; `
+          + 'sending SIGKILL so the supervised restart can retry startup',
+        );
+        this.clearDashboardReadinessWatchdog(spec.name, generation);
+        try { child.kill('SIGKILL'); } catch { /* exit/restart reconciles reality */ }
+        return;
+      }
+      record.timer = setTimeout(() => { void poll(); }, pollMs);
+    };
+    record.timer = setTimeout(() => { void poll(); }, 0);
+    this.dashboardReadinessWatchdogs.set(spec.name, record);
+  }
+
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
     if (this.stopping) return;
     const entry = spec.entry ?? 'daemon';
@@ -492,7 +646,10 @@ export class FleetSupervisor {
     } else if (entry === 'daemon') {
       childEnv = { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) };
     } else {
-      childEnv = { ...this.opts.daemonEnv };
+      childEnv = {
+        ...this.opts.daemonEnv,
+        [DASHBOARD_STARTUP_NONCE_ENV]: createDashboardStartupNonce(),
+      };
     }
     const child = spawn(command, [...nodeArgs, ...args], {
       cwd: spec.external?.cwd ?? this.opts.cwd,
@@ -554,12 +711,14 @@ export class FleetSupervisor {
       // child until its exit event, especially when removal must fail closed.
       if (!spawned) this.onChildExit(spec, generation, { code: 1, signal: null });
     });
+    this.armDashboardReadinessWatchdog(spec, child, generation, childEnv);
   }
 
   private onChildExit(spec: FleetBotSpec, generation: number, exit: ChildExit): void {
     // Generation guard: ignore an exit from a child we already replaced. A stale
     // exit must never mutate the newer generation's row or trigger a double spawn.
     if (this.liveGeneration.get(spec.name) !== generation) return;
+    this.clearDashboardReadinessWatchdog(spec.name, generation);
     this.children.delete(spec.name);
     if (this.stopping) return;
 
@@ -641,6 +800,10 @@ export class FleetSupervisor {
     this.stopping = true;
     for (const t of this.restartTimers.values()) clearTimeout(t);
     this.restartTimers.clear();
+    for (const value of this.dashboardReadinessWatchdogs.values()) {
+      clearTimeout(value.timer);
+    }
+    this.dashboardReadinessWatchdogs.clear();
     const pending = [...this.children.entries()];
     await Promise.all(pending.map(([name, child]) => this.stopOne(name, child)));
     // Reflect the stop in the durable record. onChildExit ignored these exits

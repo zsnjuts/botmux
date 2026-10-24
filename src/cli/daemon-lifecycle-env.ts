@@ -32,6 +32,7 @@ export const DAEMON_ENV_KEYS = [
   'BOTMUX_DASHBOARD_EXTERNAL_HOST',
   'BOTMUX_DASHBOARD_HOST',
   'BOTMUX_DASHBOARD_PORT',
+  'BOTMUX_DASHBOARD_STARTUP_TIMEOUT_MS',
   // Provider-neutral address published for cross-instance terminal routing.
   // Platform-specific discovery belongs in the deployment layer.
   'BOTMUX_TERMINAL_ROUTE_HOST',

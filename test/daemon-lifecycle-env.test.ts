@@ -307,6 +307,7 @@ describe('DAEMON_ENV_KEYS enforces fleet credential boundaries', () => {
   it('includes the audit-path and terminal-lease settings from .env.example', () => {
     expect(DAEMON_ENV_KEYS as readonly string[]).toContain('BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH');
     expect(DAEMON_ENV_KEYS as readonly string[]).toContain('BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS');
+    expect(DAEMON_ENV_KEYS as readonly string[]).toContain('BOTMUX_DASHBOARD_STARTUP_TIMEOUT_MS');
   });
 
   it('includes the host-scoped Go build fanout policy', () => {
