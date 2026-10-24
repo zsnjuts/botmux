@@ -79,6 +79,37 @@ describe('durable config CAS command', () => {
     });
   });
 
+  it('builds a combined path and content recovery request only from a complete explicit proof', () => {
+    const committed = 'a'.repeat(64);
+    const file = 'd'.repeat(64);
+    const boundPath = 'b'.repeat(64);
+    const currentPath = 'c'.repeat(64);
+    const args = [
+      'rebind-and-reconcile', '--bot', 'cli_demo123', '--scope', 'bots',
+      '--expected-record-revision', '9',
+      '--expected-bound-path-sha', boundPath,
+      '--expected-current-path-sha', currentPath,
+      '--expected-committed-sha', committed,
+      '--expected-file-sha', file,
+    ];
+    expect(() => parseDurableConfigCasArgs(args)).toThrow('requires --yes');
+    const parsed = parseDurableConfigCasArgs([...args, '--yes']);
+    expect(durableConfigCasRequest(parsed)).toEqual({
+      path: '/api/durable-config-cas/rebind-and-reconcile?scope=bots',
+      init: {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          expectedRecordRevision: 9,
+          expectedBoundPathSha256: boundPath,
+          expectedCurrentPathSha256: currentPath,
+          expectedCommittedSha256: committed,
+          expectedFileSha256: file,
+        }),
+      },
+    });
+  });
+
   it('rejects unsupported scopes and non-canonical digests', () => {
     expect(() => parseDurableConfigCasArgs([
       'inspect', '--bot', 'cli_demo123', '--scope', 'unknown',

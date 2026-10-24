@@ -186,4 +186,51 @@ describe('durable config CAS IPC', () => {
       ...body,
     });
   });
+
+  it('combines path rebind and content reconciliation only through the explicit recovery route', async () => {
+    const body = {
+      expectedRecordRevision: 9,
+      expectedBoundPathSha256: 'b'.repeat(64),
+      expectedCurrentPathSha256: 'c'.repeat(64),
+      expectedCommittedSha256: 'a'.repeat(64),
+      expectedFileSha256: 'd'.repeat(64),
+    };
+    const unsigned = await fetch(
+      `http://127.0.0.1:${server!.port}/api/durable-config-cas/rebind-and-reconcile?scope=global`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    );
+    expect(unsigned.status).toBe(401);
+    expect(rebindPath).not.toHaveBeenCalled();
+
+    const missing = await fetchDaemonIpc(
+      server!.port,
+      '/api/durable-config-cas/rebind-and-reconcile?scope=global',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' },
+      secret,
+    );
+    expect(missing.status).toBe(400);
+    expect(rebindPath).not.toHaveBeenCalled();
+
+    const response = await fetchDaemonIpc(
+      server!.port,
+      '/api/durable-config-cas/rebind-and-reconcile?scope=global',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      secret,
+    );
+    expect(response.status).toBe(200);
+    expect(rebindPath).toHaveBeenCalledWith({
+      scope: 'global',
+      path: process.env.BOTMUX_GLOBAL_CONFIG_FILE,
+      ...body,
+      reconcileContent: true,
+    });
+  });
 });
