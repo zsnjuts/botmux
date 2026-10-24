@@ -168,6 +168,134 @@ describe('durable session control dispatch', () => {
     await store.close();
   });
 
+  it('completes an existing pending operation when canonical state terminally ignores it', async () => {
+    const store = makeStore(() => 10);
+    const input = controlInput();
+    const acquired = await store.acquireSessionLease({
+      sessionKey: 'om_root::cli_test',
+      ownerId: 'session-owner',
+      leaseDurationMs: 1_000,
+    });
+    if (acquired.kind !== 'acquired') throw new Error('expected Session lease');
+    await store.enqueueControlOperation({
+      lease: acquired.lease,
+      operation: {
+        operationId: input.control.operationId,
+        sessionKey: 'om_root::cli_test',
+        payload: { action: 'close', sessionId: 'session-1' },
+        createdAt: 1,
+      },
+    });
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: 'session-owner',
+      resolve: async () => ({
+        kind: 'ignored',
+        reason: 'canonical lifecycle already advanced',
+        settleExistingOperation: {
+          result: { status: 'closed', applied: false },
+          evidence: { source: 'canonical-session', status: 'closed' },
+        },
+      }),
+    });
+
+    await expect(dispatch(input.control, input.context)).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'canonical lifecycle already advanced',
+    });
+    expect(await store.readControlOperation(input.control.operationId)).toMatchObject({
+      state: 'completed',
+      attempts: 1,
+      result: { status: 'closed', applied: false },
+    });
+    await store.close();
+  });
+
+  it('reconciles an existing ambiguous operation when canonical state terminally ignores it', async () => {
+    const store = makeStore(() => 10);
+    const input = controlInput();
+    const acquired = await store.acquireSessionLease({
+      sessionKey: 'om_root::cli_test',
+      ownerId: 'session-owner',
+      leaseDurationMs: 1_000,
+    });
+    if (acquired.kind !== 'acquired') throw new Error('expected Session lease');
+    await store.enqueueControlOperation({
+      lease: acquired.lease,
+      operation: {
+        operationId: input.control.operationId,
+        sessionKey: 'om_root::cli_test',
+        payload: { action: 'close', sessionId: 'session-1' },
+        createdAt: 1,
+      },
+    });
+    const begun = await store.beginControlOperationAttempt({
+      lease: acquired.lease,
+      operationId: input.control.operationId,
+    });
+    if (begun.kind !== 'applied') throw new Error('expected control attempt');
+    await store.markControlOperationAmbiguous({
+      attempt: begun.attempt,
+      error: 'previous result unknown',
+    });
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: 'session-owner',
+      resolve: async () => ({
+        kind: 'ignored',
+        reason: 'canonical lifecycle already advanced',
+        settleExistingOperation: {
+          result: { status: 'closed', applied: false },
+          evidence: { source: 'canonical-session', status: 'closed' },
+        },
+      }),
+    });
+
+    await expect(dispatch(input.control, input.context)).resolves.toMatchObject({ kind: 'ignored' });
+    expect(await store.readControlOperation(input.control.operationId)).toMatchObject({
+      state: 'completed',
+      attempts: 1,
+      reconciliation: {
+        kind: 'completed',
+        attempt: 1,
+        evidence: { source: 'canonical-session', status: 'closed' },
+      },
+    });
+    await store.close();
+  });
+
+  it('does not alter an existing operation for a non-terminal ignore', async () => {
+    const store = makeStore(() => 10);
+    const input = controlInput();
+    const acquired = await store.acquireSessionLease({
+      sessionKey: 'om_root::cli_test',
+      ownerId: 'session-owner',
+      leaseDurationMs: 1_000,
+    });
+    if (acquired.kind !== 'acquired') throw new Error('expected Session lease');
+    await store.enqueueControlOperation({
+      lease: acquired.lease,
+      operation: {
+        operationId: input.control.operationId,
+        sessionKey: 'om_root::cli_test',
+        payload: { action: 'close', sessionId: 'session-1' },
+        createdAt: 1,
+      },
+    });
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: 'session-owner',
+      resolve: async () => ({ kind: 'ignored', reason: 'operator is not authorized' }),
+    });
+
+    await expect(dispatch(input.control, input.context)).resolves.toMatchObject({ kind: 'ignored' });
+    expect(await store.readControlOperation(input.control.operationId)).toMatchObject({
+      state: 'pending',
+      attempts: 0,
+    });
+    await store.close();
+  });
+
   it('does not execute while another owner holds the canonical Session lease', async () => {
     const store = makeStore(() => 10);
     await store.acquireSessionLease({

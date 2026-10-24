@@ -291,12 +291,33 @@ export function createDurableLarkSessionControlRuntime(
         || canonicalSession.sessionId !== control.sessionId) {
       throw new Error('durable lifecycle control canonical Session is unavailable');
     }
+    const terminalIgnore = (reason: string) => ({
+      kind: 'ignored' as const,
+      reason,
+      settleExistingOperation: {
+        result: {
+          version: 1,
+          type: 'botmux.lark.session-control-result',
+          action: control.action,
+          status: canonicalSession.status,
+          applied: false,
+          ignored: true,
+          reason,
+        } as unknown as DurableJson,
+        evidence: {
+          source: 'canonical-session',
+          action: control.action,
+          status: canonicalSession.status,
+          reason,
+        } as unknown as DurableJson,
+      },
+    });
     if (control.action === 'resume' && canonicalSession.status !== 'closed') {
-      return { kind: 'ignored', reason: 'canonical Session is no longer closed' };
+      return terminalIgnore('canonical Session is no longer closed');
     }
     if ((control.action === 'handoff' || control.action === 'terminalize_orphan')
         && canonicalSession.status !== 'active') {
-      return { kind: 'ignored', reason: 'canonical Session is no longer active' };
+      return terminalIgnore('canonical Session is no longer active');
     }
     if (control.action === 'close' && canonicalSession.status !== 'active'
         && canonicalSession.status !== 'closed') {
@@ -320,16 +341,6 @@ export function createDurableLarkSessionControlRuntime(
     if (control.action === 'terminalize_orphan' && !trustedHost) {
       return { kind: 'ignored', reason: 'orphan terminalization requires a trusted host' };
     }
-    if (control.action === 'handoff' && trustedHost
-        && now() - context.claim.event.createdAt >= TRUSTED_HANDOFF_HORIZON_MS) {
-      // Handoff is a short transition between a retiring owner and its
-      // successor. Once that transition horizon is exceeded, retrying the old
-      // event cannot restore the original owner and only keeps newer lifecycle
-      // controls behind the same partition FIFO head. Complete the stale
-      // handoff without changing canonical state; a later message or orphan
-      // proof can then recover the current lineage under its own fence.
-      return { kind: 'ignored', reason: 'stale remote handoff exceeded its recovery horizon' };
-    }
     if (control.action === 'handoff'
         && options.facade().ownerId === control.retiringOwnerId) {
       throw new DurableSessionControlOwnerHandoffError(
@@ -348,6 +359,32 @@ export function createDurableLarkSessionControlRuntime(
       : undefined;
     if (control.action === 'handoff' && !handoffBaselineState) {
       return { kind: 'ignored', reason: 'canonical Session is not backed by a Remote Runner' };
+    }
+    const handoffNeverStartedRemote = control.action === 'handoff'
+      && handoffBaselineState?.generation === 0
+      && !handoffBaselineState.remoteSessionId
+      && !handoffBaselineState.agentThreadId;
+    if (control.action === 'handoff' && trustedHost
+        && !handoffNeverStartedRemote
+        && now() - context.claim.event.createdAt >= TRUSTED_HANDOFF_HORIZON_MS) {
+      // A stale handoff cannot restore its retiring owner. Settle any operation
+      // already opened by an older consumer as an explicit no-op so the Inbox
+      // and control ledgers cannot diverge permanently. A never-started remote
+      // remains eligible for the compatibility close below.
+      return terminalIgnore('stale remote handoff exceeded its recovery horizon');
+    }
+    // A provider can fail before it publishes any remote identity while the
+    // local Session shell is already durable. If the owning daemon then rolls,
+    // its trusted-host handoff must retire that empty shell instead of retrying
+    // an impossible reattach forever. Keep this compatibility path in the
+    // consumer as well as the producer so an ambiguous handoff written by an
+    // older daemon can reconcile after upgrade.
+    if (handoffNeverStartedRemote && persisted?.status !== 'closed') {
+      persisted = options.materializeClosedSession({
+        ...structuredClone(canonicalSession),
+        status: 'closed',
+        closedAt: new Date(now()).toISOString(),
+      });
     }
     const orphanBaselineState = control.action === 'terminalize_orphan'
       ? normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState)
@@ -570,6 +607,21 @@ export function createDurableLarkSessionControlRuntime(
                   generation: active?.session.remoteBackendState?.generation,
                 }
               : {}),
+          },
+        };
+      }
+      if (handoffNeverStartedRemote && current.status === 'closed') {
+        return {
+          result: result('closed', undefined, {
+            retiringOwnerId: control.retiringOwnerId,
+            applied: false,
+            recovery: 'never-started',
+          }),
+          evidence: {
+            source: 'session-store',
+            status: 'closed',
+            recovery: 'never-started',
+            ...(current.closedAt ? { closedAt: current.closedAt } : {}),
           },
         };
       }
@@ -937,7 +989,9 @@ export function createDurableLarkSessionControlRuntime(
               || (control.action === 'resume'
                 && status !== 'active'
                 && !(status === 'closed' && parsed.applied === false))
-              || (control.action === 'handoff' && status !== 'active')
+              || (control.action === 'handoff'
+                && status !== 'active'
+                && !(handoffNeverStartedRemote && status === 'closed'))
               || (control.action === 'terminalize_orphan' && status !== 'closed')
               || (control.action === 'toggle_display'
                 && (status !== 'active'
