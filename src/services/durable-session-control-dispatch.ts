@@ -37,7 +37,20 @@ export interface DurableSessionControlTarget {
 
 export type DurableSessionControlResolution =
   | { kind: 'target'; target: DurableSessionControlTarget }
-  | { kind: 'ignored'; reason: string };
+  | {
+      kind: 'ignored';
+      reason: string;
+      /**
+       * A previous consumer may already have crossed the control-operation
+       * boundary before the canonical lifecycle made this event obsolete.
+       * Terminal ignores must settle that durable operation as a no-op before
+       * the Inbox row can be completed again.
+       */
+      settleExistingOperation?: {
+        result: DurableJson;
+        evidence: DurableJson;
+      };
+    };
 
 export interface DurableSessionControlDispatchOptions {
   store: DurableCoordinationStore;
@@ -92,6 +105,70 @@ export function createDurableSessionControlDispatch(
     300_000,
   );
 
+  const settleTerminalIgnore = async (
+    control: DurableLarkSessionControlClaim,
+    resolution: Extract<DurableSessionControlResolution, { kind: 'ignored' }>,
+  ): Promise<void> => {
+    if (!resolution.settleExistingOperation) return;
+    let record = await options.store.readControlOperation(control.operationId);
+    if (!record || record.state === 'completed') return;
+    const acquired = await options.store.acquireSessionLease({
+      sessionKey: record.sessionKey,
+      ownerId,
+      leaseDurationMs,
+    });
+    if (acquired.kind === 'occupied') {
+      throw new DurableSessionControlOwnerHandoffError(
+        `durable session control Session is occupied by ${acquired.ownerId}`,
+      );
+    }
+    record = await options.store.readControlOperation(control.operationId);
+    if (!record || record.state === 'completed') return;
+    if (record.sessionKey !== acquired.lease.sessionKey) {
+      throw new Error(`durable session control operation moved ${control.operationId}`);
+    }
+    if (record.state === 'pending' || record.state === 'attempting') {
+      const begun = await options.store.beginControlOperationAttempt({
+        lease: acquired.lease,
+        operationId: control.operationId,
+      });
+      if (begun.kind === 'applied') {
+        const completed = await options.store.completeControlOperationAttempt({
+          attempt: begun.attempt,
+          result: resolution.settleExistingOperation.result,
+        });
+        if (completed.kind === 'applied') return;
+      } else if (begun.kind === 'not_pending') {
+        record = begun.record;
+      } else {
+        throw new Error(
+          `durable terminal ignore could not begin ${control.operationId}: ${begun.kind}`,
+        );
+      }
+      record = await options.store.readControlOperation(control.operationId) ?? record;
+      if (record.state === 'completed') return;
+      if (record.state === 'attempting') {
+        throw new Error(`durable terminal ignore attempt is still owned ${control.operationId}`);
+      }
+    }
+    if (record.state === 'ambiguous') {
+      const reconciled = await options.store.reconcileControlOperation({
+        lease: acquired.lease,
+        operationId: control.operationId,
+        expectedAttempt: record.attempts,
+        outcome: {
+          kind: 'completed',
+          result: resolution.settleExistingOperation.result,
+          evidence: resolution.settleExistingOperation.evidence,
+        },
+      });
+      if (reconciled.kind === 'applied' || (await options.store.readControlOperation(
+        control.operationId,
+      ))?.state === 'completed') return;
+    }
+    throw new Error(`durable terminal ignore settlement lost ${control.operationId}`);
+  };
+
   return async (control, context) => {
     if (context.signal.aborted) throw abortError(context.signal);
     const resolved = await options.resolve(control, context);
@@ -101,6 +178,7 @@ export function createDurableSessionControlDispatch(
       if (!reason || reason.length > 512) {
         throw new Error('durable session control ignored result requires a bounded reason');
       }
+      await settleTerminalIgnore(control, resolved);
       return { kind: 'ignored', reason };
     }
     const target = resolved.target;

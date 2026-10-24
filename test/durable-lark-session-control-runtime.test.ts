@@ -374,7 +374,7 @@ describe('durable Lark session control runtime', () => {
       closeResidualText: () => 'residual',
       closeRefusedText: () => 'refused',
       resumeRefusedText: error => error,
-      now: () => 20,
+      now: () => 300_003,
     });
     const dispatch = createDurableSessionControlDispatch({
       store,
@@ -2129,9 +2129,22 @@ describe('durable Lark session control runtime', () => {
     await expect(runtime.resolve(input.control, {
       claim: input.claim,
       signal: new AbortController().signal,
-    })).resolves.toEqual({
+    })).resolves.toMatchObject({
       kind: 'ignored',
       reason: 'stale remote handoff exceeded its recovery horizon',
+      settleExistingOperation: {
+        result: {
+          action: 'handoff',
+          status: 'active',
+          applied: false,
+          ignored: true,
+        },
+        evidence: {
+          source: 'canonical-session',
+          action: 'handoff',
+          status: 'active',
+        },
+      },
     });
     expect(takeOverActiveSession).not.toHaveBeenCalled();
     await facade.stop();
