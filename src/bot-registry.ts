@@ -2758,19 +2758,23 @@ export function hotReloadBotConfigSnapshot(
     throw new Error('bot_config_reload_identity_changed');
   }
   const parsedStatus = parsedNativeSubagentRuntimeStatus.get(next);
-  const normalizedRuntime = next.cliId === 'traex'
-    ? normalizeNativeSubagentRuntimePolicy(next.nativeSubagentRuntime)
-    : { ok: true as const, value: undefined };
+  let normalizedRuntimeValue: NativeSubagentRuntimePolicy | undefined;
+  let runtimeNormalizationFailed = false;
+  if (next.cliId === 'traex') {
+    const normalizedRuntime = normalizeNativeSubagentRuntimePolicy(next.nativeSubagentRuntime);
+    if (normalizedRuntime.ok) normalizedRuntimeValue = normalizedRuntime.value;
+    else runtimeNormalizationFailed = true;
+  }
   const nextRuntimeStatus: NativeSubagentRuntimeConfigState['status'] =
     parsedStatus === 'invalid' && next.nativeSubagentRuntime === undefined
       ? 'invalid'
-      : !normalizedRuntime.ok
+      : runtimeNormalizationFailed
         ? 'invalid'
-        : normalizedRuntime.value
+        : normalizedRuntimeValue
           ? 'valid'
           : 'absent';
   next.nativeSubagentRuntime = nextRuntimeStatus === 'valid'
-    ? normalizedRuntime.value
+    ? normalizedRuntimeValue
     : undefined;
   const changedKeys = [...new Set([...Object.keys(current), ...Object.keys(next)])]
     .filter(key => key !== 'larkAppSecret')
