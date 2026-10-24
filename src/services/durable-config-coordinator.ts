@@ -16,7 +16,16 @@ const RECORD_VERSION = 2;
 const MAX_AUDIT_ENTRIES = 64;
 const LEASE_DURATION_MS = 300_000;
 
-export type DurableConfigScope = 'bots' | 'global' | 'group-context';
+/**
+ * Complete set of runtime-mutable config authorities protected by durable CAS.
+ *
+ * Keep consumers on this tuple instead of copying string lists. Adding a new
+ * authority must therefore also update every exhaustive path/apply mapping,
+ * otherwise TypeScript fails the build instead of silently omitting cross-Pod
+ * propagation.
+ */
+export const DURABLE_CONFIG_SCOPES = ['bots', 'global', 'group-context'] as const;
+export type DurableConfigScope = typeof DURABLE_CONFIG_SCOPES[number];
 
 interface ConfigAuditEntry {
   operationId: string;

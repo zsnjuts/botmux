@@ -442,7 +442,7 @@ describe('message quota enforcement', () => {
       { onRetryableInfrastructureFailure: retry },
     )).resolves.toBe(false);
 
-    expect(retry).toHaveBeenCalledWith('message quota infrastructure unavailable');
+    expect(retry).toHaveBeenCalledWith('message_quota_infrastructure_unavailable');
     expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_retry_inbox');
     expect(mocks.commitCharge).not.toHaveBeenCalled();
   });

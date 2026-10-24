@@ -1,4 +1,7 @@
-import type { DurableConfigScope } from '../services/durable-config-coordinator.js';
+import {
+  DURABLE_CONFIG_SCOPES,
+  type DurableConfigScope,
+} from '../services/durable-config-coordinator.js';
 
 export const DURABLE_CONFIG_CAS_ROUTE = '/api/durable-config-cas';
 
@@ -12,7 +15,7 @@ export type DurableConfigCasCommand = {
 };
 
 const DIGEST = /^[0-9a-f]{64}$/;
-const SCOPES = new Set<DurableConfigScope>(['bots', 'global', 'group-context']);
+const SCOPES = new Set<string>(DURABLE_CONFIG_SCOPES);
 
 function valueAfter(args: string[], index: number, flag: string): string {
   const value = args[index + 1];

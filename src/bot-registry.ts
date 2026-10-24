@@ -2732,6 +2732,65 @@ export function getBot(larkAppId: string): BotState {
   return state;
 }
 
+function sameHotReloadIdentity(current: BotConfig, next: BotConfig): boolean {
+  return current.larkAppId === next.larkAppId
+    && current.larkAppSecret === next.larkAppSecret
+    && normalizeBrand(current.brand) === normalizeBrand(next.brand)
+    && (current.apiOnly === true) === (next.apiOnly === true);
+}
+
+/**
+ * Replace the registered config generation without replacing the object.
+ *
+ * Long-lived daemon closures retain the original `BotConfig` reference, so a
+ * sibling-Pod CAS watcher must mutate that exact object in place.  Feishu
+ * transport identity is deliberately immutable here: changing credentials,
+ * brand or apiOnly requires a daemon restart and may never be smuggled through
+ * a runtime config refresh.
+ */
+export function hotReloadBotConfigSnapshot(
+  larkAppId: string,
+  next: BotConfig,
+): { changedKeys: string[] } {
+  const state = getBot(larkAppId);
+  const current = state.config;
+  if (next.larkAppId !== larkAppId || !sameHotReloadIdentity(current, next)) {
+    throw new Error('bot_config_reload_identity_changed');
+  }
+  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(next);
+  const normalizedRuntime = next.cliId === 'traex'
+    ? normalizeNativeSubagentRuntimePolicy(next.nativeSubagentRuntime)
+    : { ok: true as const, value: undefined };
+  const nextRuntimeStatus: NativeSubagentRuntimeConfigState['status'] =
+    parsedStatus === 'invalid' && next.nativeSubagentRuntime === undefined
+      ? 'invalid'
+      : !normalizedRuntime.ok
+        ? 'invalid'
+        : normalizedRuntime.value
+          ? 'valid'
+          : 'absent';
+  next.nativeSubagentRuntime = nextRuntimeStatus === 'valid'
+    ? normalizedRuntime.value
+    : undefined;
+  const changedKeys = [...new Set([...Object.keys(current), ...Object.keys(next)])]
+    .filter(key => key !== 'larkAppSecret')
+    .filter(key => JSON.stringify((current as any)[key]) !== JSON.stringify((next as any)[key]))
+    .sort();
+  for (const key of Object.keys(current)) delete (current as any)[key];
+  Object.assign(current, JSON.parse(JSON.stringify(next)) as BotConfig);
+  parsedNativeSubagentRuntimeStatus.set(current, nextRuntimeStatus);
+  state.nativeSubagentRuntimeState = nextRuntimeStatus === 'valid'
+    ? { status: 'valid', policy: current.nativeSubagentRuntime! }
+    : { status: nextRuntimeStatus };
+  // The instance-pool registry keeps the registered BotConfig reference, but
+  // re-registering also reruns its cross-field validation for this generation.
+  registerCodexInstanceBot(current);
+  if (current.turnResults?.enabled !== true || current.apiOnly || current.readIsolation) {
+    getTurnResultRuntime()?.clearBot(current.larkAppId);
+  }
+  return { changedKeys };
+}
+
 export function getBotClient(larkAppId: string): Lark.Client {
   const bot = getBot(larkAppId);
   // Bot-level transport boundary at the TRUE shared base. `apiOnly` (core-only)
