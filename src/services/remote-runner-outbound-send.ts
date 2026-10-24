@@ -6,9 +6,11 @@ import {
   botmuxCliInvocation,
   buildRelayHostEnv,
 } from '../adapters/backend/sandbox.js';
+import { parseScheduledTurnId } from '../core/scheduled-turn-provenance.js';
 import type {
   RemoteRunnerOutboundMessage,
   RemoteRunnerOutboundMessageResult,
+  RemoteRunnerScheduleSelfCleanup,
 } from '../adapters/backend/remote-runner-protocol.js';
 
 const MAX_CAPTURE_BYTES = 64 * 1024;
@@ -33,14 +35,54 @@ export function classifyRemoteRunnerOutboundHostResult(
   exitCode: number | null,
   stdout: string,
   stderr: string,
+  expectedScheduleTaskId?: string,
 ): RemoteRunnerOutboundMessageResult {
   if (exitCode === 0) {
     for (const line of stdout.trim().split('\n').reverse()) {
       if (!line.trim()) continue;
       try {
-        const parsed = JSON.parse(line) as { success?: unknown; messageId?: unknown };
+        const parsed = JSON.parse(line) as {
+          success?: unknown;
+          messageId?: unknown;
+          scheduleSelfCleanup?: unknown;
+        };
         if (parsed.success === true && typeof parsed.messageId === 'string' && parsed.messageId) {
-          return { outcome: 'delivered', messageId: parsed.messageId };
+          const rawCleanup = parsed.scheduleSelfCleanup;
+          const cleanup = rawCleanup && typeof rawCleanup === 'object' && !Array.isArray(rawCleanup)
+            ? rawCleanup as Record<string, unknown>
+            : undefined;
+          const normalizedCleanup = cleanup
+            && cleanup.requested === true
+            && typeof cleanup.taskId === 'string'
+            && /^[0-9a-z_]{1,50}$/.test(cleanup.taskId)
+            && (
+              expectedScheduleTaskId === undefined
+              || cleanup.taskId === expectedScheduleTaskId
+            )
+            && typeof cleanup.removed === 'boolean'
+            && (cleanup.replay === undefined || typeof cleanup.replay === 'boolean')
+            && (cleanup.error === undefined || typeof cleanup.error === 'string')
+            ? {
+                requested: true as const,
+                taskId: cleanup.taskId,
+                removed: cleanup.removed,
+                ...(cleanup.replay === true ? { replay: true } : {}),
+                ...(typeof cleanup.error === 'string' ? { error: cleanup.error } : {}),
+              } satisfies RemoteRunnerScheduleSelfCleanup
+            : undefined;
+          const effectiveCleanup = normalizedCleanup ?? (expectedScheduleTaskId
+            ? {
+                requested: true as const,
+                taskId: expectedScheduleTaskId,
+                removed: false,
+                error: 'scheduled self-cleanup result was missing or invalid',
+              }
+            : undefined);
+          return {
+            outcome: 'delivered',
+            messageId: parsed.messageId,
+            ...(effectiveCleanup ? { scheduleSelfCleanup: effectiveCleanup } : {}),
+          };
         }
       } catch { /* keep looking for the CLI's final JSON line */ }
     }
@@ -82,6 +124,16 @@ export async function sendRemoteRunnerOutboundMessage(
   message: RemoteRunnerOutboundMessage,
   context: RemoteRunnerOutboundHostContext,
 ): Promise<RemoteRunnerOutboundMessageResult> {
+  const expectedScheduleTaskId = message.scheduleRemoveSelf
+    ? parseScheduledTurnId(context.turnId) ?? undefined
+    : undefined;
+  if (message.scheduleRemoveSelf && !expectedScheduleTaskId) {
+    return {
+      outcome: 'rejected',
+      code: 'outbound_schedule_task_missing',
+      message: 'Scheduled self-cleanup requires trusted scheduled-turn provenance.',
+    };
+  }
   const directory = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-'));
   const contentPath = join(directory, 'content.md');
   writeFileSync(contentPath, message.content, { mode: 0o600 });
@@ -101,6 +153,7 @@ export async function sendRemoteRunnerOutboundMessage(
     'send',
     '--remote-runner-outbound',
     '--response-kind', message.responseKind,
+    ...(message.scheduleRemoveSelf ? ['--schedule-remove-self'] : []),
     ...mentionArgs,
     '--content-file', contentPath,
     ...imagePaths.flatMap(path => ['--images', path]),
@@ -158,7 +211,12 @@ export async function sendRemoteRunnerOutboundMessage(
           });
           return;
         }
-        resolve(classifyRemoteRunnerOutboundHostResult(code, stdout, stderr));
+        resolve(classifyRemoteRunnerOutboundHostResult(
+          code,
+          stdout,
+          stderr,
+          expectedScheduleTaskId,
+        ));
       });
     });
   } finally {

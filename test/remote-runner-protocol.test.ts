@@ -335,11 +335,30 @@ describe('remote runner protocol', () => {
       content: 'final answer',
       responseKind: 'final',
       mention: 'none',
+      scheduleRemoveSelf: true,
     }))).toMatchObject({
       type: 'outbound_message',
       operationId: 'outbound-2',
       responseKind: 'final',
+      scheduleRemoveSelf: true,
     });
+    for (const invalidCleanup of [
+      { responseKind: 'progress', scheduleRemoveSelf: true },
+      { responseKind: 'final', scheduleRemoveSelf: false },
+      { responseKind: 'final', scheduleRemoveSelf: 'true' },
+    ]) {
+      expect(parseRemoteRunnerEventLine(JSON.stringify({
+        protocol: REMOTE_RUNNER_PROTOCOL,
+        version: REMOTE_RUNNER_PROTOCOL_VERSION,
+        type: 'outbound_message',
+        operationId: 'outbound-invalid-cleanup',
+        turnId: 'turn-1',
+        generation: 3,
+        content: 'invalid cleanup',
+        mention: 'none',
+        ...invalidCleanup,
+      }))).toBeUndefined();
+    }
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,

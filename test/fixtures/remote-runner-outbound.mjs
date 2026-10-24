@@ -21,6 +21,7 @@ function outbound(
   mention = 'none',
   mentions = undefined,
   responseKind = 'progress',
+  scheduleRemoveSelf = false,
 ) {
   emit({
     type: 'outbound_message',
@@ -31,6 +32,7 @@ function outbound(
     responseKind,
     mention,
     ...(mentions ? { mentions } : {}),
+    ...(scheduleRemoveSelf ? { scheduleRemoveSelf: true } : {}),
   });
 }
 
@@ -42,6 +44,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       capabilities: [
         'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
         'outbound_message', 'outbound_message_explicit_mention', 'outbound_message_final',
+        'outbound_message_schedule_self_cleanup',
       ],
     });
     return;
@@ -78,6 +81,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       outbound(
         'final-operation', command.turnId, 'final payload',
         'explicit', ['ou_target:Target'], 'final',
+      );
+    } else if (command.content === 'final-cleanup') {
+      expectedResults = 1;
+      outbound(
+        'final-cleanup-operation', command.turnId, 'scheduled payload',
+        'none', undefined, 'final', true,
       );
     }
     return;

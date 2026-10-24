@@ -15,6 +15,7 @@
       "start", "resume", "turn", "cancel", "detach", "reattach", "status",
       "terminal_screen", "terminal_input", "terminal_resize", "outbound_message",
       "outbound_message_explicit_mention", "outbound_message_final",
+      "outbound_message_schedule_self_cleanup",
       "session_tool",
       "session_tool_schedule", "session_tool_schedule_actor"
     ],
@@ -119,6 +120,7 @@ provider 可以额外声明三项通用终端能力：
 
 - `content` 使用 BotMux Markdown；普通文本是其子集，单条最多 32 KiB。
 - `responseKind` 缺省能力只允许 `progress|auxiliary`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明 `outbound_message_final` 时才允许 `final`；该请求通过普通 `botmux send --response-kind final` 投递并成为本轮唯一 Lark final，随后 provider 仍须发送协议 `final|failure` 收口执行生命周期。Host 收到 `delivered` 回执后会把同 turn 的 provider `final` 仅作为生命周期终态，不再投递其中的 transcript 或空结果兜底；`rejected|unknown` 时则保留 provider final，避免用户无结果。旧 host/provider 未双边协商时发送 `final` 会 fail-closed。
+- scheduled turn 需要在 final 投递落账后删除自身任务时，可以在 `final` 事件上附加 presence-only 的 `"scheduleRemoveSelf": true`。Host `requiredCapabilities` 与 provider hello 还必须同时声明 `outbound_message_schedule_self_cleanup`；宿主会把该意图交给普通 `botmux send --response-kind final --schedule-remove-self`，由可信 turn 环境解析当前任务 ID，provider 不能自报 task ID。缺少 capability、非 final 携带、显式 `false` 或 cleanup 回执不可验证都会 fail-closed。
 - `mention` 允许 `none|requester|explicit`。`requester` 仍要通过当前 turn 的精确回复对象与多参与者门禁；`explicit` 必须同时携带非空 `mentions` 字符串数组，并要求 provider 声明 `outbound_message_explicit_mention`。BotMux 把每项原样转为普通 `--mention` 参数：字面 `ou_` 沿用直接透传语义，邮箱、手机号、`union_id` 或姓名是否可解析以及目标群成员校验，完全复用目标 Bot 的 `allowArbitraryMention` 配置，不增加 Remote Runner 专属的“当前话题参与者”限制。
 - `images` 可省略；只允许 PNG/JPEG/GIF/WebP，最多 4 张、解码后合计最多 2 MiB。文件名、MIME、base64 canonical encoding 和文件 magic 都会在协议边界校验；宿主只在私有临时目录物化，并固定转成普通 `botmux send --images`，turn 仍不能发送任意文件、视频或语音。
 - `turnId` 必须等于 active turn，`generation` 必须等于当前 backend state；迟到或跨代事件会 fail-closed。
@@ -133,11 +135,19 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
   "operationId": "progress-1",
   "turnId": "turn-1",
   "generation": 3,
-  "result": { "outcome": "delivered", "messageId": "om_xxx" }
+  "result": {
+    "outcome": "delivered",
+    "messageId": "om_xxx",
+    "scheduleSelfCleanup": {
+      "requested": true,
+      "taskId": "deadbeef",
+      "removed": true
+    }
+  }
 }
 ```
 
-结果为 `delivered|rejected|unknown`。`unknown` 表示平台可能已经接受消息但 BotMux 无法证明结果，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
+结果为 `delivered|rejected|unknown`。请求 scheduled self-cleanup 时，`delivered` 还会携带 `scheduleSelfCleanup`；只有 `removed=true` 才证明当前任务已经删除，`removed=false` 时调用方可原样重试同一 final，宿主 turn-send ledger 会复用已投递消息并只补做删除。Host 从受信 `schedule:<taskId>:<uuid>` turn ID 解析 expected task ID，并用它校验 CLI 回执；final 消息已取得确定 message ID、但 cleanup 回执缺失、非法或 task ID 不匹配时仍保留 `delivered` 以抑制 transcript 重复投递，同时返回该 expected task ID 与 `removed=false`，不能把 cleanup 失败降格成会重发 final 的消息 unknown。`unknown` 表示消息平台是否接受本身无法证明，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
 
 `progress|auxiliary` 写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`；协商后的 `final` 写入终态发送标记，用于抑制同一 turn 随后的 transcript 重复回复。上述 capability 都不属于默认必需集合，只有显式配置它们的部署才会在握手时要求 provider 支持。
 成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 和 `session_tool_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
@@ -177,7 +187,7 @@ Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Act
 - `schedule.add`：只接受 schedule、prompt、名称、执行位置、静默、模型、思考强度和工作日历等结构化任务字段；Chat、Topic root、Bot 和工作目录由当前 Session 推导。
 - `schedule.update|remove|pause|resume|run`：只接受合法任务 ID 和各动作的最小字段，并继续通过现有 daemon mutation route 授权；`self` 只允许当前定时执行自行 pause/remove。
 
-不属于 allowlist 的 ask、handoff、workflow、改名、任意管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急或 attention；`final` 必须单独双边协商 `outbound_message_final`。
+不属于 allowlist 的 ask、handoff、workflow、改名、任意管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急或 attention；`final` 必须单独双边协商 `outbound_message_final`，scheduled self-cleanup 还必须单独双边协商 `outbound_message_schedule_self_cleanup`。
 
 ```json
 {

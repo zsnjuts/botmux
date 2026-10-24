@@ -27,6 +27,9 @@ describe('remote runner config surface', () => {
       .toThrow(/requires session_tool_schedule/);
     expect(() => normalizeRemoteRunnerConfig({ requiredCapabilities: ['outbound_message_final'] }))
       .toThrow(/requires outbound_message/);
+    expect(() => normalizeRemoteRunnerConfig({
+      requiredCapabilities: ['outbound_message', 'outbound_message_schedule_self_cleanup'],
+    })).toThrow(/requires outbound_message_final/);
   });
 
   it('loads remote-runner without embedding credentials or provider endpoints', () => {
