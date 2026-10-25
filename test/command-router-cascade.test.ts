@@ -104,3 +104,19 @@ describe('Codex App / CLI /effort routing', () => {
     expect(classifySlash({ ...input, text: '/effort high\nExplain this command' }).kind).toBe('forward');
   });
 });
+
+describe('/close routing', () => {
+  const input: SlashRouteInput = {
+    text: '/close', context: 'thread', phase: 'none',
+    passthrough: new Set(), coldStartPassthrough: new Set(),
+    senderIsBot: false, acceptSlashFromBots: true,
+  };
+
+  it('never pre-creates a session, with or without an existing route', () => {
+    const expected = { kind: 'daemon', cmd: '/close', content: '/close', sessionPolicy: 'existing_only' };
+    expect(classifySlash(input)).toEqual(expected);
+    expect(classifySlash({ ...input, context: 'new-topic' })).toEqual(expected);
+    expect(classifySlash({ ...input, phase: 'running' })).toEqual(expected);
+    expect(classifySlash({ ...input, phase: 'closed' })).toEqual(expected);
+  });
+});

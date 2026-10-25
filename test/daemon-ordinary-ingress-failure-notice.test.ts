@@ -398,6 +398,46 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ));
   });
 
+  it('does not create a phantom session when /close is repeated after the route is closed', async () => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_already_closed';
+    const queuedControl = vi.fn();
+    const rawText = '/close @_self';
+    const event = makeBotEventData('om_repeat_close', rawText, anchor);
+    event.message.content = JSON.stringify({ text: rawText });
+    event.message.mentions = [{
+      key: '@_self',
+      name: 'TargetBot',
+      id: { open_id: 'ou_self_bot' },
+      id_type: 'open_id',
+    }];
+    const ctx = {
+      ...makeCtx(anchor, 'om_repeat_close'),
+      queuePostAdmissionControl: queuedControl,
+    };
+    const previousMode = process.env.BOTMUX_COORDINATION_MODE;
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      await handleThreadReply(event, ctx);
+    } finally {
+      if (previousMode === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+      else process.env.BOTMUX_COORDINATION_MODE = previousMode;
+    }
+
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(queuedControl).not.toHaveBeenCalled();
+    expect(repliedText()).toContain(tr('cmd.no_active_session', undefined, localeForBot(APP)));
+    expect(repliedText()).not.toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
   it.each([
     ['other-leading', '@_other /close @_self', [
       { key: '@_other', name: 'PeerBot', id: { open_id: 'ou_other_bot' }, id_type: 'open_id' },

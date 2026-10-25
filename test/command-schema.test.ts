@@ -46,7 +46,11 @@ describe('command schema ↔ 冻结的 legacy 集合', () => {
   });
   it('SESSIONLESS / EXISTING_SESSION_ONLY / MULTILINE 逐字相等', () => {
     expect(sorted(withoutIntentional(SESSIONLESS_DAEMON_COMMANDS))).toEqual(sorted(ORACLE_SESSIONLESS_DAEMON_COMMANDS));
-    expect(sorted(withoutIntentional(EXISTING_SESSION_ONLY_DAEMON_COMMANDS))).toEqual(sorted(ORACLE_EXISTING_SESSION_ONLY_DAEMON_COMMANDS));
+    const existingOnlyWithoutClose = new Set(
+      [...withoutIntentional(EXISTING_SESSION_ONLY_DAEMON_COMMANDS)].filter(c => c !== '/close'),
+    );
+    expect(sorted(existingOnlyWithoutClose)).toEqual(sorted(ORACLE_EXISTING_SESSION_ONLY_DAEMON_COMMANDS));
+    expect(commandSpec('/close')).toMatchObject({ sessionPolicy: 'existingOnly' });
     expect(sorted(withoutIntentional(MULTILINE_COMMANDS))).toEqual(sorted(ORACLE_MULTILINE_COMMANDS));
   });
   it('子集关系与不相交关系（command-trigger 的 reservedCommandKind 依赖它）', () => {
