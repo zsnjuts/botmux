@@ -2271,6 +2271,81 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
+  it('terminally ignores a control for a Session replaced at the same root', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-replaced-session-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'peer-owner' });
+    const successor = session({
+      sessionId: 'session-2',
+      status: 'closed',
+      closedAt: '2026-10-09T01:00:00.000Z',
+    });
+    await admitDurableLarkSession({ facade, message: message(), session: successor });
+    const materializeClosedSession = vi.fn((value: Session) => value);
+    const takeOverActiveSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession,
+      takeOverActiveSession,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'not_local' }),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = directControl('trusted-host', 'handoff', 'retiring-owner');
+
+    await expect(runtime.resolve(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({
+      kind: 'ignored',
+      reason: 'canonical Session was replaced',
+      settleExistingOperation: {
+        result: {
+          action: 'handoff',
+          status: 'closed',
+          applied: false,
+          ignored: true,
+        },
+        evidence: {
+          source: 'canonical-session',
+          action: 'handoff',
+          status: 'closed',
+        },
+      },
+    });
+
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'canonical Session was replaced',
+    });
+    expect(await store.readControlOperation(input.control.operationId)).toBeUndefined();
+    expect(materializeClosedSession).not.toHaveBeenCalled();
+    expect(takeOverActiveSession).not.toHaveBeenCalled();
+    await facade.stop();
+    await store.close();
+  });
+
   it('proactively reattaches a handed-off Remote Runner and settles after readiness', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-peer-handoff-'));
     tempDirs.push(dir);
