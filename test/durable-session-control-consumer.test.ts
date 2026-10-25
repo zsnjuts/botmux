@@ -202,11 +202,13 @@ describe('durable session control consumer', () => {
       },
       concurrency: 2,
       batchSize: 1,
-      intervalMs: 60_000,
+      intervalMs: 10,
       now: () => now,
     });
     await consumer.ready;
-    expect(new Set(dispatched)).toEqual(new Set(['session-a', 'session-b']));
+    await vi.waitFor(() => {
+      expect(new Set(dispatched)).toEqual(new Set(['session-a', 'session-b']));
+    });
     await consumer.stop();
     await store.close();
   });
@@ -234,11 +236,13 @@ describe('durable session control consumer', () => {
       },
       concurrency: 2,
       batchSize: 1,
-      intervalMs: 60_000,
+      intervalMs: 10,
       now: () => now,
     });
     await consumer.ready;
-    expect(new Set(dispatched)).toEqual(new Set(['session-remote-a', 'session-remote-b']));
+    await vi.waitFor(() => {
+      expect(new Set(dispatched)).toEqual(new Set(['session-remote-a', 'session-remote-b']));
+    });
     await consumer.stop();
     await store.close();
   });
@@ -437,6 +441,95 @@ describe('durable session control consumer', () => {
       partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
       leaseDurationMs: 100,
     })).toMatchObject({ attempts: 2 });
+    await store.close();
+  });
+
+  it('closes prefix fanout after fallback races a live exact owner', async () => {
+    let now = 10;
+    let ownerReads = 0;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    await store.enqueueInbox(controlEvent('session-b', 'evt-b', 2));
+    await store.enqueueInbox(controlEvent('session-c', 'evt-c', 3));
+    await store.enqueueInbox(controlEvent('session-d', 'evt-d', 4));
+    const retryInboxClaim = vi.spyOn(store, 'retryInboxClaim');
+    let liveOwner = true;
+    const dispatched: string[] = [];
+    const dispatch = vi.fn(async (control: { sessionId: string }) => {
+      dispatched.push(control.sessionId);
+      if (liveOwner) {
+        throw new DurableSessionControlOwnerHandoffError(
+          'exact owner still holds the lease',
+        );
+      }
+      return { kind: 'settled' as const };
+    });
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-prefix-race',
+      ownedPartitionKeys: () => {
+        ownerReads += 1;
+        if (ownerReads === 1) now += 1_000;
+        return [];
+      },
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      ownerHandoffRetryDelayMs: 100,
+      dispatch,
+      concurrency: 4,
+      batchSize: 2,
+      intervalMs: 10,
+      now: () => now,
+    });
+    await consumer.ready;
+
+    // The single broad probe discovers the live owner and is requeued quickly,
+    // but the other production-default slots must not steal sessions b-d while
+    // that probe is unresolved.
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(retryInboxClaim).toHaveBeenCalledOnce();
+    expect(retryInboxClaim).toHaveBeenCalledWith(expect.objectContaining({
+      visibleAt: 1_110,
+    }));
+    const claimB = await store.claimNextInbox({
+      workerId: 'exact-owner-b',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-b')],
+      leaseDurationMs: 100,
+    });
+    expect(claimB).toMatchObject({ attempts: 1 });
+    expect(await store.completeInboxClaim(claimB!)).toMatchObject({ kind: 'applied' });
+    const claimC = await store.claimNextInbox({
+      workerId: 'exact-owner-c',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-c')],
+      leaseDurationMs: 100,
+    });
+    expect(claimC).toMatchObject({ attempts: 1 });
+    expect(await store.completeInboxClaim(claimC!)).toMatchObject({ kind: 'applied' });
+    const claimD = await store.claimNextInbox({
+      workerId: 'exact-owner-d',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-d')],
+      leaseDurationMs: 100,
+    });
+    expect(claimD).toMatchObject({ attempts: 1 });
+    expect(await store.completeInboxClaim(claimD!)).toMatchObject({ kind: 'applied' });
+    expect(await store.claimNextInbox({
+      workerId: 'exact-owner-a-too-early',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      leaseDurationMs: 100,
+    })).toBeUndefined();
+
+    // Once the previous owner really disappears, the next periodic probe must
+    // reopen and settle the same row rather than leaving fallback disabled.
+    liveOwner = false;
+    now = 2_110;
+    await vi.waitFor(() => {
+      expect(dispatched).toEqual(['session-a', 'session-a']);
+    });
+    await consumer.stop();
     await store.close();
   });
 

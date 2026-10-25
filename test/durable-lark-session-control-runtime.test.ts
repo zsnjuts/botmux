@@ -590,6 +590,7 @@ describe('durable Lark session control runtime', () => {
     operatorAllowed = true;
     expect(runtime.ownedPartitionKeys()).toEqual([
       'lark-session-control:cli_test:interactive:session-1',
+      'lark-session-control:cli_test:session-1',
     ]);
     const dispatch = createDurableSessionControlDispatch({
       store,
@@ -690,6 +691,7 @@ describe('durable Lark session control runtime', () => {
 
     expect(makeRuntime(ownerFacade).ownedPartitionKeys()).toEqual([
       'lark-session-control:cli_test:interactive:session-1',
+      'lark-session-control:cli_test:session-1',
     ]);
     expect(makeRuntime(standbyFacade).ownedPartitionKeys()).toEqual([]);
 
