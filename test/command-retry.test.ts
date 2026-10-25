@@ -443,6 +443,105 @@ describe('/retry command', () => {
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'om_msg_001');
   });
 
+  it('uses the injected durable submitter and delays success until post-admission delivery', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    deps.submitRetryTurn = vi.fn(async () => ({ kind: 'accepted' as const }));
+    deps.postAdmissionReply = vi.fn(async () => 'out_command_reply');
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(deps.submitRetryTurn).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      turnId: 'om_msg_001',
+      userPrompt: 'fix the flaky test',
+      trustedCaller: expect.objectContaining({
+        requestUserOpenId: 'ou_sender',
+        senderType: 'user',
+      }),
+      payload: expect.objectContaining({
+        content: '<user-prompt>fix the flaky test</user-prompt>',
+      }),
+    }));
+    expect(sendWorkerInput).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(deps.postAdmissionReply).toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('已重新提交'),
+    );
+    expect(deps.sessionReply).not.toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('已重新提交'),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('keeps reply identity but withholds success while a durable provider receipt is pending', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    deps.submitRetryTurn = vi.fn(async () => ({ kind: 'retry' as const, inputAccepted: true }));
+    deps.postAdmissionReply = vi.fn(async () => 'out_command_reply');
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(ds.session.replyTargets?.om_msg_001).toBeDefined();
+    expect(ds.session.turnReplyContexts?.om_msg_001).toBeDefined();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(rememberLastCliInput).not.toHaveBeenCalled();
+    expect(deps.postAdmissionReply).not.toHaveBeenCalled();
+    expect(deps.sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('rolls back reply identity when durable admission retries before worker acceptance', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    deps.submitRetryTurn = vi.fn(async () => ({ kind: 'retry' as const, inputAccepted: false }));
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(ds.session.replyTargets?.om_msg_001).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.om_msg_001).toBeUndefined();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(deps.sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('bypasses retry cooldown when the exact durable command turn is replaying a commit receipt', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({
+        lastFailedTurn: makeFailedTurn({ lastRetryAt: new Date().toISOString() }),
+      }),
+    });
+    const deps = makeDeps(ds);
+    deps.isRetryTurnCommitted = vi.fn(() => true);
+    deps.submitRetryTurn = vi.fn(async () => ({ kind: 'accepted' as const }));
+    deps.postAdmissionReply = vi.fn(async () => 'out_command_reply');
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(deps.isRetryTurnCommitted).toHaveBeenCalledWith(ds, 'om_msg_001');
+    expect(deps.submitRetryTurn).toHaveBeenCalledOnce();
+    expect(deps.postAdmissionReply).toHaveBeenCalledOnce();
+    expect(deps.sessionReply).not.toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('重试冷却中'),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
   it('forks a fresh worker when the current one is dead', async () => {
     const ds = makeDaemonSession({
       worker: { killed: true } as any,

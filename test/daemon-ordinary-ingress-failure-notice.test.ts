@@ -2,6 +2,7 @@ import {
   __testOnly_durablePrimaryWorkerAdmission,
   __testOnly_handleDocComment,
   __testOnly_recordDurablePrimaryInputCommit,
+  __testOnly_submitDurablePrimaryRetryTurn,
 } from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
 /**
@@ -621,6 +622,159 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       expect.objectContaining({ turnId, dispatchAttempt: 7, workerGeneration: 5 }),
     ]);
     expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('submits a dead-worker /retry with durable metadata and reuses its exact receipt', async () => {
+    const anchor = 'om_thread_primary_retry_dead_worker';
+    const turnId = 'om_primary_retry_command';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.workerGeneration = 8;
+    ds.session.workerGeneration = 8;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 3,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    mocks.forkWorker.mockImplementationOnce((target: any, payload: any, resume: any, options: any) => {
+      expect(payload).toMatchObject({ content: '<failed-turn>retry me</failed-turn>' });
+      expect(resume).toMatchObject({
+        resume: true,
+        turnId,
+        dispatchAttempt: 3,
+        durablePrimaryInbox: true,
+        trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }),
+      });
+      target.workerGeneration = 9;
+      target.session.workerGeneration = 9;
+      target.worker = { killed: false, send: vi.fn() };
+      options.onAdmission?.('accepted');
+      setImmediate(() => {
+        __testOnly_recordDurablePrimaryInputCommit(target, {
+          type: 'turn_input_committed',
+          turnId,
+          dispatchAttempt: 3,
+          durablePrimaryInbox: true,
+        }, 9);
+      });
+      return true;
+    });
+
+    const input = {
+      ds,
+      payload: { content: '<failed-turn>retry me</failed-turn>' },
+      turnId,
+      trustedCaller: {
+        requestLarkAppId: APP,
+        requestUserOpenId: OWNER,
+        senderType: 'user' as const,
+      },
+      userPrompt: 'retry me',
+    };
+    await expect(__testOnly_submitDurablePrimaryRetryTurn(ctx, input)).resolves.toEqual({
+      kind: 'accepted',
+    });
+
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId,
+      caller: { requestUserOpenId: OWNER },
+      userPrompt: 'retry me',
+    });
+    expect(ds.session.durablePrimaryInputCommits).toEqual([
+      expect.objectContaining({ turnId, dispatchAttempt: 3, workerGeneration: 9 }),
+    ]);
+
+    mocks.forkWorker.mockClear();
+    const replayCtx = makeCtx(anchor, turnId);
+    replayCtx.durablePrimaryDispatch = {
+      attempt: 4,
+      signal: new AbortController().signal,
+    };
+    replayCtx.queuePostAdmissionOutput = vi.fn();
+    await expect(__testOnly_submitDurablePrimaryRetryTurn(replayCtx, input)).resolves.toEqual({
+      kind: 'accepted',
+    });
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(replayCtx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('routes a primary /retry success through the post-admission Outbox queue', async () => {
+    const anchor = 'om_thread_primary_retry_command_route';
+    const turnId = 'om_primary_retry_command_route_turn';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.workerGeneration = 10;
+    ds.session.workerGeneration = 10;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    ds.session.lastFailedTurn = {
+      turnId: 'om_failed_before_retry',
+      userPrompt: 'finish the durable task',
+      cliInput: '<failed-turn>finish the durable task</failed-turn>',
+      failedAt: new Date(Date.now() - 30_000).toISOString(),
+      errorCode: 'provider_unexpected_eof',
+      status: 'failed',
+      retryCount: 0,
+    };
+    const queuePostAdmissionOutput = vi.fn();
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 6,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+
+    mocks.forkWorker.mockImplementationOnce((target: any, payload: any, resume: any, options: any) => {
+      expect(payload).toMatchObject({
+        content: '<failed-turn>finish the durable task</failed-turn>',
+      });
+      expect(resume).toMatchObject({
+        turnId,
+        dispatchAttempt: 6,
+        durablePrimaryInbox: true,
+      });
+      target.workerGeneration = 11;
+      target.session.workerGeneration = 11;
+      target.worker = { killed: false, send: vi.fn() };
+      options.onAdmission?.('accepted');
+      setImmediate(() => {
+        __testOnly_recordDurablePrimaryInputCommit(target, {
+          type: 'turn_input_committed',
+          turnId,
+          dispatchAttempt: 6,
+          durablePrimaryInbox: true,
+        }, 11);
+      });
+      return true;
+    });
+
+    await handleThreadReply(makeEventData(turnId, '/retry', anchor), ctx);
+
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      target: { kind: 'reply', messageId: anchor, replyInThread: true },
+      content: expect.stringContaining('已重新提交'),
+      msgType: 'text',
+      providerUuid: expect.stringMatching(/^command_reply_[a-f0-9]{24}$/),
+      hookContext: { sessionId: ds.session.sessionId, turnId },
+    }));
+    expect(repliedText()).not.toContain('已重新提交');
+    expect(ds.session.lastFailedTurn).toMatchObject({
+      turnId: 'om_failed_before_retry',
+      retryCount: 1,
+    });
+    expect(ds.session.durablePrimaryInputCommits).toEqual([
+      expect.objectContaining({ turnId, dispatchAttempt: 6, workerGeneration: 11 }),
+    ]);
   });
 
   it('replays a queued activation journal after worker death before the durable follower', async () => {

@@ -591,6 +591,30 @@ export interface CommandHandlerDeps {
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
+  /** Durable-primary only: whether this exact command turn already has a
+   * provider-submit receipt. A replay of the same Inbox claim must bypass the
+   * user-facing retry cooldown and finish canonical admission without sending
+   * the failed prompt to the worker a second time. */
+  isRetryTurnCommitted?: (ds: DaemonSession, turnId: string) => boolean;
+  /** Durable-primary only: submit `/retry` through the same worker-receipt
+   * boundary as an ordinary IM turn. Non-primary callers omit this dependency
+   * and retain the local send/fork path below. */
+  submitRetryTurn?: (input: {
+    ds: DaemonSession;
+    payload: CliTurnPayload;
+    turnId: string;
+    trustedCaller?: TrustedCaller;
+    userPrompt: string;
+  }) => Promise<
+    | { kind: 'accepted' }
+    | { kind: 'retry'; inputAccepted: boolean }
+    | { kind: 'handled' }
+    | { kind: 'rejected' }
+  >;
+  /** Queue a success reply behind canonical Session admission. `/retry` uses
+   * this in primary mode so “已重新提交” can never overtake the snapshot that
+   * authorizes the retried turn's later output. */
+  postAdmissionReply?: (rootId: string, content: string, msgType?: string) => Promise<string>;
   submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
@@ -3561,7 +3585,9 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.retry.no_failed_turn', undefined, loc));
           break;
         }
-        const cooldownMs = retryCooldownRemaining(failedTurn);
+        const retryTurnId = message.messageId;
+        const replayingCommittedTurn = deps.isRetryTurnCommitted?.(ds, retryTurnId) === true;
+        const cooldownMs = replayingCommittedTurn ? 0 : retryCooldownRemaining(failedTurn);
         if (cooldownMs > 0) {
           await sessionReply(rootId, t('cmd.retry.cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, loc));
           break;
@@ -3579,7 +3605,6 @@ export async function handleCommand(
         // reusing the old id would also bind terminal/output attribution to the
         // wrong Lark message. Freeze the command message as the exact reply and
         // actor context before publishing credentials or touching worker IPC.
-        const retryTurnId = message.messageId;
         const retrySenderType: TrustedCaller['senderType'] = message.senderType === 'user'
           ? 'user'
           : message.senderType === 'bot' || message.senderType === 'app'
@@ -3626,7 +3651,11 @@ export async function handleCommand(
             );
           }
         };
-        let accepted = false;
+        let submission:
+          | { kind: 'accepted' }
+          | { kind: 'retry'; inputAccepted: boolean }
+          | { kind: 'handled' }
+          | { kind: 'rejected' } = { kind: 'rejected' };
         try {
           beginReplyTargetTurn(ds, retryReplyRoot, retryTurnId, new Date().toISOString(), {
             quoteOnly: invocationTarget?.mode === 'quote',
@@ -3649,11 +3678,19 @@ export async function handleCommand(
           });
           sessionStore.updateSession(ds.session);
           await deps.prepareTurn?.(ds, retryTurnId);
-          if (ds.worker && !ds.worker.killed) {
-            accepted = sendWorkerInput(ds, retryInput, retryTurnId, {
+          if (deps.submitRetryTurn) {
+            submission = await deps.submitRetryTurn({
+              ds,
+              payload: retryInput,
+              turnId: retryTurnId,
+              ...(retryCaller ? { trustedCaller: retryCaller } : {}),
+              userPrompt: failedTurn.userPrompt,
+            });
+          } else if (ds.worker && !ds.worker.killed) {
+            submission = sendWorkerInput(ds, retryInput, retryTurnId, {
               notifyRejection: false,
               ...(retryCaller ? { trustedCaller: retryCaller } : {}),
-            });
+            }) ? { kind: 'accepted' } : { kind: 'rejected' };
           } else {
             let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
             const forked = forkWorker(ds, retryInput, {
@@ -3663,12 +3700,26 @@ export async function handleCommand(
             }, {
               onAdmission: state => { admission = state; },
             });
-            accepted = forked && admission !== undefined && admission !== 'rejected';
+            submission = forked && admission !== undefined && admission !== 'rejected'
+              ? { kind: 'accepted' }
+              : { kind: 'rejected' };
           }
         } catch (err) {
           logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
         }
-        if (!accepted) {
+        if (submission.kind === 'retry') {
+          // Once worker IPC accepted this exact turn, keep its frozen reply
+          // identity while the durable Inbox claim waits for the provider
+          // receipt. Before acceptance the mutation is still safe to undo.
+          if (!submission.inputAccepted) rollbackReplyState();
+          break;
+        }
+        if (submission.kind === 'handled') {
+          // A durable post-admission rejection notice already owns the only
+          // user-visible result for this claim.
+          break;
+        }
+        if (submission.kind !== 'accepted') {
           rollbackReplyState();
           await sessionReply(rootId, t('cmd.retry.submit_failed', undefined, loc));
           break;
@@ -3686,7 +3737,10 @@ export async function handleCommand(
         rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
-        await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
+        const success = t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc);
+        await (deps.postAdmissionReply
+          ? deps.postAdmissionReply(rootId, success)
+          : sessionReply(rootId, success));
         break;
       }
 

@@ -6224,6 +6224,7 @@ function commandDepsForInvocation(input: {
   anchor: string;
   messageId: string;
   replyRootId?: string;
+  ctx?: RoutingContext;
 }): CommandHandlerDeps {
   const replyTarget = resolveInboundReplyTarget({
     scope: input.scope,
@@ -6231,6 +6232,9 @@ function commandDepsForInvocation(input: {
     threadRootId: input.anchor,
     replyRootId: input.replyRootId,
   });
+  const primaryCtx = input.ctx?.durablePrimaryDispatch
+    ? input.ctx
+    : undefined;
   return {
     ...commandDeps,
     invocationReplyTarget: replyTarget,
@@ -6243,6 +6247,58 @@ function commandDepsForInvocation(input: {
         turnId ?? input.messageId,
         opts?.replyTarget ? opts : { ...opts, replyTarget },
       ),
+    ...(primaryCtx
+      ? {
+          isRetryTurnCommitted: (ds: DaemonSession, turnId: string) =>
+            hasDurablePrimaryInputCommit(ds, turnId),
+          submitRetryTurn: (retryInput: {
+            ds: DaemonSession;
+            payload: CliTurnPayload;
+            turnId: string;
+            trustedCaller?: TrustedCaller;
+            userPrompt: string;
+          }) => submitDurablePrimaryRetryTurn(primaryCtx, retryInput),
+          postAdmissionReply: async (_rootId: string, content: string, msgType = 'text') => {
+            if (!primaryCtx.ingressAdmission?.admitted
+                || primaryCtx.ingressAdmission.retryReason
+                || !primaryCtx.queuePostAdmissionOutput) {
+              throw new Error('durable command reply requires successful canonical admission');
+            }
+            const current = activeSessions.get(sessionKey(
+              primaryCtx.runtimeRoutingAnchor ?? input.anchor,
+              primaryCtx.larkAppId,
+            ));
+            const target: DurableLarkOutboxTarget = current
+              ? durableOutboxTargetForTurn(current, input.messageId)
+              : replyTarget.mode === 'plain'
+                ? { kind: 'send', chatId: replyTarget.chatId }
+                : {
+                    kind: 'reply',
+                    messageId: replyTarget.rootMessageId,
+                    replyInThread: replyTarget.mode === 'thread',
+                  };
+            const providerUuid = `command_reply_${createHash('sha256')
+              .update(JSON.stringify([
+                primaryCtx.larkAppId,
+                input.messageId,
+                msgType,
+                content,
+              ]))
+              .digest('hex')
+              .slice(0, 24)}`;
+            primaryCtx.queuePostAdmissionOutput({
+              target,
+              content,
+              msgType,
+              providerUuid,
+              ...(current
+                ? { hookContext: { sessionId: current.session.sessionId, turnId: input.messageId } }
+                : {}),
+            });
+            return `out_${providerUuid}`;
+          },
+        }
+      : {}),
   };
 }
 
@@ -23331,6 +23387,26 @@ function hasDurablePrimaryInputCommit(ds: DaemonSession, turnId: string): boolea
   return ds.session.durablePrimaryInputCommits?.some(item => item.turnId === turnId) === true;
 }
 
+function durablePrimaryTurnDisposition(
+  ds: DaemonSession,
+  turnId: string,
+): ReturnType<typeof durablePrimaryExistingTurnDisposition> {
+  return durablePrimaryExistingTurnDisposition({
+    session: ds.session,
+    worker: ds.worker,
+    cliReady: ds.cliReady,
+    activeInteractiveTurn: ds.activeInteractiveTurn,
+    // Durable queued-activation state is recovery input, not proof that a live
+    // handler owns this dead worker generation. Only a pending repository
+    // choice or another handler's live claim token blocks a cold refork.
+    workerStartBlocker: ds.pendingRepo === true
+      ? 'pending-repo'
+      : ds.initialStartPending === true && ds.initialStartClaimToken !== undefined
+        ? 'in-flight-claim'
+        : undefined,
+  }, turnId);
+}
+
 function retryDurablePrimaryIngress(ctx: RoutingContext, reason: string): boolean {
   if (!ctx.durablePrimaryDispatch) return false;
   ctx.ingressAdmission ??= { admitted: false };
@@ -23509,6 +23585,112 @@ function durablePrimaryWorkerAdmission(
 }
 
 export const __testOnly_durablePrimaryWorkerAdmission = durablePrimaryWorkerAdmission;
+
+type DurablePrimaryRetrySubmission =
+  | { kind: 'accepted' }
+  | { kind: 'retry'; inputAccepted: boolean }
+  | { kind: 'handled' }
+  | { kind: 'rejected' };
+
+/** Submit `/retry` through the ordinary durable-primary worker-receipt gate.
+ * The command handler owns reply-identity rollback and retry bookkeeping; this
+ * daemon seam owns Inbox replay, worker IPC metadata and receipt waiting. */
+async function submitDurablePrimaryRetryTurn(
+  ctx: RoutingContext,
+  input: {
+    ds: DaemonSession;
+    payload: CliTurnPayload;
+    turnId: string;
+    trustedCaller?: TrustedCaller;
+    userPrompt: string;
+  },
+): Promise<DurablePrimaryRetrySubmission> {
+  const dispatch = ctx.durablePrimaryDispatch;
+  if (!dispatch) return { kind: 'rejected' };
+  const { ds, payload, turnId, trustedCaller, userPrompt } = input;
+  const disposition = durablePrimaryTurnDisposition(ds, turnId);
+  if (disposition === 'committed') {
+    markIngressAdmitted(ctx);
+    return { kind: 'accepted' };
+  }
+  if (disposition === 'retry') {
+    retryDurablePrimaryIngress(ctx, 'session has an unfinished turn');
+    return { kind: 'retry', inputAccepted: false };
+  }
+
+  let inputAccepted = false;
+  if (ds.worker && !ds.worker.killed) {
+    inputAccepted = sendWorkerInput(ds, payload, turnId, {
+      dispatchAttempt: dispatch.attempt,
+      durablePrimaryInbox: true,
+      notifyRejection: false,
+      ...(trustedCaller ? { trustedCaller } : {}),
+    });
+  } else {
+    let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+    const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, turnId);
+    const primaryOnAdmission = primaryAdmission?.options.onAdmission;
+    const forked = forkWorker(ds, payload, {
+      resume: ds.hasHistory,
+      turnId,
+      dispatchAttempt: dispatch.attempt,
+      durablePrimaryInbox: true,
+      ...(trustedCaller ? { trustedCaller } : {}),
+      onIpcDispatchAttempted: () => { inputAccepted = true; },
+    }, {
+      ...primaryAdmission?.options,
+      onAdmission: state => {
+        admission = state;
+        primaryOnAdmission?.(state);
+      },
+    });
+    primaryAdmission?.markForkReturned();
+    await primaryAdmission?.waitIfMarginal();
+    if (admission === 'rejected') {
+      // durablePrimaryWorkerAdmission already queued the exact rejection behind
+      // canonical admission. It is the terminal user-visible result; never add
+      // a contradictory generic submit-failed line.
+      markIngressAdmitted(ctx);
+      return { kind: 'handled' };
+    }
+    inputAccepted = forked && admission !== undefined;
+  }
+
+  if (!inputAccepted) {
+    retryDurablePrimaryIngress(ctx, 'retry worker did not accept input');
+    return { kind: 'retry', inputAccepted: false };
+  }
+
+  // Fence exact-claim replay while the asynchronous provider receipt is in
+  // flight. This is deliberately not the persisted retry/cooldown mutation;
+  // the command handler applies that once, only after receipt proof exists.
+  if (trustedCaller) {
+    ds.activeInteractiveTurn = {
+      turnId,
+      caller: { ...trustedCaller },
+      ...(userPrompt.trim() ? { userPrompt } : {}),
+    };
+  }
+  markIngressAdmitted(ctx);
+  try {
+    await waitForDurablePrimaryInputCommit(ds, turnId, dispatch.signal);
+  } catch (error) {
+    // Ownership loss leaves the Inbox row recoverable on another claimant.
+    // Do not let command-handler's broad catch turn that into a direct
+    // submit-failed side effect from the stale owner.
+    if (dispatch.signal.aborted) return { kind: 'retry', inputAccepted: true };
+    retryDurablePrimaryIngress(ctx, 'retry provider submit receipt is still pending');
+    logger.warn(
+      `[${tag(ds)}] Durable-primary /retry ${turnId.slice(0, 12)} will retry `
+      + `after provider submit receipt wait failed: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { kind: 'retry', inputAccepted: true };
+  }
+  return { kind: 'accepted' };
+}
+
+export const __testOnly_submitDurablePrimaryRetryTurn = submitDurablePrimaryRetryTurn;
 
 /**
  * 普通消息处理链的终态失败收口：transport 已 ACK（用户看到消息发出去了），但
@@ -26567,21 +26749,7 @@ async function handleThreadReplyAdmitted(
   // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
   // retry must be a pure claim-state transition.
   if (ds && ctx.durablePrimaryDispatch) {
-    const disposition = durablePrimaryExistingTurnDisposition({
-      session: ds.session,
-      worker: ds.worker,
-      cliReady: ds.cliReady,
-      activeInteractiveTurn: ds.activeInteractiveTurn,
-      // Durable queued-activation state is recovery INPUT, not proof that a
-      // live handler already owns this dead worker's generation. Let the cold
-      // path below replay that exact journal. Only a pending repository choice
-      // or another handler's live claim token blocks this refork boundary.
-      workerStartBlocker: ds.pendingRepo === true
-        ? 'pending-repo'
-        : ds.initialStartPending === true && ds.initialStartClaimToken !== undefined
-          ? 'in-flight-claim'
-          : undefined,
-    }, parsed.messageId);
+    const disposition = durablePrimaryTurnDisposition(ds, parsed.messageId);
     if (disposition === 'committed') {
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       markSessionActivity(ds, Date.now(), {
@@ -28377,6 +28545,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       anchor,
       messageId: parsed.messageId,
       replyRootId,
+      ctx,
     });
     const effectiveThreadChatId = existingDs?.chatId ?? chatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, senderOpenId, cmd);
