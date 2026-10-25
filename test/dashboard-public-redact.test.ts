@@ -57,6 +57,8 @@ function sampleSchedules() {
       enabled: true,
       nextRunAt: '2026-06-07T01:00:00Z',
       lastStatus: 'ok',
+      lastError: 'failed to open /root/iserver/customer-secret',
+      boundSessionId: 'session-private-bound',
       prompt: '部署到 /root/iserver/customer-secret 并通知客户',
       workingDir: '/root/iserver/customer-secret',
       hasPrecondition: true,
@@ -159,6 +161,8 @@ describe('redactSchedulesForPublic', () => {
     const out = redactSchedulesForPublic(sampleSchedules()) as any[];
     expect(out[0]).not.toHaveProperty('prompt');
     expect(out[0]).not.toHaveProperty('workingDir');
+    expect(out[0]).not.toHaveProperty('lastError');
+    expect(out[0]).not.toHaveProperty('boundSessionId');
     expect(out[0]).not.toHaveProperty('preconditionScript');
     expect(out[0]).not.toHaveProperty('preconditionFile');
     expect(out[0]).not.toHaveProperty('preconditionFilePath');

@@ -37,11 +37,22 @@ type ScheduleRow = Record<string, any> & {
   preconditionScript?: string;
   preconditionFilePath?: string;
   lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  lastError?: string;
+  boundSessionId?: string;
   model?: string;
   reasoningEffort?: string;
 };
 export function scheduleCalendarLabel(id: string, names: Partial<Record<'zh' | 'en', string>> | undefined, locale: 'zh' | 'en'): string {
   return names?.[locale] ?? names?.zh ?? names?.en ?? id;
+}
+
+/** Browser-only compact label. Keep this local instead of importing the
+ * server-side schedule model, whose timezone fallback reaches node:fs. */
+export function compactDashboardScheduleSessionId(sessionId: string | undefined): string | undefined {
+  const normalized = sessionId?.trim();
+  if (!normalized) return undefined;
+  if (normalized.length <= 16) return normalized;
+  return `${normalized.slice(0, 8)}…${normalized.slice(-4)}`;
 }
 type ScheduleBotOption = {
   larkAppId: string;
@@ -1245,6 +1256,11 @@ function ScheduleRowCard(props: {
             </span>
           ) : null}
           <span>{tr('schedules.delivery')}: {placementLabel(s, tr)}</span>
+          {s.boundSessionId ? (
+            <span className="schedule-bound-session-chip" title={s.boundSessionId}>
+              🔗 {tr('schedules.boundSession')}: {compactDashboardScheduleSessionId(s.boundSessionId)}
+            </span>
+          ) : null}
           {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
           {s.model || s.reasoningEffort ? (
             <span title={tr('schedules.modelChipHelp')}>
@@ -1262,6 +1278,11 @@ function ScheduleRowCard(props: {
           {s.calendar ? <span>{tr('schedules.form.calendar')}: {scheduleCalendarLabel(s.calendar, s.calendarCheck?.displayNames ?? s.lastCalendarCheck?.displayNames, locale)} · {tr(`schedules.calendarDayType.${s.calendarDayType ?? 'workday'}`)} · {tr('schedules.calendarNext')}: {fmtScheduleDate(s.nextEligibleRunAt, scheduleTimeZone)} · {s.calendarCheck?.reason ? tr(`schedules.calendarReason.${s.calendarCheck.reason}`) : ''}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
           <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
+          {s.lastStatus === 'error' && s.lastError ? (
+            <span className="schedule-last-error" title={s.lastError}>
+              ⚠️ {tr('schedules.lastError')}: {s.lastError}
+            </span>
+          ) : null}
           {repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}
         </div>
       </OverviewListMain>

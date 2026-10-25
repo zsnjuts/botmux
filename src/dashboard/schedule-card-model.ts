@@ -26,6 +26,7 @@ import type {
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PROMPT_TRUNCATE = 200;
+const DEFAULT_ERROR_TRUNCATE = 500;
 const DEFAULT_NEXT_RUNS_COUNT = 5;
 
 /** Minimal task input — self-contained so PR1 model does not pull in `ScheduledTask`. */
@@ -55,6 +56,9 @@ export interface ScheduleCardTaskInput {
   /** ISO of the last completed run. */
   lastRunAt?: string;
   lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  lastError?: string;
+  /** Exact logical Session retained by an opt-in fixed-topic task. */
+  boundSessionId?: string;
   /** Repeat counter shape mirrors `ScheduledTask.repeat` (`src/types.ts:212`):
    *  `times === null` ⇒ forever; finite `times` ⇒ auto-removes after N runs.
    *  `completed` counts how many runs have fired. */
@@ -133,6 +137,8 @@ export interface ScheduleDetailDto {
   nextRunAt?: string;
   lastRunAt?: string;
   lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  lastError?: string;
+  boundSessionId?: string;
   errorIndicator: boolean;
   /** Passthrough of `ScheduledTask.repeat`. */
   repeat?: { times: number | null; completed: number };
@@ -199,6 +205,15 @@ export function computeButtonAvailability(task: ScheduleCardTaskInput): Schedule
 
 export function normalizeScheduleDelivery(deliver: ScheduleCardTaskInput['deliver']): ScheduleDelivery {
   return deliver === 'new-topic' || deliver === 'local' ? deliver : 'origin';
+}
+
+/** Compact a Session id for dense rows while leaving the full value available
+ * to detail views and title attributes. */
+export function compactScheduleSessionId(sessionId: string | undefined): string | undefined {
+  const normalized = sessionId?.trim();
+  if (!normalized) return undefined;
+  if (normalized.length <= 16) return normalized;
+  return `${normalized.slice(0, 8)}…${normalized.slice(-4)}`;
 }
 
 /** Resolve the user-facing execution position from the captured session anchor. */
@@ -292,6 +307,9 @@ export function toScheduleDetailDto(task: ScheduleCardTaskInput, ctx: RowRenderC
   const promptRaw = task.prompt ?? '';
   const promptTruncated = promptRaw.length > truncateAt;
   const prompt = promptTruncated ? `${promptRaw.slice(0, truncateAt)}…` : promptRaw;
+  const lastError = task.lastError && task.lastError.length > DEFAULT_ERROR_TRUNCATE
+    ? `${task.lastError.slice(0, DEFAULT_ERROR_TRUNCATE)}…`
+    : task.lastError;
 
   return {
     id: task.id,
@@ -309,6 +327,8 @@ export function toScheduleDetailDto(task: ScheduleCardTaskInput, ctx: RowRenderC
     nextRunAt: task.nextRunAt,
     lastRunAt: task.lastRunAt,
     lastStatus: task.lastStatus,
+    lastError,
+    boundSessionId: task.boundSessionId,
     errorIndicator: task.lastStatus === 'error',
     repeat: task.repeat,
     actions: computeButtonAvailability(task),

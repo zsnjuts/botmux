@@ -13,6 +13,11 @@ const botConfig = vi.hoisted(() => ({
   cliLaunchMode: undefined as 'forge-traex' | undefined,
   model: undefined as string | undefined,
 }));
+const scheduleTasks = vi.hoisted(() => [] as Array<{
+  boundSessionId?: string;
+  enabled: boolean;
+  disabledReason?: 'once_completed' | 'manual';
+}>);
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
@@ -22,6 +27,10 @@ vi.mock('../src/bot-registry.js', () => ({
       ...botConfig,
     },
   })),
+}));
+
+vi.mock('../src/services/schedule-store.js', () => ({
+  listTasks: vi.fn(() => scheduleTasks),
 }));
 
 import { buildClosedSessionCard } from '../src/core/closed-session-card.js';
@@ -64,6 +73,7 @@ function markdown(cardJson: string): string {
 
 describe('buildClosedSessionCard — frozen runtime resume identity', () => {
   beforeEach(() => {
+    scheduleTasks.length = 0;
     botConfig.cliRuntime = {
       id: 'current-codex',
       displayName: 'Current Codex',
@@ -74,6 +84,32 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     botConfig.wrapperCli = undefined;
     botConfig.cliLaunchMode = undefined;
     botConfig.model = undefined;
+  });
+
+  it('warns about enabled and paused schedules that remain bound to the closed Session', () => {
+    scheduleTasks.push(
+      { boundSessionId: 'botmux-session', enabled: true },
+      { boundSessionId: 'botmux-session', enabled: false, disabledReason: 'manual' },
+      { boundSessionId: 'botmux-session', enabled: false, disabledReason: 'once_completed' },
+      { boundSessionId: 'another-session', enabled: true },
+    );
+
+    const content = markdown(buildClosedSessionCard(makeSession(), 'zh'));
+
+    expect(content).toContain('仍有 2 个定时任务绑定此会话（1 个已启用）');
+    expect(content).toContain('关闭不会解绑');
+    expect(content).toContain('请暂停或删除任务');
+  });
+
+  it('does not show a binding warning for completed or unrelated schedules', () => {
+    scheduleTasks.push(
+      { boundSessionId: 'botmux-session', enabled: false, disabledReason: 'once_completed' },
+      { boundSessionId: 'another-session', enabled: true },
+    );
+
+    const content = markdown(buildClosedSessionCard(makeSession(), 'zh'));
+
+    expect(content).not.toContain('定时任务绑定此会话');
   });
 
   it('uses the session-frozen executable and display after the bot runtime changes', () => {

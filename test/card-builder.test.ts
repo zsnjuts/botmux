@@ -2234,6 +2234,18 @@ describe('buildSessionClosedCard', () => {
     expect(findMarkdownContent(card)).toContain('/proj/x');
   });
 
+  it('explains that closing does not cancel bound schedules', () => {
+    const card = parse(buildSessionClosedCard(
+      'sess-bound', 'om_root', 'bound topic', 'codex', '/proj/x',
+      'codex resume cdx-uuid', 'zh', undefined, false,
+      { total: 3, enabled: 2 },
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('3 个定时任务绑定此会话');
+    expect(md).toContain('2 个已启用');
+    expect(md).toContain('关闭不会解绑');
+  });
+
   it('shows a fallback note when the CLI cannot resume from CLI args (gemini/opencode)', () => {
     const card = parse(buildSessionClosedCard(
       'sess-3', 'om_root', 'topic', 'opencode', undefined, null,

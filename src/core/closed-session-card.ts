@@ -7,8 +7,10 @@ import { buildSessionClosedCard } from '../im/lark/card-builder.js';
 import type { Session } from '../types.js';
 import { sessionAnchorId, storedSessionAnchorId, type DaemonSession } from './types.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { listTasks } from '../services/schedule-store.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import type { Locale } from '../i18n/index.js';
+import { logger } from '../utils/logger.js';
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -17,6 +19,30 @@ function shellQuote(value: string): string {
 function replaceResumeExecutable(command: string, executable: string): string {
   const rest = command.trim().replace(/^\S+/, '').trimStart();
   return rest ? `${shellQuote(executable)} ${rest}` : shellQuote(executable);
+}
+
+function boundScheduleSummary(
+  sessionId: string,
+  larkAppId: string,
+): { total: number; enabled: number } | undefined {
+  try {
+    const tasks = listTasks(larkAppId).filter(task =>
+      task.boundSessionId === sessionId && task.disabledReason !== 'once_completed');
+    if (tasks.length === 0) return undefined;
+    return {
+      total: tasks.length,
+      enabled: tasks.filter(task => task.enabled).length,
+    };
+  } catch (error) {
+    // A schedule-store read failure must never prevent the close card itself
+    // from being delivered. The close operation has already happened; retain
+    // the normal recovery surface and leave a diagnostic for operators.
+    logger.warn(
+      `[closed-session-card] Failed to inspect bound schedules for ${sessionId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -107,5 +133,6 @@ export function buildClosedSessionCard(
     // resuming reactivates the route but starts a FRESH session — the card
     // must not imply history is restored.
     !cliResumeCommand && resumeStartsFresh({ cliId: closedCliId, cliSessionId: session.cliSessionId }),
+    boundScheduleSummary(closedSessionId, larkAppId),
   );
 }

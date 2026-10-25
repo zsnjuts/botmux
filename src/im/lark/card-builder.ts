@@ -548,10 +548,17 @@ export function buildSessionClosedCard(
   locale?: Locale,
   runtimeDisplayName?: string,
   resumeStartsFresh?: boolean,
+  boundSchedules?: { total: number; enabled: number },
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const dirLine = workingDir ? `\n${t('card.body.working_dir', undefined, locale)}\`${escapeMd(workingDir)}\`` : '';
+  const boundSchedulesLine = boundSchedules && boundSchedules.total > 0
+    ? `\n\n${t('card.body.bound_schedules', {
+        total: String(boundSchedules.total),
+        enabled: String(boundSchedules.enabled),
+      }, locale)}`
+    : '';
   const cmdBlock = cliResumeCommand
     ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
     : resumeStartsFresh
@@ -563,7 +570,8 @@ export function buildSessionClosedCard(
   const body =
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
-    dirLine;
+    dirLine +
+    boundSchedulesLine;
   const card = simpleCard({
     title: t('card.status.session_closed', undefined, locale),
     template: 'grey',
