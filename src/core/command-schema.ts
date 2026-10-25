@@ -66,7 +66,7 @@ export interface CommandSpec {
 }
 
 export const COMMANDS: readonly CommandSpec[] = [
-  { name: '/close', sessionPolicy: 'default', help: ['help.close'] },
+  { name: '/close', sessionPolicy: 'existingOnly', help: ['help.close'] },
   {
     name: '/dismiss', sessionPolicy: 'sessionless', help: ['help.dismiss'],
     notes: '可选恰好一个 `--confirm=<sha256>`；主干会话群解散。无会话也可跑（操作已关闭的登记行）。rebase 2026-09-30 从主干同步',

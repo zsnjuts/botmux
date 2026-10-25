@@ -23,7 +23,7 @@ import {
 
 /** 设计 §10 的字母表：命令 / 子命令 / 透传 / 冷启动 / 未注册 / 多行豁免 / 占位符 / 中文 / latin / 引号 / 大小写。 */
 const ALPHABET = [
-  '/cd', '/repo', 'wt', '/rename', '/sessions', '/card', '/cot', '/term', '/vc-auth',
+  '/cd', '/repo', 'wt', '/rename', '/close', '/sessions', '/card', '/cot', '/term', '/vc-auth',
   '/context-sharing', '/effort', '/queue', '/resume',
   '/compact', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
   '<pane>', '中文', 'latin', '"x y"', '/T',
@@ -88,6 +88,13 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  // 重复 /close 只允许命中既有会话；无会话时不得预建 worker:null 幽灵会话。
+  (input, legacy, next) => input.text.trim().toLowerCase().split(/\s/)[0] === '/close'
+    && legacy.kind === 'daemon' && legacy.cmd === '/close'
+    && (legacy.sessionPolicy === 'precreate' || legacy.sessionPolicy === 'existing')
+    && next.kind === 'daemon' && next.cmd === '/close'
+    && next.content === legacy.content
+    && next.sessionPolicy === 'existing_only',
   // Native Codex /effort now drives the model menu; other CLIs still pass through.
   (input, legacy, next) => input.cliId === 'codex'
     && (legacy.kind === 'passthrough' || (legacy.kind === 'forward' && legacy.reason === 'unknown_slash'))

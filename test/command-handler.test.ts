@@ -10241,6 +10241,20 @@ describe('command guards — no-session / transfer-in-progress replies', () => {
     expect(sessionTexts(deps).filter(x => x === t(key))).toHaveLength(1);
   });
 
+  it('/close 在 primary 且无会话时仍先返回 no-active-session', async () => {
+    const deps = makeDeps();
+    const previousMode = process.env.BOTMUX_COORDINATION_MODE;
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+    } finally {
+      if (previousMode === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+      else process.env.BOTMUX_COORDINATION_MODE = previousMode;
+    }
+    expect(sessionTexts(deps)).toContain(t('cmd.no_active_session'));
+    expect(sessionTexts(deps)).not.toContain(t('cmd.close.primary_unsupported'));
+  });
+
   it('没有 appId 与会话时 /card /cot /term 走各自的「无会话」守卫', async () => {
     for (const cmd of ['/card', '/cot', '/term']) {
       const deps = makeDeps();

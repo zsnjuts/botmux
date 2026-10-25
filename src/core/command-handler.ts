@@ -2291,6 +2291,13 @@ export async function handleCommand(
       }
 
       case '/close': {
+        // `/close` 只作用于既有会话。关闭后的同一话题再次收到命令时，先返回
+        // no-active-session；不能让 primary 的本地关闭拒绝文案掩盖缺席状态，也
+        // 不能让入口为这条重复命令预建 worker:null 的幽灵会话。
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
         // primary 的无参数 /close 会在 daemon 入口转交 durable control。
         // 能落到这里的请求（含 /close wt 和卡片确认）都不能再执行本地关闭、
         // sibling 回收或 worktree 删除；否则其它副本仍会保留旧的权威状态。
