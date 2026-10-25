@@ -317,9 +317,7 @@ export function createDurableLarkSessionControlRuntime(
     const canonicalSession = canonical
       ? parseDurablePrimarySessionRecord(canonical).session
       : undefined;
-    if (!canonicalSession
-        || canonicalSession.larkAppId !== options.larkAppId
-        || canonicalSession.sessionId !== control.sessionId) {
+    if (!canonicalSession || canonicalSession.larkAppId !== options.larkAppId) {
       throw new Error('durable lifecycle control canonical Session is unavailable');
     }
     const terminalIgnore = (reason: string) => ({
@@ -343,6 +341,13 @@ export function createDurableLarkSessionControlRuntime(
         } as unknown as DurableJson,
       },
     });
+    // A closed Session may be replaced by a new logical Session at the same
+    // conversation root. Controls for the retired session can never become
+    // applicable again; retrying them would permanently head-of-line block
+    // every newer control in that retired session's FIFO partition.
+    if (canonicalSession.sessionId !== control.sessionId) {
+      return terminalIgnore('canonical Session was replaced');
+    }
     if (control.action === 'resume' && canonicalSession.status !== 'closed') {
       return terminalIgnore('canonical Session is no longer closed');
     }
