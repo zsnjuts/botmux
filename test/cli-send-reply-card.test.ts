@@ -15,6 +15,7 @@ import { bindGroupContextDelivery, confirmGroupContextDelivery, getDeliveredGrou
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import { DEFAULT_BRAND_LABEL } from '../src/im/lark/md-card.js';
 import MarkdownIt from 'markdown-it';
+import { scheduledFinalDeliveryElementId } from '../src/core/scheduled-final-delivery-proof.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' };
@@ -289,7 +290,7 @@ describe('real CLI send into a running reply card', () => {
 
   it.each([
     ['isolated (no host secret): hands the row to the daemon', false],
-    ['host (secret readable): reports the local failure, no relay', true],
+    ['host (secret readable): reports the trusted final receipt to the daemon', true],
   ])('when the feedback store cannot be opened — %s', (_label, hostSecret) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-index-'));
     const dataDir = join(root, 'data');
@@ -316,6 +317,7 @@ describe('real CLI send into a running reply card', () => {
         ...key,
         status: 'active',
         cliId: 'claude-code',
+        workerGeneration: 7,
         chatId: 'oc_test',
         rootMessageId: 'om_root',
         scope: 'thread',
@@ -360,23 +362,108 @@ describe('real CLI send into a running reply card', () => {
       const posts = requests.filter(r => r.method === 'POST');
       expect(posts[0]).toMatchObject({ path: `/api/sessions/${key.sessionId}/durable-send` });
       const relayed = posts.filter(r => r.path.endsWith('/turn-delivery'));
-      if (hostSecret) {
-        expect(relayed).toHaveLength(0);
-        expect(String(result.stderr)).toContain('turn delivery indexing failed after delivery');
-      } else {
-        expect(posts).toHaveLength(2);
-        expect(posts[1]).toMatchObject({
-          method: 'POST',
-          path: `/api/sessions/${key.sessionId}/turn-delivery`,
-          body: { messageId: 'om_durable_message' },
-        });
-        expect(posts[1].body.content).toContain('Indexed final');
-        // Correlation fields are the daemon's to derive, never the CLI's.
-        for (const field of ['turnId', 'sessionId', 'chatId', 'botAppId', 'policy']) {
-          expect(posts[1].body).not.toHaveProperty(field);
-        }
-        expect(String(result.stderr)).not.toContain('turn delivery indexing failed');
+      expect(relayed).toHaveLength(1);
+      expect(posts).toHaveLength(2);
+      expect(relayed[0]).toMatchObject({
+        method: 'POST',
+        path: `/api/sessions/${key.sessionId}/turn-delivery`,
+        body: { messageId: 'om_durable_message', responseKind: 'final' },
+      });
+      expect(relayed[0].body.content).toContain('Indexed final');
+      // Correlation fields are the daemon's to derive, never the CLI's.
+      for (const field of ['turnId', 'sessionId', 'chatId', 'botAppId', 'policy']) {
+        expect(relayed[0].body).not.toHaveProperty(field);
       }
+      expect(String(result.stderr)).not.toContain('turn delivery indexing failed');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
+  it('reports an ordinary local-backend scheduled final through trusted daemon IPC', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-scheduled-receipt-'));
+    const dataDir = join(root, 'data');
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000031';
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId,
+      }));
+      mkdirSync(join(root, '.botmux'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, '.botmux', '.dashboard-secret'), 'host-secret', { mode: 0o600 });
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId,
+        larkAppSecret: 'test-secret',
+        cliId: 'claude-code',
+        replyCardMode: 'legacy',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key,
+        status: 'active',
+        cliId: 'claude-code',
+        workerGeneration: 7,
+        chatId: 'oc_test',
+        rootMessageId: 'om_root',
+        scope: 'thread',
+        chatType: 'group',
+        workingDir: root,
+        replyTargets: { [turnId]: {
+          updatedAt: new Date().toISOString(),
+          senderOpenId: 'ou_requester',
+          participants: [{ openId: 'ou_requester', isBot: false }],
+        } },
+        turnReplyContexts: { [turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_root' },
+          replyTargetSenderOpenId: 'ou_requester',
+          replyTargetSenderIsBot: false,
+        } },
+      } });
+
+      const result = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--response-kind', 'final', 'Scheduled local final',
+      ], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: {
+          PATH: process.env.PATH,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId,
+          BOTMUX_TURN_ID: turnId,
+          BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_DAEMON_IPC_PORT: '7951',
+          BOTMUX_TEST_DURABLE_SEND: '1',
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+
+      expect(result.status, String(result.stderr)).toBe(0);
+      const providerReply = String(result.stdout).split('\n')
+        .find(line => line.startsWith('CAPTURE_REPLY='));
+      expect(providerReply).toBeDefined();
+      const daemonPosts = String(result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      const receiptPosts = daemonPosts.filter(request =>
+        request.method === 'POST' && request.path.endsWith('/turn-delivery'));
+      const receiptProof = scheduledFinalDeliveryElementId({ turnId, workerGeneration: 7 })!;
+      expect(JSON.parse(providerReply!.slice('CAPTURE_REPLY='.length)).body.content)
+        .toContain(receiptProof);
+      expect(receiptPosts).toHaveLength(1);
+      expect(receiptPosts[0]).toMatchObject({
+        method: 'POST',
+        path: `/api/sessions/${key.sessionId}/turn-delivery`,
+        body: {
+          messageId: 'om_separate_message',
+          content: 'Scheduled local final',
+          responseKind: 'final',
+          receiptTurnId: turnId,
+          receiptWorkerGeneration: 7,
+          receiptProof,
+        },
+      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

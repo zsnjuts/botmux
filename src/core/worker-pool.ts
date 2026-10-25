@@ -767,6 +767,10 @@ import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cl
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
 import {
+  observeScheduledRunDaemonProviderDelivery,
+  observeScheduledRunTerminal,
+} from './scheduled-run-settlement.js';
+import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
   readScheduledTaskForProvenance,
@@ -13600,7 +13604,12 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
-      forkWorker(ds, promptInput, resumeOrTurnId);
+      forkWorker(ds, promptInput, resumeOrTurnId, opts);
+    } else {
+      // The deferred spawn owned this caller's exact admission lifecycle. If
+      // activation closed/replaced the Session, explicitly terminate that
+      // lifecycle instead of leaving a scheduler receipt pending forever.
+      opts.onAdmission?.('rejected');
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -14341,6 +14350,13 @@ export function forkWorker(
   worker.on('error', (err) => {
     const reason = (err as Error)?.message ?? String(err);
     logger.error(`[${t}] Worker fork error: ${reason}`);
+    if (initAttributionTurnId) {
+      observeScheduledRunTerminal({
+        turnId: initAttributionTurnId,
+        status: 'failed',
+        errorCode: 'worker_fork_error',
+      });
+    }
     if (ds.worker === worker) {
       if (ds.session.queuedActivationPending) {
         // The durable opening journal remains authoritative until the adapter
@@ -18621,6 +18637,15 @@ function setupWorkerHandlers(
         } catch (err: any) {
           logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        // Bridge final delivery runs asynchronously from the ordered terminal
+        // IPC. Wait for that exact drain before deciding that a non-silent
+        // scheduled turn ended without a provider receipt.
+        await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+        observeScheduledRunTerminal({
+          turnId: msg.turnId,
+          status: msg.status,
+          ...(msg.errorCode ? { errorCode: msg.errorCode } : {}),
+        });
         break;
       }
 
@@ -19386,6 +19411,15 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.workerCardViewToken = null;
+      const interruptedTurnId = ds.managedTurnOrigin?.turnId
+        ?? (preReadyExit ? startupState.initTurnId : undefined);
+      if (unexpectedWorkerExit && interruptedTurnId) {
+        observeScheduledRunTerminal({
+          turnId: interruptedTurnId,
+          status: 'ambiguous',
+          errorCode: 'worker_exit',
+        });
+      }
       ds.managedTurnOrigin = undefined;
       ds.scheduledTurnCallers = undefined;
       ds.taskContinuationRpcProof = undefined;
@@ -20614,6 +20648,7 @@ function deliverFinalOutput(
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
         confirmLinkRefDraft();
+        observeScheduledRunDaemonProviderDelivery(msg.turnId, preparedListenerReply.messageId);
         onComplete?.(true, preparedListenerReply.messageId);
         return;
       }
@@ -20711,6 +20746,7 @@ function deliverFinalOutput(
       const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await (managedReceiver
         ? sendFinal(canonicalOutput.content)
         : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
+      observeScheduledRunDaemonProviderDelivery(msg.turnId, messageId);
       if (!isStillOwned()) {
         // The provider already returned its stable message id. Ownership loss
         // only suppresses later local bookkeeping; it cannot make that external

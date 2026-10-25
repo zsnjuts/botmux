@@ -961,6 +961,7 @@ async function handleScheduleCommand(
   larkAppId?: string,
   senderOpenId?: string,
   senderUnionId?: string,
+  sourceMessageCreateTime?: string,
 ): Promise<void> {
   const { activeSessions } = deps;
   const sessionReply = (rid: string, content: string, msgType?: string) =>
@@ -1048,7 +1049,14 @@ async function handleScheduleCommand(
   }
 
   // Natural language: /schedule 每日17:50给我"帮我看看AI新闻"
-  const parsed = scheduler.parseNaturalSchedule(trimmed);
+  const sourceMessageTimeMs = Number(sourceMessageCreateTime);
+  const parsed = scheduler.parseNaturalSchedule(
+    trimmed,
+    Number.isFinite(sourceMessageTimeMs) && sourceMessageTimeMs > 0
+      ? sourceMessageTimeMs
+      : undefined,
+    { requireTrustedReferenceTime: true },
+  );
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = resolveScheduleWorkingDir(ds, chatId, larkAppId);
@@ -3874,6 +3882,7 @@ export async function handleCommand(
           // access, with the audit trail pointing at the bot. Withholding the
           // union_id here is what makes such a task fail closed later.
           message.senderType === 'user' ? message.senderUnionId : undefined,
+          message.createTime,
         );
         logger.info(`[${logTag}] Schedule command handled`);
         break;

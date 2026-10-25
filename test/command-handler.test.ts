@@ -6277,6 +6277,47 @@ describe('handleCommand', () => {
   // ─── /schedule ──────────────────────────────────────────────────────────
 
   describe('/schedule', () => {
+    it('anchors native relative schedule parsing to the triggering Lark message time', async () => {
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const createTime = '1792907862000';
+
+      await handleCommand(
+        '/schedule',
+        ROOT_ID,
+        makeLarkMessage('/schedule 30分钟后 提醒我', { createTime }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(scheduler.parseNaturalSchedule).toHaveBeenCalledWith(
+        '30分钟后 提醒我',
+        Number(createTime),
+        { requireTrustedReferenceTime: true },
+      );
+    });
+
+    it('does not normalize a missing platform create_time to Unix epoch', async () => {
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/schedule',
+        ROOT_ID,
+        makeLarkMessage('/schedule 30分钟后 提醒我', { createTime: '' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(scheduler.parseNaturalSchedule).toHaveBeenCalledWith(
+        '30分钟后 提醒我',
+        undefined,
+        { requireTrustedReferenceTime: true },
+      );
+    });
+
     it('should list tasks when called with no args (empty list)', async () => {
       vi.mocked(scheduleStore.listTasks).mockReturnValue([]);
 

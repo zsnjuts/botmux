@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
+import { beginScheduledRunSettlement } from '../src/core/scheduled-run-settlement.js';
 
 const {
   emitHookEventMock,
@@ -691,6 +692,85 @@ describe('host memory pressure worker admission', () => {
 
       expect(forkMock).not.toHaveBeenCalled();
       expect(admissions).toEqual(['rejected']);
+    } finally {
+      setActiveSessionsRegistry(undefined);
+      resetDeviceIsolationActivationForTest();
+    }
+  });
+
+  it('preserves the admission callback when a device-isolation replay is rejected', async () => {
+    const ds = makeDs({ hasHistory: true });
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    acquireDeviceIsolationFreeze({
+      nonce: 'r'.repeat(32),
+      inventoryGeneration: 'g-replay',
+      leaseIdFactory: () => 'lease-replay-reject',
+    });
+    const admissions: string[] = [];
+
+    try {
+      expect(forkWorker(ds, 'scheduled reminder', {
+        resume: true,
+        turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000021',
+      }, {
+        onAdmission: admission => admissions.push(admission),
+      })).toBe(true);
+      expect(admissions).toEqual(['deferred']);
+
+      checkWorkerAdmissionMock.mockReturnValue({
+        allowed: false,
+        reasons: ['memory pressure'],
+        pressure: { warnings: [] },
+        policy: {
+          minAvailableMemoryBytes: 8 * 1024 ** 3,
+          maxMemoryFullAvg10: 20,
+          minAvailableMemorySource: 'default',
+          maxMemoryFullAvg10Source: 'default',
+        },
+      } as any);
+      releaseDeviceIsolationFreeze({
+        nonce: 'r'.repeat(32),
+        leaseId: 'lease-replay-reject',
+      });
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(admissions).toEqual(['deferred', 'rejected']);
+    } finally {
+      setActiveSessionsRegistry(undefined);
+      resetDeviceIsolationActivationForTest();
+    }
+  });
+
+  it('rejects the deferred admission when device isolation removed the Session', async () => {
+    const ds = makeDs({ hasHistory: true });
+    const sessions = new Map([[activeSessionKey(ds), ds]]);
+    setActiveSessionsRegistry(sessions);
+    acquireDeviceIsolationFreeze({
+      nonce: 's'.repeat(32),
+      inventoryGeneration: 'g-removed',
+      leaseIdFactory: () => 'lease-session-removed',
+    });
+    const admissions: string[] = [];
+
+    try {
+      expect(forkWorker(ds, 'scheduled reminder', {
+        resume: true,
+        turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000022',
+      }, {
+        onAdmission: admission => admissions.push(admission),
+      })).toBe(true);
+      expect(admissions).toEqual(['deferred']);
+
+      sessions.delete(activeSessionKey(ds));
+      releaseDeviceIsolationFreeze({
+        nonce: 's'.repeat(32),
+        leaseId: 'lease-session-removed',
+      });
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(admissions).toEqual(['deferred', 'rejected']);
     } finally {
       setActiveSessionsRegistry(undefined);
       resetDeviceIsolationActivationForTest();
@@ -7300,6 +7380,74 @@ describe('managed turn authority worker generations', () => {
 });
 
 describe('worker startup failure delivery', () => {
+  it('does not accept a CLI-writable explicit marker as the scheduled delivery receipt', async () => {
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000000';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+    let settled = false;
+    void settlement.settled.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'explicit_reply_observed',
+      turnId,
+      messageId: 'om_forged_marker',
+      responseKind: 'final',
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId,
+      status: 'completed',
+    });
+    await expect(settlement.settled).rejects.toThrow(
+      'completed without a final Lark message receipt',
+    );
+  });
+
+  it('settles a scheduled run when the worker fork errors before provenance publication', async () => {
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000001';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('error', new Error('spawn ENOENT'));
+
+    await expect(settlement.settled).rejects.toThrow('worker_fork_error');
+  });
+
+  it('settles a scheduled run on a pre-ready exit without managed origin', async () => {
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000002';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('exit', 1, null);
+
+    await expect(settlement.settled).rejects.toThrow('worker_exit');
+  });
+
   it('keeps the clean init payload and reports a structured failure once to its exact originating turn', async () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const sessionReply = vi.fn(async () => 'om_error_reply');

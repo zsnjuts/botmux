@@ -145,6 +145,12 @@ import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigVa
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import { observeScheduledRunProviderReadbackDelivery } from './scheduled-run-settlement.js';
+import {
+  scheduledFinalDeliveryElementId,
+  verifyScheduledFinalDeliveryReadback,
+} from './scheduled-final-delivery-proof.js';
+import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -2089,9 +2095,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/link-refs/resolve', async (req, res, 
   }
 });
 
-/** Delivery row for a final answer an isolated CLI already sent: the CLI
- * cannot open the shared feedback store, so the daemon records it with
- * correlation fields taken from the live session (see relayed-turn-delivery). */
+/** Host receipt for a final answer already accepted by Lark. The daemon binds
+ * it to the exact live turn, records the completion row idempotently, and uses
+ * an explicit final receipt to settle a non-silent scheduled run. */
 ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, async (req, res, params) => {
   let body: Record<string, unknown> | undefined;
   try {
@@ -2105,6 +2111,54 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   try {
+    const liveTurnId = ds?.managedTurnOrigin?.turnId;
+    const scheduledFinal = body.responseKind === 'final'
+      && typeof liveTurnId === 'string'
+      && parseScheduledTurnId(liveTurnId) !== null;
+    if (scheduledFinal) {
+      const liveWorkerGeneration = ds?.workerGeneration;
+      const persistedWorkerGeneration = ds?.session.workerGeneration;
+      const receiptDispatchAttempt = body.receiptDispatchAttempt;
+      if (body.receiptTurnId !== liveTurnId
+          || typeof body.receiptWorkerGeneration !== 'number'
+          || body.receiptWorkerGeneration !== liveWorkerGeneration
+          || body.receiptWorkerGeneration !== persistedWorkerGeneration
+          || receiptDispatchAttempt !== ds?.managedTurnOrigin?.dispatchAttempt) {
+        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
+      }
+      const expectedProof = scheduledFinalDeliveryElementId({
+        turnId: liveTurnId,
+        workerGeneration: body.receiptWorkerGeneration,
+        ...(typeof receiptDispatchAttempt === 'number'
+          ? { dispatchAttempt: receiptDispatchAttempt }
+          : {}),
+      });
+      if (!expectedProof || body.receiptProof !== expectedProof) {
+        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_proof_invalid' });
+      }
+      const messageId = typeof body.messageId === 'string' ? body.messageId : '';
+      let detail: unknown;
+      try {
+        detail = await getMessageDetail(ds!.larkAppId, messageId, {
+          userCardContent: true,
+          timeoutMs: 10_000,
+        });
+      } catch (error) {
+        return jsonRes(res, 502, {
+          ok: false,
+          error: 'scheduled_delivery_readback_failed',
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
+      const proof = verifyScheduledFinalDeliveryReadback({
+        detail,
+        messageId,
+        larkAppId: ds!.larkAppId,
+        chatId: ds!.chatId,
+        elementId: expectedProof,
+      });
+      if (!proof.ok) return jsonRes(res, 409, { ok: false, error: proof.error });
+    }
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
     try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
@@ -2115,6 +2169,9 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
       webhookDestinations,
       teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
     });
+    if (result.ok && scheduledFinal && liveTurnId) {
+      observeScheduledRunProviderReadbackDelivery(liveTurnId, body.messageId as string);
+    }
     return result.ok
       ? jsonRes(res, 200, result)
       : jsonRes(res, result.status, { ok: false, error: result.error });

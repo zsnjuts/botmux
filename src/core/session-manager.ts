@@ -94,6 +94,7 @@ import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
+import { observeScheduledRunTerminal } from './scheduled-run-settlement.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
@@ -4269,6 +4270,28 @@ export function buildSilentScheduleHint(taskName: string, locale?: Locale): stri
   ].join('\n');
 }
 
+/** Trusted prompt preamble for every non-silent scheduled fire. The scheduler
+ * records success only after the host observes a concrete Lark message id, so
+ * the model must not intentionally finish with a private/terminal-only answer. */
+export function buildScheduledDeliveryHint(taskName: string, locale?: Locale): string {
+  if (locale === 'en') {
+    return [
+      '<botmux_scheduled_delivery trusted="true">',
+      `This is a NON-SILENT run of scheduled task "${taskName}". The run succeeds only after BotMux receives a concrete Lark delivery receipt for the final user-visible message.`,
+      '- Before ending the turn, send exactly one complete result with `botmux send --response-kind final --no-mention` (or the explicitly required mention option).',
+      '- After that send succeeds, do not send another final message. Do not intentionally finish with terminal-only prose or BOTMUX_NOTHING_TO_SEND before the send.',
+      '</botmux_scheduled_delivery>',
+    ].join('\n');
+  }
+  return [
+    '<botmux_scheduled_delivery trusted="true">',
+    `本次是非静默定时任务「${taskName}」。只有 BotMux 拿到最终用户可见消息的真实飞书投递回执，本次执行才算成功。`,
+    '- 结束本轮前，必须用 `botmux send --response-kind final --no-mention` 发送且只发送一条完整结果；确有明确收件人要求时改用对应的 mention 参数。',
+    '- 该发送成功后不要再发第二条 final；发送前不得只在终端输出结论，也不得先用 BOTMUX_NOTHING_TO_SEND 静默结束。',
+    '</botmux_scheduled_delivery>',
+  ].join('\n');
+}
+
 /**
  * Resolve the durable execution position of a scheduled task.
  *
@@ -4415,6 +4438,30 @@ export async function executeScheduledTask(
     throw new Error(`scheduled turn ${suppliedTurnId} does not belong to task ${task.id}`);
   }
   const scheduledTurnId = suppliedTurnId ?? `schedule:${task.id}:${randomUUID()}`;
+  const forkScheduledWorker = (
+    target: DaemonSession,
+    input: string | CliTurnPayload,
+    resumeOrTurnId: Parameters<typeof forkWorker>[2],
+  ): void => {
+    let synchronousAdmission: import('./worker-pool.js').WorkerForkAdmission | undefined;
+    let inForkCall = true;
+    forkWorker(target, input, resumeOrTurnId, {
+      onAdmission(admission) {
+        if (inForkCall) synchronousAdmission = admission;
+        if (admission !== 'rejected') return;
+        if (silent) disarmSilentScheduledTurn(target, scheduledTurnId);
+        observeScheduledRunTerminal({
+          turnId: scheduledTurnId,
+          status: 'failed',
+          errorCode: 'worker_admission_rejected',
+        });
+      },
+    });
+    inForkCall = false;
+    if (synchronousAdmission === 'rejected') {
+      throw new Error(`scheduled task ${task.id} worker admission was rejected`);
+    }
+  };
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -4682,9 +4729,10 @@ export async function executeScheduledTask(
   const effectivePrompt = additionalPrompt === undefined
     ? task.prompt
     : `${task.prompt}\n\n${additionalPrompt}`;
-  const firePrompt = silent
-    ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
-    : effectivePrompt;
+  const scheduleHint = silent
+    ? buildSilentScheduleHint(task.name, localeForBot(larkAppId))
+    : buildScheduledDeliveryHint(task.name, localeForBot(larkAppId));
+  const firePrompt = `${scheduleHint}\n\n${effectivePrompt}`;
   // Per-task model / effort, resolved against the bot that is about to run it.
   // Stale intent is dropped with a warning rather than failing the run.
   const modelOverride = resolveScheduleModelOverride(task, bot.config);
@@ -4885,7 +4933,7 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
-          forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
+          forkScheduledWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
           throw err;
@@ -5006,7 +5054,7 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      forkWorker(ds, prompt, scheduledTurnId);
+      forkScheduledWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
       throw err;

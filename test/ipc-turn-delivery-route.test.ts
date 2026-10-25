@@ -25,6 +25,16 @@ import {
   __testOnly_closeSkillFeedbackStores,
 } from '../src/services/skill-feedback-store.js';
 import { RELAYED_TURN_DELIVERY_MAX_BYTES } from '../src/core/relayed-turn-delivery.js';
+import {
+  __testOnlyResetScheduledRunSettlements,
+  beginScheduledRunSettlement,
+} from '../src/core/scheduled-run-settlement.js';
+import {
+  scheduledFinalDeliveryElementId,
+  stampScheduledFinalDeliveryProof,
+} from '../src/core/scheduled-final-delivery-proof.js';
+import { markGroupContextCardPurpose } from '../src/im/lark/group-context-card.js';
+import * as larkClient from '../src/im/lark/client.js';
 
 const SECRET = 'turn-delivery-narrow-secret';
 const CAP_A = 'ab12cd34'.repeat(8);
@@ -35,6 +45,7 @@ let dataDir: string | null = null;
 let prevDataDir: string | null = null;
 
 afterEach(async () => {
+  __testOnlyResetScheduledRunSettlements();
   if (handle) await handle.close();
   handle = null;
   setIpcAuthSecret(null);
@@ -56,6 +67,7 @@ function liveSession(sessionId: string, capability: string, turnId: string | und
       cliSessionId: `native-${sessionId}`,
       cliId: 'claude-code',
       model: 'opus',
+      workerGeneration: 7,
       ...extra,
     },
     worker: { killed: false, connected: true, send: vi.fn() },
@@ -63,6 +75,7 @@ function liveSession(sessionId: string, capability: string, turnId: string | und
     chatId: `oc_${sessionId}`,
     chatType: 'group',
     cliVersion: '9.9.9',
+    workerGeneration: 7,
     managedTurnOrigin: { capability, ...(turnId ? { turnId, dispatchAttempt: 2 } : {}) },
   };
 }
@@ -90,6 +103,106 @@ async function rowFor(messageId: string) {
 }
 
 describe('POST /api/sessions/:sessionId/turn-delivery', () => {
+  it('settles the exact scheduled turn only from an authenticated final receipt', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000011';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const elementId = scheduledFinalDeliveryElementId({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = stampScheduledFinalDeliveryProof(markGroupContextCardPurpose({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, 'message'), elementId);
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_answer_final',
+      chat_id: 'oc_sess-a',
+      deleted: false,
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_answer_final',
+      content: 'final answer',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: elementId,
+    });
+    expect(res.status).toBe(200);
+    await expect(settlement.settled).resolves.toEqual({ messageId: 'om_answer_final' });
+  });
+
+  it('does not settle a client-reported id that provider readback cannot prove', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000012';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const elementId = scheduledFinalDeliveryElementId({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_forged',
+      content: 'not actually delivered',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: elementId,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'provider_message_not_found' });
+    let settled = false;
+    void settlement.settled.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+  });
+
+  it('rejects a receipt from a stale worker generation before provider readback', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000013';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const staleProof = scheduledFinalDeliveryElementId({
+      turnId,
+      workerGeneration: 6,
+      dispatchAttempt: 2,
+    })!;
+    const readback = vi.spyOn(larkClient, 'getMessageDetail');
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_stale_generation',
+      content: 'stale',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 6,
+      receiptDispatchAttempt: 2,
+      receiptProof: staleProof,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'scheduled_delivery_origin_changed',
+    });
+    expect(readback).not.toHaveBeenCalled();
+  });
+
   it('records the row from the live session, ignoring body-supplied correlation fields', async () => {
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
     const res = await post('sess-a', {
@@ -161,6 +274,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
 
   it.each([
     ['non-om message id', { messageId: 'oc_not_a_message', content: 'x' }],
+    ['malformed om message id', { messageId: 'om_!', content: 'x' }],
     ['message id with a path separator', { messageId: 'om_a/b', content: 'x' }],
     ['empty content', { messageId: 'om_empty', content: '' }],
     ['non-string content', { messageId: 'om_obj', content: { text: 'x' } }],

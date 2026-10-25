@@ -592,6 +592,15 @@ describe('Return value shape', () => {
 // ─── New: Chinese one-shot patterns (N分钟后 / N小时后 / 明天X点) ─────────────
 
 describe('One-shot Chinese patterns', () => {
+  it('anchors relative schedules to the trusted source-message time', () => {
+    const sourceMessageAt = Date.parse('2026-10-25T05:57:42.000Z');
+    const minutes = parseNaturalSchedule('30分钟后 提醒我喝水', sourceMessageAt);
+    const hours = parseNaturalSchedule('2小时后 检查部署', sourceMessageAt);
+
+    expect(minutes?.parsed.runAt).toBe('2026-10-25T06:27:42.000Z');
+    expect(hours?.parsed.runAt).toBe('2026-10-25T07:57:42.000Z');
+  });
+
   it('N分钟后 produces once schedule', () => {
     const result = parseNaturalSchedule('30分钟后 提醒我喝水');
     expect(result).not.toBeNull();
@@ -666,6 +675,12 @@ describe('One-shot Chinese patterns', () => {
 // ─── New: parseSchedule() — bare schedule parser for CLI ─────────────────────
 
 describe('parseSchedule (bare schedule strings)', () => {
+  it('anchors duration syntax to an explicit reference time', () => {
+    const sourceMessageAt = Date.parse('2026-10-25T05:57:42.000Z');
+    expect(parseSchedule('30m', sourceMessageAt).runAt)
+      .toBe('2026-10-25T06:27:42.000Z');
+  });
+
   it('cron expression', () => {
     const p = parseSchedule('0 9 * * *');
     expect(p.kind).toBe('cron');

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ScheduledTask } from '../src/types.js';
+import { ScheduledRunDeliveryError } from '../src/core/scheduled-run-settlement.js';
 
 const mocks = vi.hoisted(() => ({
   listTasks: vi.fn<() => ScheduledTask[]>(),
@@ -215,6 +216,24 @@ describe('scheduler execution context', () => {
     for (let i = 0; i < 5; i += 1) await Promise.resolve();
 
     expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('records a missing final receipt as a delivery error', async () => {
+    setExecuteCallback(async () => {
+      throw new ScheduledRunDeliveryError('schedule:task-context-1:run', 'receipt missing');
+    });
+
+    expect(runNow(task.id)).toEqual({ ok: true });
+    await vi.runAllTicks();
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+    expect(mocks.markRun).toHaveBeenCalledWith(
+      task.id,
+      false,
+      expect.stringContaining('receipt missing'),
+      expect.stringContaining('receipt missing'),
+      expect.any(String),
+    );
   });
 
   it('does not re-arm a task that is already running through the chat path', () => {

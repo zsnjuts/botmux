@@ -214,6 +214,7 @@ import {
 } from './services/group-context-settings-store.js';
 import { setGroupContextSettingsResolver } from './services/group-context-ingest.js';
 import { prepareGroupContextForTurn, captureNativeGroupContextInput } from './services/group-context-runtime.js';
+import { getGroupContextMessage } from './services/group-context-store.js';
 import { groupContextConversationForTurn } from './services/group-context-location.js';
 import { groupContextQuery } from './services/group-context.js';
 import { ensureGroupContextRecallHealth } from './services/group-context-health.js';
@@ -551,6 +552,11 @@ import {
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
+import { resolveScheduleReferenceTime } from './core/schedule-reference-time.js';
+import { scheduleRequiresReferenceTime } from './core/scheduler.js';
+import {
+  executeScheduledRunAwaitingSettlement,
+} from './core/scheduled-run-settlement.js';
 import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
@@ -6181,6 +6187,8 @@ async function submitQueuedMessage(
     senderOpenId: message.senderId,
     participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
     inThread: !!message.threadId,
+    sourceMessageId: message.messageId,
+    sourceMessageCreateTime: message.createTime,
   });
   await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
   // Identity refresh and reaction delivery both await external work.
@@ -7870,6 +7878,35 @@ function scheduleCallerForTurn(ds: DaemonSession, turnId: string): TrustedCaller
   return dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
 }
 
+/** Resolve the time the user actually issued the schedule request. Relative
+ * schedules must not silently start their countdown only after the model has
+ * finished asking questions and invoked the tool. If the platform create_time
+ * is unavailable, relative schedules fail closed instead of changing anchors. */
+function scheduleReferenceTimeForTurn(
+  ds: DaemonSession,
+  turnId: string,
+  schedule: string,
+): number | undefined {
+  let sourceMessageCreateTime = ds.session.turnReplyContexts?.[turnId]?.sourceMessageCreateTime;
+  try {
+    sourceMessageCreateTime ??= getGroupContextMessage(
+      ds.larkAppId,
+      ds.chatId,
+      ds.session.turnReplyContexts?.[turnId]?.sourceMessageId ?? turnId,
+    )?.createTime;
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to read source-message time for ${turnId.slice(0, 12)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const referenceTimeMs = resolveScheduleReferenceTime({ sourceMessageCreateTime });
+  if (referenceTimeMs === undefined && scheduleRequiresReferenceTime(schedule)) {
+    throw new Error('schedule_reference_time_unavailable');
+  }
+  return referenceTimeMs;
+}
+
 // Managed schedule creation. The caller supplies task input only; creator
 // identity, grant scope and the commit authority are derived from this exact
 // live turn and the host-signed dispatch record.
@@ -8076,6 +8113,8 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       creatorChatId: ds.chatId,
       creatorRootMessageId: expectedRoot,
       creatorLarkAppId: ds.larkAppId,
+      referenceTimeMs: scheduleReferenceTimeForTurn(ds, turnId, task.schedule),
+      requireTrustedReferenceTime: true,
       chatType: ds.chatType === 'p2p' ? 'p2p' as const : 'topic_group' as const,
       silent: task.silent === true,
       followActive: task.followActive === true,
@@ -23234,7 +23273,7 @@ async function startInitialPassthroughSession(args: {
   const substituteReplyMode = substitute
     ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute, senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId, sourceMessageId: parsed.messageId });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute, senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId, sourceMessageId: parsed.messageId, sourceMessageCreateTime: parsed.createTime });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -24655,7 +24694,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Turn key is the reply anchor (== messageId outside session-group births) so
   // the per-turn reply context and currentReplyTarget.turnId line up with the
   // worker's turn id — current-turn provenance requires that equality.
-  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId, sourceMessageCreateTime: parsed.createTime });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -26790,6 +26829,7 @@ async function handleThreadReplyAdmitted(
         inThread: !!parsed.threadId,
         foldedRootId: ctx.foldedRootId,
         sourceMessageId: parsed.messageId,
+        sourceMessageCreateTime: parsed.createTime,
       });
       if (callerOpenId) ds.session.lastCallerOpenId = callerOpenId;
       publishLastInputFromBotPatch(ds);
@@ -26957,7 +26997,7 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId, sourceMessageCreateTime: parsed.createTime });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -27420,7 +27460,7 @@ async function handleThreadReplyAdmitted(
       : 'thread';
     const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId, sourceMessageCreateTime: parsed.createTime });
     sessionStore.updateSession(newDs.session);
     const registration = await claimNewDaemonSession(activeSessions, newDs);
     if (!registration.accepted) {
@@ -32525,80 +32565,90 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const results = await executeScheduledTaskForTargets(
               task,
               targetChatIds,
-              targetTask => withBotTurnAdmission(
-                effectiveAppId,
-                () => executeScheduledTask(
-                  targetTask,
-                  activeSessions,
-                  refreshCliVersion,
-                  additionalPrompt,
-                  {
-                    ...(targetTask.boundSessionId
-                      ? { scheduledTurnId: `schedule:${targetTask.id}:${executionContext.runId}` }
-                      : {}),
-                    prepareTurnIdentity: (session, turnId) =>
-                      prepareTurnCliIdentity(session, turnId),
-                    resumeBoundSession: async input => {
-                      if (input.larkAppId !== effectiveAppId) {
-                        throw new Error('bound Session application mismatch');
-                      }
-                      const deadline = Date.now() + 45_000;
-                      for (;;) {
-                        try {
-                          if (durableCoordinationRuntime?.mode === 'primary') {
-                            const control = durablePrimaryControlRuntimeByApp.get(input.larkAppId);
-                            if (!control) throw new Error('durable primary Session control is unavailable');
-                            await control.resumeTrustedDirect({
-                              operationId: `schedule-bound-resume:${input.turnId}:${input.sessionId}`,
-                              sessionId: input.sessionId,
-                              rootId: input.rootMessageId,
-                            });
-                          } else {
-                            const stored = sessionStore.getSession(input.sessionId);
-                            if (!stored
-                                || stored.larkAppId !== input.larkAppId
-                                || stored.chatId !== input.chatId
-                                || storedSessionAnchorId(stored) !== input.rootMessageId) {
-                              throw new Error('bound Session identity mismatch');
-                            }
-                            if (stored.status !== 'closed') {
-                              throw new Error('bound Session is not closed yet');
-                            }
-                            const resumed = await resumeSession(input.sessionId, activeSessions);
-                            if (!resumed.ok) {
-                              throw new Error(`bound Session resume failed: ${resumed.error}`);
-                            }
-                            if (resumed.recoveryPending === true) {
-                              while ((!resumed.ds.worker
-                                  || resumed.ds.worker.killed
-                                  || resumed.ds.workerReady !== true)
-                                  && Date.now() < deadline) {
-                                await new Promise<void>(resolve => setTimeout(resolve, 100));
+              async targetTask => {
+                // One claimed run may fan out to several chats. Keep the
+                // durable run id for the common single-target path and mint a
+                // separate valid scheduled-turn id per fan-out target.
+                const scheduledTurnId = `schedule:${targetTask.id}:${
+                  targetChatIds.length === 1 ? executionContext.runId : randomUUID()
+                }`;
+                await executeScheduledRunAwaitingSettlement({
+                  turnId: scheduledTurnId,
+                  taskId: targetTask.id,
+                  requireFinalDelivery: targetTask.silent !== true,
+                }, () => withBotTurnAdmission(
+                  effectiveAppId,
+                  () => executeScheduledTask(
+                    targetTask,
+                    activeSessions,
+                    refreshCliVersion,
+                    additionalPrompt,
+                    {
+                        scheduledTurnId,
+                        prepareTurnIdentity: (session, turnId) =>
+                          prepareTurnCliIdentity(session, turnId),
+                        resumeBoundSession: async input => {
+                          if (input.larkAppId !== effectiveAppId) {
+                            throw new Error('bound Session application mismatch');
+                          }
+                          const deadline = Date.now() + 45_000;
+                          for (;;) {
+                            try {
+                              if (durableCoordinationRuntime?.mode === 'primary') {
+                                const control = durablePrimaryControlRuntimeByApp.get(input.larkAppId);
+                                if (!control) throw new Error('durable primary Session control is unavailable');
+                                await control.resumeTrustedDirect({
+                                  operationId: `schedule-bound-resume:${input.turnId}:${input.sessionId}`,
+                                  sessionId: input.sessionId,
+                                  rootId: input.rootMessageId,
+                                });
+                              } else {
+                                const stored = sessionStore.getSession(input.sessionId);
+                                if (!stored
+                                    || stored.larkAppId !== input.larkAppId
+                                    || stored.chatId !== input.chatId
+                                    || storedSessionAnchorId(stored) !== input.rootMessageId) {
+                                  throw new Error('bound Session identity mismatch');
+                                }
+                                if (stored.status !== 'closed') {
+                                  throw new Error('bound Session is not closed yet');
+                                }
+                                const resumed = await resumeSession(input.sessionId, activeSessions);
+                                if (!resumed.ok) {
+                                  throw new Error(`bound Session resume failed: ${resumed.error}`);
+                                }
+                                if (resumed.recoveryPending === true) {
+                                  while ((!resumed.ds.worker
+                                      || resumed.ds.worker.killed
+                                      || resumed.ds.workerReady !== true)
+                                      && Date.now() < deadline) {
+                                    await new Promise<void>(resolve => setTimeout(resolve, 100));
+                                  }
+                                  if (!resumed.ds.worker
+                                      || resumed.ds.worker.killed
+                                      || resumed.ds.workerReady !== true) {
+                                    throw new Error('bound Session remote resume did not become ready');
+                                  }
+                                }
                               }
-                              if (!resumed.ds.worker
-                                  || resumed.ds.worker.killed
-                                  || resumed.ds.workerReady !== true) {
-                                throw new Error('bound Session remote resume did not become ready');
-                              }
+                              break;
+                            } catch (error) {
+                              const message = error instanceof Error ? error.message : String(error);
+                              const closing = message.includes('canonical Session is no longer closed')
+                                || message.includes('bound Session is not closed yet')
+                                || message.endsWith('bound Session resume failed: not_closed');
+                              if (!closing || Date.now() >= deadline) throw error;
+                              await new Promise<void>(resolve => setTimeout(resolve, 250));
                             }
                           }
-                          break;
-                        } catch (error) {
-                          const message = error instanceof Error ? error.message : String(error);
-                          const closing = message.includes('canonical Session is no longer closed')
-                            || message.includes('bound Session is not closed yet')
-                            || message.endsWith('bound Session resume failed: not_closed');
-                          if (!closing || Date.now() >= deadline) throw error;
-                          await new Promise<void>(resolve => setTimeout(resolve, 250));
-                        }
-                      }
-                      const resumed = findActiveBySessionId(input.sessionId);
-                      if (!resumed) throw new Error('bound Session resume did not install a local owner');
-                      return resumed;
+                          const resumed = findActiveBySessionId(input.sessionId);
+                          if (!resumed) throw new Error('bound Session resume did not install a local owner');
+                          return resumed;
+                        },
                     },
-                  },
-                ),
-              ),
+                  ),
+                ));
+              },
             );
             if (targetChatIds.length > 1) targetResults = results;
           } catch (error) {

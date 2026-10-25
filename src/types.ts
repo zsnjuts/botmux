@@ -1735,6 +1735,9 @@ export type FrozenSessionReplyTarget =
 export interface FrozenSessionReplyContext {
   target: FrozenSessionReplyTarget;
   sourceMessageId?: string;
+  /** Platform create_time (milliseconds) of the Lark message that opened this
+   * turn. Distinct from daemon admission/update timestamps. */
+  sourceMessageCreateTime?: number;
   quoteTargetId?: string;
   replyTargetSenderOpenId?: string;
   replyTargetSenderIsBot?: boolean;

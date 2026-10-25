@@ -14,6 +14,7 @@ function createFixture(
   topicUnavailablePolicy?: 'stop',
   session: Record<string, unknown> = {},
   turnId = 'om_turn_idempotency',
+  extraEnv: NodeJS.ProcessEnv = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-turn-idempotency-'));
   const dataDir = join(root, 'data');
@@ -44,7 +45,8 @@ function createFixture(
       cwd: repo,
       env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir,
         BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: sessionId, BOTMUX_TURN_ID: turnId,
-        BOTMUX_LARK_APP_ID: 'cli_test', ...(topicUnavailablePolicy ? { BOTMUX_TEST_TOPIC_STATE: topicState } : {}) },
+        BOTMUX_LARK_APP_ID: 'cli_test', ...(topicUnavailablePolicy ? { BOTMUX_TEST_TOPIC_STATE: topicState } : {}),
+        ...extraEnv },
       encoding: 'utf8', timeout: 30_000,
     });
     const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='));
@@ -342,6 +344,35 @@ describe('botmux send per-turn final idempotency', () => {
       const markerAfter = JSON.parse(readFileSync(markerPath, 'utf8'));
       expect(markerAfter.turnId).toBe(scheduledTurn);
       expect(markerAfter.queuedTurns).toEqual([{ turnId: 'om_turn_2' }]);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it('deletes a scheduled task only after the trusted final receipt is verified', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const f = createFixture(
+      undefined,
+      { scope: 'chat', workerGeneration: 7 },
+      scheduledTurn,
+      { BOTMUX_DAEMON_IPC_PORT: '7951', BOTMUX_TEST_DURABLE_SEND: '1' },
+    );
+    try {
+      const sent = f.run('final', 'scheduled answer', ['--schedule-remove-self']);
+      expect(sent.result.status, String(sent.result.stderr)).toBe(0);
+      const daemonRequests = String(sent.result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      expect(daemonRequests.map(request => request.path)).toEqual([
+        `/api/sessions/${f.sessionId}/turn-delivery`,
+        '/api/schedule/managed-mutate',
+      ]);
+      expect(JSON.parse(String(sent.result.stdout).split('\n').findLast(line => line.startsWith('{'))!))
+        .toMatchObject({
+          scheduleSelfCleanup: {
+            requested: true,
+            taskId: 'a1b2c3d4',
+            removed: true,
+          },
+        });
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
 

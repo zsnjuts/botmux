@@ -32,6 +32,11 @@ import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
 import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
+import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
+import {
+  scheduledFinalDeliveryElementId,
+  stampScheduledFinalDeliveryProof,
+} from './core/scheduled-final-delivery-proof.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
@@ -11463,6 +11468,93 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
+  const receiptTargetChatId = overrideChatId ?? s.chatId;
+  const scheduledTurn = !!currentTurnId && parseScheduledTurnId(currentTurnId) !== null;
+  const scheduledFinalDeliveryIdentity = scheduledTurn && currentTurnId
+    && typeof s.workerGeneration === 'number'
+    ? {
+        turnId: currentTurnId,
+        workerGeneration: s.workerGeneration,
+        ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
+      }
+    : undefined;
+  const scheduledFinalDeliveryProof = scheduledFinalDeliveryIdentity
+    ? scheduledFinalDeliveryElementId(scheduledFinalDeliveryIdentity)
+    : undefined;
+  let trustedFinalDeliveryReport: Promise<boolean> | undefined;
+  /** Report a provider-confirmed final to the resident daemon. Scheduled turns
+   * are settled only after that daemon independently reads back the exact
+   * turn/generation proof from Lark. */
+  const reportTrustedFinalDelivery = async (
+    messageId: string,
+    sentContent: string,
+  ): Promise<boolean> => {
+    if (effectiveResponseKind !== 'final'
+        || !currentTurnId
+        || receiptTargetChatId !== s.chatId) return false;
+    trustedFinalDeliveryReport ??= (async () => {
+      let discoveredPort: number | undefined;
+      try { discoveredPort = findDaemon(appId)?.ipcPort; } catch { /* isolated CLI */ }
+      const deliveryIpcPort = resolveDaemonIpcPort(
+        discoveredPort,
+        process.env.BOTMUX_DAEMON_IPC_PORT,
+      );
+      if (!deliveryIpcPort) {
+        console.error('botmux send: trusted final delivery receipt unavailable after delivery: daemon IPC unavailable');
+        return false;
+      }
+      try {
+        const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', {
+          messageId,
+          content: sentContent,
+          responseKind: 'final',
+          ...(scheduledFinalDeliveryIdentity && scheduledFinalDeliveryProof
+            ? {
+                receiptTurnId: scheduledFinalDeliveryIdentity.turnId,
+                receiptWorkerGeneration: scheduledFinalDeliveryIdentity.workerGeneration,
+                ...(scheduledFinalDeliveryIdentity.dispatchAttempt !== undefined
+                  ? { receiptDispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
+                  : {}),
+                receiptProof: scheduledFinalDeliveryProof,
+              }
+            : {}),
+        });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => undefined) as { error?: string } | undefined;
+          throw new Error(detail?.error ?? `HTTP ${res.status}`);
+        }
+        return true;
+      } catch (error) {
+        console.error(
+          `botmux send: trusted final delivery receipt failed after delivery: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return false;
+      }
+    })();
+    return trustedFinalDeliveryReport;
+  };
+  const removeScheduleSelfAfterVerifiedFinal = async (
+    messageId: string,
+    sentContent: string,
+  ): Promise<void> => {
+    if (!scheduleRemoveSelfTaskId) return;
+    if (!await reportTrustedFinalDelivery(messageId, sentContent)) {
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: false,
+        error: 'trusted_final_delivery_unverified',
+      };
+      console.error(
+        `⚠️ 最终答复已发送，但可信飞书回执未验证；当前 turn 已保留，`
+        + `定时任务 ${scheduleRemoveSelfTaskId} 未删除；`
+        + '请原样重试同一 botmux send 命令完成验证与自删除',
+      );
+      return;
+    }
+    await removeScheduleSelfAfterFinal();
+  };
   const turnSendKey = currentTurnId
     ? {
         larkAppId: originSession?.larkAppId ?? appId,
@@ -11577,7 +11669,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   if (existingTurnPrimary) {
-    await removeScheduleSelfAfterFinal();
+    await removeScheduleSelfAfterVerifiedFinal(
+      existingTurnPrimary.messageId,
+      expectedLinkRenderedContent,
+    );
     if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
       advanceAncestorSessionTurn(
         sendDataDir,
@@ -13053,6 +13148,9 @@ async function cmdSend(rest: string[]): Promise<void> {
             : {}),
           ...(feedbackPolicy ? { feedback: buildFeedbackElement(feedbackPolicy) } : {}),
         });
+        if (scheduledFinalDeliveryProof) {
+          stampScheduledFinalDeliveryProof(canonicalCard, scheduledFinalDeliveryProof);
+        }
       }
       if (feedbackPolicy && effectiveResponseKind === 'final') {
 
@@ -13173,7 +13271,10 @@ async function cmdSend(rest: string[]): Promise<void> {
             : 'standard_reply_card',
         );
       }
-      await removeScheduleSelfAfterFinal();
+      if (scheduledTurn && !scheduleRemoveSelfTaskId) {
+        await reportTrustedFinalDelivery(messageId, text);
+      }
+      await removeScheduleSelfAfterVerifiedFinal(messageId, text);
       if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
           sendDataDir,
@@ -13246,34 +13347,8 @@ async function cmdSend(rest: string[]): Promise<void> {
       } catch (error) {
         indexError = error;
       }
-      if (indexError !== undefined) {
-        // An isolated CLI (bwrap relay / macOS read isolation) cannot open the
-        // shared feedback store — it holds every bot's rows — so hand the row
-        // to the daemon, which derives it from the live session. Same test as
-        // postSessionCliIpc: a relay env or no readable host secret.
-        let isolated = !!process.env.BOTMUX_SEND_RELAY;
-        if (!isolated) {
-          try { loadDaemonIpcSecret(); } catch { isolated = true; }
-        }
-        const deliveryIpcPort = isolated
-          ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
-          : undefined;
-        // The daemon binds the row to the capability's turn and the session's
-        // own chat; an unbound turn or a cross-chat publish has nothing there
-        // to correlate against.
-        if (deliveryIpcPort && currentTurnId && targetChatId === s.chatId) {
-          try {
-            const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text });
-            if (!res.ok) {
-              const detail = await res.json().catch(() => undefined) as { error?: string } | undefined;
-              throw new Error(detail?.error ?? `HTTP ${res.status}`);
-            }
-            indexError = undefined;
-          } catch (error) {
-            indexError = error;
-          }
-        }
-      }
+      if ((indexError !== undefined || scheduledTurn)
+          && await reportTrustedFinalDelivery(messageId, text)) indexError = undefined;
       if (indexError !== undefined) {
         console.error(
           `botmux send: turn delivery indexing failed after delivery: ${indexError instanceof Error ? indexError.message : String(indexError)}`,
@@ -13313,7 +13388,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           : 'non_patchable',
       );
     }
-    await removeScheduleSelfAfterFinal();
+    await removeScheduleSelfAfterVerifiedFinal(messageId, text);
     let advancedNextTurnId: string | undefined;
     if (effectiveResponseKind === 'final'
       && (!scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true)

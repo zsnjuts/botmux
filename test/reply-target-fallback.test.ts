@@ -120,6 +120,35 @@ describe('fallbackTurnId × resolveSessionReplyTarget (the leak fix)', () => {
 });
 
 describe('rehomeReplyTargetState', () => {
+  it('preserves the platform source-message time independently of admission time', () => {
+    const ds = makeDs();
+    beginReplyTargetTurn(ds as DaemonSession, 'om_source', 'om_turn', NOW, {
+      sourceMessageId: 'om_source',
+      sourceMessageCreateTime: '1792907862000',
+    });
+
+    expect(ds.session.turnReplyContexts?.om_turn?.sourceMessageCreateTime)
+      .toBe(1792907862000);
+    rehomeReplyTargetState(ds as DaemonSession);
+    expect(ds.session.turnReplyContexts?.om_turn?.sourceMessageCreateTime)
+      .toBe(1792907862000);
+  });
+
+  it('does not persist an empty or zero platform time as a trusted epoch', () => {
+    const ds = makeDs();
+    beginReplyTargetTurn(ds as DaemonSession, 'om_source', 'om_empty_time', NOW, {
+      sourceMessageId: 'om_source',
+      sourceMessageCreateTime: '',
+    });
+    beginReplyTargetTurn(ds as DaemonSession, 'om_source', 'om_zero_time', NOW, {
+      sourceMessageId: 'om_source',
+      sourceMessageCreateTime: 0,
+    });
+
+    expect(ds.session.turnReplyContexts?.om_empty_time?.sourceMessageCreateTime).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.om_zero_time?.sourceMessageCreateTime).toBeUndefined();
+  });
+
   it('removes source-topic routing authority while preserving buffered-turn attribution', () => {
     const ds = makeDs({
       scope: 'thread',
