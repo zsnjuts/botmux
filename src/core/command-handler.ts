@@ -114,7 +114,7 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1, CliTurnPayload } from '../types.js';
+import type { LarkMessage, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1, CliTurnPayload, TrustedCaller } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, principalLaneRoutingAnchorId, markRepoCardConsumed } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -127,7 +127,7 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
-import { rehomeReplyTargetState } from './reply-target.js';
+import { beginReplyTargetTurn, rehomeReplyTargetState } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
@@ -3574,23 +3574,114 @@ export async function handleCommand(
           content: failedTurn.cliInput,
           ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
         };
+        // `/retry` is a NEW authenticated BotMux turn, not a transport replay
+        // of the failed turn. Remote Runner rejects inputs without a turn id;
+        // reusing the old id would also bind terminal/output attribution to the
+        // wrong Lark message. Freeze the command message as the exact reply and
+        // actor context before publishing credentials or touching worker IPC.
+        const retryTurnId = message.messageId;
+        const retrySenderType: TrustedCaller['senderType'] = message.senderType === 'user'
+          ? 'user'
+          : message.senderType === 'bot' || message.senderType === 'app'
+            ? 'bot'
+            : undefined;
+        const retryCaller: TrustedCaller | undefined = retrySenderType
+          && message.senderId.startsWith('ou_')
+          ? {
+              requestLarkAppId: ds.larkAppId,
+              requestUserOpenId: message.senderId,
+              ...(message.senderUnionId
+                ? { requestUserUnionId: message.senderUnionId }
+                : {}),
+              senderType: retrySenderType,
+            }
+          : undefined;
+        const invocationTarget = deps.invocationReplyTarget;
+        const retryReplyRoot = invocationTarget?.mode === 'thread'
+          || invocationTarget?.mode === 'quote'
+          ? invocationTarget.rootMessageId
+          : undefined;
+        const priorReplyState = {
+          replyTargets: ds.session.replyTargets,
+          replyTargetsPrunedThrough: ds.session.replyTargetsPrunedThrough,
+          turnReplyContexts: ds.session.turnReplyContexts,
+          replyThreadAliases: ds.replyThreadAliases,
+          currentReplyTarget: ds.currentReplyTarget,
+          sessionReplyThreadAliases: ds.session.replyThreadAliases,
+          sessionCurrentReplyTarget: ds.session.currentReplyTarget,
+        };
+        const rollbackReplyState = (): void => {
+          ds.session.replyTargets = priorReplyState.replyTargets;
+          ds.session.replyTargetsPrunedThrough = priorReplyState.replyTargetsPrunedThrough;
+          ds.session.turnReplyContexts = priorReplyState.turnReplyContexts;
+          ds.replyThreadAliases = priorReplyState.replyThreadAliases;
+          ds.currentReplyTarget = priorReplyState.currentReplyTarget;
+          ds.session.replyThreadAliases = priorReplyState.sessionReplyThreadAliases;
+          ds.session.currentReplyTarget = priorReplyState.sessionCurrentReplyTarget;
+          try { sessionStore.updateSession(ds.session); }
+          catch (err) {
+            logger.warn(
+              `[${logTag}] /retry failed to roll back reply identity: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        };
         let accepted = false;
         try {
+          beginReplyTargetTurn(ds, retryReplyRoot, retryTurnId, new Date().toISOString(), {
+            quoteOnly: invocationTarget?.mode === 'quote',
+            senderOpenId: message.senderId.startsWith('ou_')
+              ? message.senderId
+              : undefined,
+            participants: message.senderId.startsWith('ou_')
+            ? [{
+                openId: message.senderId,
+                isBot: retrySenderType === 'bot'
+                  ? true
+                  : retrySenderType === 'user'
+                    ? false
+                    : undefined,
+              }]
+              : undefined,
+            participantsIncomplete: !message.senderId.startsWith('ou_'),
+            inThread: !!message.threadId,
+            sourceMessageId: message.messageId,
+          });
+          sessionStore.updateSession(ds.session);
+          await deps.prepareTurn?.(ds, retryTurnId);
           if (ds.worker && !ds.worker.killed) {
-            accepted = sendWorkerInput(ds, retryInput);
+            accepted = sendWorkerInput(ds, retryInput, retryTurnId, {
+              notifyRejection: false,
+              ...(retryCaller ? { trustedCaller: retryCaller } : {}),
+            });
           } else {
-            forkWorker(ds, retryInput, ds.hasHistory);
-            accepted = true;
+            let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+            const forked = forkWorker(ds, retryInput, {
+              resume: ds.hasHistory,
+              turnId: retryTurnId,
+              ...(retryCaller ? { trustedCaller: retryCaller } : {}),
+            }, {
+              onAdmission: state => { admission = state; },
+            });
+            accepted = forked && admission !== undefined && admission !== 'rejected';
           }
         } catch (err) {
           logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (!accepted) {
+          rollbackReplyState();
           await sessionReply(rootId, t('cmd.retry.submit_failed', undefined, loc));
           break;
         }
         // Update retry state + record the input as the session's last CLI turn
         // (same post-acceptance pattern as the daemon's live-worker path).
+        if (retryCaller) {
+          ds.activeInteractiveTurn = {
+            turnId: retryTurnId,
+            caller: { ...retryCaller },
+            userPrompt: failedTurn.userPrompt,
+          };
+        }
         markRetryAttempt(ds.session);
         rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
         sessionStore.updateSession(ds.session);
