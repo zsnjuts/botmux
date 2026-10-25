@@ -201,7 +201,7 @@ import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { t as tr, localeForBot } from '../src/i18n/index.js';
 import type { DaemonSession } from '../src/core/types.js';
 
-const APP = 'ingress_notice_app';
+const APP = 'cli_1a2b3c4d5e6f7890';
 const CHAT = 'oc_ingress_notice_chat';
 const OWNER = 'ou_owner';
 const NOW = new Date().toISOString();
@@ -347,6 +347,108 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       allowedUsers: [OWNER],
     });
     bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  it.each([
+    ['trailing', '/close @_self'],
+    ['leading', '@_self /close'],
+  ])('queues durable /close with a %s self mention', async (_position, rawText) => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_durable_bot_close';
+    const session = seedThreadSession(anchor, 'durable bot close');
+    const queuedControl = vi.fn();
+    const event = makeBotEventData(
+      'om_durable_bot_close',
+      rawText,
+      anchor,
+    );
+    event.message.content = JSON.stringify({ text: rawText });
+    event.message.mentions = [{
+      key: '@_self',
+      name: 'TargetBot',
+      id: { open_id: 'ou_self_bot' },
+      id_type: 'open_id',
+    }];
+    const ctx = {
+      ...makeCtx(anchor, 'om_durable_bot_close'),
+      queuePostAdmissionControl: queuedControl,
+    };
+
+    await handleThreadReply(event, ctx);
+
+    expect(queuedControl).toHaveBeenCalledOnce();
+    expect(queuedControl).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: `lark-command.session-control:${APP}:om_durable_bot_close`,
+      lane: 'session-control',
+      payload: expect.objectContaining({
+        type: 'botmux.session.control',
+        action: 'close',
+        sessionId: session.session.sessionId,
+        operatorOpenId: 'ou_proposer_bot',
+      }),
+    }));
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(repliedText()).not.toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
+  it.each([
+    ['other-leading', '@_other /close @_self', [
+      { key: '@_other', name: 'PeerBot', id: { open_id: 'ou_other_bot' }, id_type: 'open_id' },
+      { key: '@_self', name: 'TargetBot', id: { open_id: 'ou_self_bot' }, id_type: 'open_id' },
+    ]],
+    ['other-trailing', '/close @_other @_self', [
+      { key: '@_other', name: 'PeerBot', id: { open_id: 'ou_other_bot' }, id_type: 'open_id' },
+      { key: '@_self', name: 'TargetBot', id: { open_id: 'ou_self_bot' }, id_type: 'open_id' },
+    ]],
+    ['same-name-other', '/close @_other @_self', [
+      { key: '@_other', name: 'TargetBot', id: { open_id: 'ou_other_bot' }, id_type: 'open_id' },
+      { key: '@_self', name: 'TargetBot', id: { open_id: 'ou_self_bot' }, id_type: 'open_id' },
+    ]],
+    ['argument', '/close wt @_self', [
+      { key: '@_self', name: 'TargetBot', id: { open_id: 'ou_self_bot' }, id_type: 'open_id' },
+    ]],
+  ])('does not queue non-exact durable /close: %s', async (_case, rawText, mentions) => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_nonexact_bot_close';
+    const session = seedThreadSession(anchor, 'non-exact bot close');
+    const queuedControl = vi.fn();
+    const event = makeBotEventData(
+      'om_nonexact_bot_close',
+      rawText,
+      anchor,
+    );
+    event.message.content = JSON.stringify({ text: rawText });
+    event.message.mentions = mentions;
+    const ctx = {
+      ...makeCtx(anchor, 'om_nonexact_bot_close'),
+      queuePostAdmissionControl: queuedControl,
+    };
+    const previousMode = process.env.BOTMUX_COORDINATION_MODE;
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      await handleThreadReply(event, ctx);
+    } finally {
+      if (previousMode === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+      else process.env.BOTMUX_COORDINATION_MODE = previousMode;
+    }
+
+    expect(queuedControl).not.toHaveBeenCalled();
+    expect(session.session.status).toBe('active');
+    expect(repliedText()).toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
   });
 
   it('thread reply delivery failure replies with the notice and rethrows the original error', async () => {
