@@ -207,7 +207,7 @@ import { setTurnResultRuntime } from './core/turn-result-runtime.js';
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
 import { resolvePricingConfig } from './services/model-pricing.js';
-import { createImgNumberer, extractPostAtParticipants, isPlaceholderOnlyText, messageMentionsBot, parseApiMessage, parseEventMessage, resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { createImgNumberer, extractPostAtParticipants, isPlaceholderOnlyText, mentionAppId, mentionOpenId, messageMentionsBot, parseApiMessage, parseEventMessage, resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import {
   getGroupContextSettings,
   groupContextSettingsStorePath,
@@ -28226,6 +28226,30 @@ interface ThreadSlashContext {
   getThreadSender: () => Promise<Parameters<typeof setDirectChatDisplayNameFromSender>[2]>;
 }
 
+function isExactDurableCloseCommand(
+  data: any,
+  larkAppId: string,
+): boolean {
+  const message = data?.message;
+  if (message?.message_type !== 'text') return false;
+  let body: unknown;
+  try { body = JSON.parse(message.content ?? '{}'); } catch { return false; }
+  if (!body || typeof body !== 'object' || typeof (body as { text?: unknown }).text !== 'string') {
+    return false;
+  }
+  const bot = getBot(larkAppId);
+  let text = (body as { text: string }).text;
+  const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+  for (const mention of mentions) {
+    const self = (!!bot.botOpenId && mentionOpenId(mention) === bot.botOpenId)
+      || mentionAppId(mention) === larkAppId;
+    const key = typeof mention?.key === 'string' ? mention.key : '';
+    if (!self || !key) continue;
+    text = text.split(key).join('');
+  }
+  return text.trim().toLowerCase() === '/close';
+}
+
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
   // Intercept daemon commands
@@ -28515,7 +28539,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // 负责，当前副本消失后仍可恢复。`/close wt` 暂时保留原确认流程，等待
       // worktree retirement 接入同一套分布式协议。
       if (cmd === '/close'
-          && commandContent.trim().toLowerCase() === '/close'
+          && isExactDurableCloseCommand(data, larkAppId)
           && existingDs
           && senderOpenId
           && ctx.queuePostAdmissionControl) {

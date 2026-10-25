@@ -590,6 +590,7 @@ describe('durable Lark session control runtime', () => {
     operatorAllowed = true;
     expect(runtime.ownedPartitionKeys()).toEqual([
       'lark-session-control:cli_test:interactive:session-1',
+      'lark-session-control:cli_test:session-1',
     ]);
     const dispatch = createDurableSessionControlDispatch({
       store,
@@ -650,6 +651,52 @@ describe('durable Lark session control runtime', () => {
     expect(await runtime.authorizeBeforeAck(control().data)).toBe(true);
     expect(runtime.ownedPartitionKeys()).toEqual([]);
     await facade.stop();
+    await store.close();
+  });
+
+  it('advertises an active control partition only from the replica holding its Session lease', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-active-owner-partition-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const ownerFacade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const standbyFacade = createDurableSessionFacade({ store, ownerId: 'session-standby' });
+    const persisted = session();
+    const active = {
+      session: persisted,
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      streamCardId: 'om_card',
+    } as DaemonSession;
+    await admitDurableLarkSession({ facade: ownerFacade, message: message(), session: persisted });
+    const makeRuntime = (facade: ReturnType<typeof createDurableSessionFacade>) =>
+      createDurableLarkSessionControlRuntime({
+        larkAppId: 'cli_test',
+        privateCard: false,
+        store,
+        facade: () => facade,
+        listActiveSessions: () => [active],
+        findActiveSession: () => active,
+        listPersistedSessions: () => [persisted],
+        getPersistedSession: () => persisted,
+        materializeClosedSession: value => value,
+        canOperate: () => true,
+        closeSession: async () => ({ ok: false, error: 'not called' }),
+        resumeSession: async () => ({ ok: false, error: 'not called' }),
+        buildClosedCard: () => 'closed',
+        buildActiveCard: () => 'active',
+        closeResidualText: () => 'residual',
+        closeRefusedText: () => 'refused',
+        resumeRefusedText: () => 'resume-refused',
+      });
+
+    expect(makeRuntime(ownerFacade).ownedPartitionKeys()).toEqual([
+      'lark-session-control:cli_test:interactive:session-1',
+      'lark-session-control:cli_test:session-1',
+    ]);
+    expect(makeRuntime(standbyFacade).ownedPartitionKeys()).toEqual([]);
+
+    await ownerFacade.stop();
+    await standbyFacade.stop();
     await store.close();
   });
 

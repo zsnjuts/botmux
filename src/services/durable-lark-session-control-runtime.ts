@@ -8,6 +8,7 @@ import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
 import {
   durableDirectSessionControlEvent,
   durableInteractiveSessionControlPartition,
+  durableLarkSessionControlPartition,
   parseDurableSessionControlClaim,
 } from './durable-lark-session-control.js';
 import type {
@@ -191,19 +192,34 @@ export function createDurableLarkSessionControlRuntime(
   );
 
   const ownedPartitionKeys = (): string[] => {
-    const sessionIds = new Set<string>();
+    const partitions = new Set<string>();
     for (const ds of options.listActiveSessions()) {
-      if (ds.larkAppId === options.larkAppId && ds.session.status === 'active') {
-        sessionIds.add(ds.session.sessionId);
+      const canonicalKey = sessionKey(sessionAnchorId(ds), options.larkAppId);
+      if (ds.larkAppId === options.larkAppId
+          && ds.session.status === 'active'
+          && options.facade().ownsLease(canonicalKey)) {
+        partitions.add(durableInteractiveSessionControlPartition(
+          options.larkAppId,
+          ds.session.sessionId,
+        ));
+        // Trusted-host handoff rows deliberately retain the original ordinary
+        // Session partition. Advertise it from the same exact lease owner so a
+        // rolling standby cannot monopolize those rows through prefix fallback.
+        partitions.add(durableLarkSessionControlPartition(
+          options.larkAppId,
+          ds.session.sessionId,
+        ));
       }
     }
     for (const session of options.listPersistedSessions()) {
       if (session.larkAppId === options.larkAppId && session.status === 'closed') {
-        sessionIds.add(session.sessionId);
+        partitions.add(durableInteractiveSessionControlPartition(
+          options.larkAppId,
+          session.sessionId,
+        ));
       }
     }
-    return [...sessionIds].map(sessionId =>
-      durableInteractiveSessionControlPartition(options.larkAppId, sessionId));
+    return [...partitions];
   };
 
   const authorizeBeforeAck = async (raw: unknown): Promise<boolean> => {

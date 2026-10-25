@@ -115,6 +115,8 @@ The first primary release deliberately narrows unsupported multi-effect shapes i
 
 These limitations are observable feature gates, never fallback routes. Tests also cover type-ahead output, zero-wait topic seeds and durable message-edit admission. A two-runtime SQLite integration test admits and delivers 100 independent Sessions across ingress-leader shutdown and takeover, while the provider contract suite continues to verify stale lease, claim and outbox fencing independently.
 
+An active Session's exact interactive-control partition is advertised only by the replica whose Session facade currently retains that canonical route lease. A standby may still authorize the callback from shared canonical state and discover failover work through the bounded application-prefix fallback, but a stale replica-local Session row does not put it in the exact-owner claim set; Session lease acquisition remains the final mutation fence. This prevents a standby from repeatedly reclaiming an owner's close or resume event until the live lease expires.
+
 ## Shutdown
 
 Graceful daemon shutdown requests provider `close` and bounds the response. Fatal process exit terminates the child synchronously. A provider close failure is logged without provider stderr, the child is terminated, and the daemon continues its existing bounded shutdown.

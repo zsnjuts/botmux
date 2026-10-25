@@ -184,6 +184,7 @@ export function startDurableSessionControlConsumer(
   let partitionCursor = 0;
   let lastFallbackClaimAt = now();
   let fallbackWindowOpen = false;
+  let fallbackProbeInFlight = false;
 
   const reportError = (error: unknown): void => {
     try { options.onError?.(error); } catch { /* observers cannot alter claim state */ }
@@ -205,7 +206,10 @@ export function startDurableSessionControlConsumer(
     return batch;
   };
 
-  const processClaim = async (initialClaim: InboxClaim): Promise<void> => {
+  const processClaim = async (
+    initialClaim: InboxClaim,
+    claimSource: 'exact' | 'prefix-probe' | 'prefix-fanout',
+  ): Promise<void> => {
     const controller = new AbortController();
     controllers.add(controller);
     let claim = initialClaim;
@@ -256,11 +260,30 @@ export function startDurableSessionControlConsumer(
       }
       try { options.onSettled?.({ control, result }); }
       catch (error) { reportError(error); }
+      if (claimSource === 'prefix-probe') {
+        // Only a fully settled prefix probe proves that this fallback window
+        // contains canonical-only work which may safely use idle fanout slots.
+        fallbackWindowOpen = true;
+      }
     } catch (error) {
       clearInterval(renewalTimer);
       if (renewing) await renewing;
       if (ownershipLost || controller.signal.aborted) return;
       reportError(error);
+      if (claimSource !== 'exact'
+          && error instanceof DurableSessionControlOwnerHandoffError) {
+        // A prefix probe raced a still-live exact owner. Close the shared
+        // fallback fanout immediately: otherwise every idle slot keeps
+        // reclaiming the retried row through the broad application prefix and
+        // can starve the exact owner's filtered claim indefinitely. The next
+        // periodic probe remains available when that owner really disappears.
+        fallbackWindowOpen = false;
+        lastFallbackClaimAt = now();
+      } else if (claimSource === 'prefix-probe') {
+        // Unknown/provider failures are not authority to widen a prefix probe
+        // into concurrent fallback claims.
+        fallbackWindowOpen = false;
+      }
       const delayMs = error instanceof DurableSessionControlOwnerHandoffError
         ? ownerHandoffRetryDelayMs
         : error instanceof DurableSessionControlDeferredError
@@ -275,6 +298,7 @@ export function startDurableSessionControlConsumer(
       }
     } finally {
       clearInterval(renewalTimer);
+      if (claimSource === 'prefix-probe') fallbackProbeInFlight = false;
       controllers.delete(controller);
     }
   };
@@ -283,28 +307,33 @@ export function startDurableSessionControlConsumer(
     const slotWorkerId = `${workerId}:${slot.index}`;
     for (let index = 0; index < batchSize && !stopped; index++) {
       let claim: InboxClaim | undefined;
+      let claimSource: 'exact' | 'prefix-probe' | 'prefix-fanout' | undefined;
       try {
         const partitionKeys = nextOwnedPartitionBatch();
         let prefixClaimAttempted = false;
         if (partitionKeyPrefix
+            && !fallbackWindowOpen
+            && !fallbackProbeInFlight
             && now() - lastFallbackClaimAt >= fallbackClaimIntervalMs) {
-          // Give exact owners the initial interval, then reserve one periodic
-          // prefix-first probe. If locally owned partitions are continuously
-          // retryable, probing the prefix only after an exact miss starves
-          // canonical-only failover controls forever. Opening the fallback
-          // window also lets other idle slots use the prefix after an exact
-          // miss. Without that second path, even one locally owned partition
-          // keeps a large canonical-only backlog serialized behind this
-          // single periodic probe.
-          fallbackWindowOpen = true;
+          // Give exact owners the initial interval, then reserve exactly one
+          // prefix-first probe. Other slots may continue exact-owner work, but
+          // cannot join prefix fanout until this probe settles successfully.
+          fallbackProbeInFlight = true;
           lastFallbackClaimAt = now();
           prefixClaimAttempted = true;
-          claim = await options.store.claimNextInbox({
-            workerId: slotWorkerId,
-            lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
-            partitionKeyPrefix,
-            leaseDurationMs,
-          });
+          try {
+            claim = await options.store.claimNextInbox({
+              workerId: slotWorkerId,
+              lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+              partitionKeyPrefix,
+              leaseDurationMs,
+            });
+            if (claim) claimSource = 'prefix-probe';
+            else fallbackProbeInFlight = false;
+          } catch (error) {
+            fallbackProbeInFlight = false;
+            throw error;
+          }
         }
         if (!claim && partitionKeys.length > 0) {
           claim = await options.store.claimNextInbox({
@@ -313,6 +342,7 @@ export function startDurableSessionControlConsumer(
             partitionKeys,
             leaseDurationMs,
           });
+          if (claim) claimSource = 'exact';
         }
         if (!claim && partitionKeyPrefix && fallbackWindowOpen && !prefixClaimAttempted) {
           claim = await options.store.claimNextInbox({
@@ -321,6 +351,13 @@ export function startDurableSessionControlConsumer(
             partitionKeyPrefix,
             leaseDurationMs,
           });
+          if (claim) claimSource = 'prefix-fanout';
+          else {
+            // The canonical-only backlog is drained. Restore the grace period
+            // before a future row may use broad prefix discovery.
+            fallbackWindowOpen = false;
+            lastFallbackClaimAt = now();
+          }
         }
         if (partitionKeys.length === 0 && !partitionKeyPrefix) return;
       } catch (error) {
@@ -332,7 +369,11 @@ export function startDurableSessionControlConsumer(
         reportError(new Error(`durable session control claim belongs to ${claim.workerId}`));
         return;
       }
-      await processClaim(claim);
+      if (!claimSource) {
+        reportError(new Error(`durable session control claim source is unavailable`));
+        return;
+      }
+      await processClaim(claim, claimSource);
     }
   };
 
