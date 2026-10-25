@@ -492,7 +492,7 @@ describe('durable config coordinator', () => {
     await store.close();
   });
 
-  it('never combines path rebinding with content reconciliation', async () => {
+  it('combines path rebinding with content reconciliation only when explicitly requested', async () => {
     const { path, store, coordinator } = fixture();
     const oldPathSha256 = '7'.repeat(64);
     const committedSha256 = contentSha256(path);
@@ -509,6 +509,63 @@ describe('durable config coordinator', () => {
       expectedCommittedSha256: committedSha256,
       expectedFileSha256: fileSha256,
     })).rejects.toThrow('durable_config_rebind_content_drift');
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({ revision: 1, value: { pathSha256: oldPathSha256, audit: [] } });
+
+    const recovered = await coordinator.rebindPath({
+      scope: 'global',
+      path,
+      expectedRecordRevision: 1,
+      expectedBoundPathSha256: oldPathSha256,
+      expectedCurrentPathSha256: pathSha256(path),
+      expectedCommittedSha256: committedSha256,
+      expectedFileSha256: fileSha256,
+      reconcileContent: true,
+    });
+    expect(recovered).toMatchObject({
+      status: 'in_sync',
+      recordRevision: 2,
+      boundPathSha256: pathSha256(path),
+      currentPathSha256: pathSha256(path),
+      committedSha256: fileSha256,
+      fileSha256,
+    });
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({
+        revision: 2,
+        value: {
+          baseSha256: committedSha256,
+          contentSha256: fileSha256,
+          pathSha256: pathSha256(path),
+          audit: [{
+            outcome: 'reconciled_external',
+            baseSha256: committedSha256,
+            contentSha256: fileSha256,
+            basePathSha256: oldPathSha256,
+            pathSha256: pathSha256(path),
+            changedPaths: ['<external-reconcile>', '<path-identity-rebind>'],
+          }],
+        },
+      });
+    await store.close();
+  });
+
+  it('refuses the combined recovery when either path or content is already synchronized', async () => {
+    const { path, store, coordinator } = fixture();
+    const digest = contentSha256(path);
+    const oldPathSha256 = '7'.repeat(64);
+    await seedV2PathRecord(store, { scope: 'global', path, pathSha256: oldPathSha256 });
+
+    await expect(coordinator.rebindPath({
+      scope: 'global',
+      path,
+      expectedRecordRevision: 1,
+      expectedBoundPathSha256: oldPathSha256,
+      expectedCurrentPathSha256: pathSha256(path),
+      expectedCommittedSha256: digest,
+      expectedFileSha256: digest,
+      reconcileContent: true,
+    })).rejects.toThrow('durable_config_rebind_reconcile_not_drifted');
     expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
       .toMatchObject({ revision: 1, value: { pathSha256: oldPathSha256, audit: [] } });
     await store.close();
