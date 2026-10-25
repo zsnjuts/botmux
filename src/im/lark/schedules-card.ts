@@ -28,6 +28,7 @@ import type {
 import {
   computeDeliveryButtonAvailability,
   computeButtonAvailability,
+  compactScheduleSessionId,
   paginateSchedules,
   nextScheduleExecutionPosition,
   resolveScheduleExecutionPlacement,
@@ -305,6 +306,12 @@ function renderRow(row: ScheduleRowDto, locale: Locale, showBotLabel: boolean): 
   if (repeatStr) {
     secondaryParts.push(t('card.dashboard.schedules.repeat_label', { repeat: repeatStr }, locale));
   }
+  const boundSession = compactScheduleSessionId(row.raw.boundSessionId);
+  if (boundSession) {
+    secondaryParts.push(t('card.dashboard.schedules.bound_session_label', {
+      session: boundSession,
+    }, locale));
+  }
   // In global scope, prefix rows with the owning bot so same-name schedules
   // remain distinguishable.
   // Preference: row.raw.botName → larkAppId short-suffix → '—'.
@@ -481,6 +488,24 @@ export function buildSchedulesDetailCard(
       t(
         'card.dashboard.schedules.detail.status_label',
         { status: escapeLarkMd(detail.lastStatus) },
+        opts.locale,
+      ),
+    );
+  }
+  if (detail.boundSessionId) {
+    infoLines.push(
+      t(
+        'card.dashboard.schedules.detail.bound_session_label',
+        { session: escapeLarkMd(detail.boundSessionId) },
+        opts.locale,
+      ),
+    );
+  }
+  if (detail.lastStatus === 'error' && detail.lastError) {
+    infoLines.push(
+      t(
+        'card.dashboard.schedules.detail.error_label',
+        { reason: escapeLarkMd(detail.lastError) },
         opts.locale,
       ),
     );

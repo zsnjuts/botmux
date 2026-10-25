@@ -20,12 +20,19 @@ import {
   initialScheduleEditPosition,
   scheduleTargetChatIds,
   scheduleCalendarLabel,
+  compactDashboardScheduleSessionId,
 } from '../src/dashboard/web/schedules-page.js';
 
 const TRUSTED_FILE_ROOT = '/srv/botmux-data/schedule-preconditions/trusted-files';
 const TRUSTED_FILE_PATH = `${TRUSTED_FILE_ROOT}/check-ready.sh`;
 
 describe('dashboard schedules React page helpers', () => {
+  it('compacts a bound Session id without hiding its stable prefix and suffix', () => {
+    expect(compactDashboardScheduleSessionId('session-1234567890abcdef')).toBe('session-…cdef');
+    expect(compactDashboardScheduleSessionId('short-session')).toBe('short-session');
+    expect(compactDashboardScheduleSessionId('  ')).toBeUndefined();
+  });
+
   it('shows localized calendar names and day selections instead of a builtin ID', () => {
     const names = { zh: '中国法定工作日历', en: 'China Statutory Work Calendar' };
     expect(scheduleCalendarLabel('cn', names, 'zh')).toBe(names.zh);

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { ParsedSchedule } from '../src/types.js';
 import {
   computeButtonAvailability,
+  compactScheduleSessionId,
   computeDeliveryButtonAvailability,
   computeNextNRuns,
   filterSchedules,
@@ -153,6 +154,29 @@ describe('schedule-card-model · toScheduleDetailDto', () => {
     const sd = toScheduleDetailDto(short, { nowMs: FIXED_NOW, promptTruncateAt: 100 });
     expect(sd.promptTruncated).toBe(false);
     expect(sd.prompt).toBe('short');
+  });
+
+  it('projects the bound Session and exact last failure into task details', () => {
+    const detail = toScheduleDetailDto(makeTask({
+      boundSessionId: 'session-1234567890abcdef',
+      lastStatus: 'error',
+      lastError: 'anchor_occupied',
+    }), { nowMs: FIXED_NOW });
+
+    expect(detail.boundSessionId).toBe('session-1234567890abcdef');
+    expect(detail.lastError).toBe('anchor_occupied');
+    expect(compactScheduleSessionId(detail.boundSessionId)).toBe('session-…cdef');
+  });
+
+  it('bounds the Lark detail failure text while preserving its diagnostic prefix', () => {
+    const detail = toScheduleDetailDto(makeTask({
+      lastStatus: 'error',
+      lastError: `anchor_occupied: ${'x'.repeat(800)}`,
+    }), { nowMs: FIXED_NOW });
+
+    expect(detail.lastError?.startsWith('anchor_occupied: ')).toBe(true);
+    expect(detail.lastError?.endsWith('…')).toBe(true);
+    expect(detail.lastError?.length).toBe(501);
   });
 });
 

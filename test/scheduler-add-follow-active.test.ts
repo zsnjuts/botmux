@@ -60,6 +60,38 @@ afterEach(() => {
 });
 
 describe('scheduler.addTask → schedule-store', () => {
+  it('persists an exact bound Session only for fixed topic execution', async () => {
+    const { store, scheduler } = await freshImport();
+    const task = scheduler.addTask({ ...PARAMS, boundSessionId: 'session-bound-1' });
+    expect(task.boundSessionId).toBe('session-bound-1');
+    expect(store.getTask(task.id, TEST_APP)?.boundSessionId).toBe('session-bound-1');
+  });
+
+  it('rejects bound Session routing that can move or create another conversation', async () => {
+    const { scheduler } = await freshImport();
+    expect(() => scheduler.addTask({
+      ...PARAMS,
+      executionPosition: 'top-level',
+      rootMessageId: undefined,
+      boundSessionId: 'session-bound-1',
+    })).toThrow('bound_session_requires_topic');
+    expect(() => scheduler.addTask({
+      ...PARAMS,
+      followActive: true,
+      boundSessionId: 'session-bound-1',
+    })).toThrow('bound_session_follow_active_conflict');
+  });
+
+  it('clears an existing binding when an edit moves the task away from its exact topic', async () => {
+    const { store, scheduler } = await freshImport();
+    const task = scheduler.addTask({ ...PARAMS, boundSessionId: 'session-bound-1' });
+    expect(scheduler.updateTask(task.id, { executionPosition: 'top-level' })).toEqual({ ok: true });
+    expect(store.getTask(task.id, TEST_APP)).toMatchObject({
+      executionPosition: 'top-level',
+      boundSessionId: undefined,
+    });
+  });
+
   it('persists followActive: true so the stored task carries it', async () => {
     const { store, scheduler } = await freshImport();
     const task = scheduler.addTask({ ...PARAMS, followActive: true });

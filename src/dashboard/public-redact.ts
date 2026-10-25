@@ -138,6 +138,8 @@ export function stripAllSchedulePreconditionMaterial(schedule: unknown): unknown
 }
 
 /** Drop `prompt` (business instructions), `workingDir` (repo/customer path),
+ * `lastError` (which can include backend/path details), `boundSessionId`
+ * (management identity),
  *  and every executable/authority-bearing precondition field from
  *  `/api/schedules` rows for anonymous visitors. The supported list projection
  *  may carry only `hasPrecondition` / `preconditionEnabled`; source/path/script/
@@ -152,6 +154,8 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
     const {
       prompt: _prompt,
       workingDir: _workingDir,
+      lastError: _lastError,
+      boundSessionId: _boundSessionId,
       ...rest
     } = projected as Record<string, unknown>;
     return rest;

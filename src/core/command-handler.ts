@@ -964,7 +964,8 @@ async function handleScheduleCommand(
       const runAsStr = task.ownerUnionId
         ? `\n   runAs: ${task.ownerOpenId ?? task.ownerUnionId}`
         : '\n   runAs: —（无创建人身份，按身份鉴权的工具会 fail-closed）';
-      return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${runAsStr}${nextStr}${lastStr}`;
+      const boundStr = task.boundSessionId ? `\n   session: ${task.boundSessionId}（绑定）` : '';
+      return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${runAsStr}${boundStr}${nextStr}${lastStr}`;
     });
     await sessionReply(rootId, `${t('schedule.list_header', { count: tasks.length }, loc)}\n\n${lines.join('\n\n')}`);
     return;

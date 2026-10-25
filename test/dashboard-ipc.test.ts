@@ -6101,6 +6101,7 @@ describe('GET /api/schedules', () => {
       larkAppId: 'cli_ipc_test_bot001',
       executionPosition: 'topic',
       rootMessageId: 'om_schedule_root',
+      boundSessionId: 'session-schedule-bound',
       chatType: 'topic_group',
     });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -6115,6 +6116,7 @@ describe('GET /api/schedules', () => {
       name: 'AI 工作环境巡检',
       schedule: '10 0,12 * * *',
       parsed: { display: '10 0,12 * * *' },
+      boundSessionId: 'session-schedule-bound',
     });
   });
 

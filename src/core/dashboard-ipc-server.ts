@@ -5637,6 +5637,7 @@ export interface ScheduleRow {
   nextRunAt?: string;
   lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
+  boundSessionId?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
@@ -5835,6 +5836,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     nextRunAt: t.nextRunAt,
     lastStatus: t.lastStatus,
     lastError: t.lastError,
+    boundSessionId: t.boundSessionId,
     repeat: t.repeat,
     deliver: t.deliver ?? 'origin',
     silent: t.silent,

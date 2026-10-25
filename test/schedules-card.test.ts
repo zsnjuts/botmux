@@ -100,6 +100,14 @@ describe('buildSchedulesCard', () => {
     expect(json).toContain('已跑 3/10');
   });
 
+  it('row marks a task that is bound to its original Session', () => {
+    const json = buildSchedulesCard([
+      task({ boundSessionId: 'session-1234567890abcdef' }),
+    ], baseOpts, NOW);
+
+    expect(json).toContain('🔗 原会话 session-…cdef');
+  });
+
   it('pagination at >5 tasks; page=2 of 5 emits prev=1 / next=3', () => {
     // PAGE_SIZE=5 (unified 2026-06-10). 25 / 5 = 5 pages.
     const tasks: ScheduleCardTaskInput[] = Array.from({ length: 25 }, (_, i) =>
@@ -386,6 +394,19 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(json).toContain('定时任务详情');
     expect(json).toContain('my schedule');
     expect(json).toContain('sch_detail_123');
+  });
+
+  it('shows the exact bound Session and last failure reason in detail', () => {
+    const detail = detailFor({
+      boundSessionId: 'session-bound-123',
+      lastStatus: 'error',
+      lastError: 'Scheduled task lost its bound Session',
+    });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+
+    expect(json).toContain('绑定会话：session-bound-123');
+    expect(json).toContain('关闭后到点恢复同一会话');
+    expect(json).toContain('失败原因：Scheduled task lost its bound Session');
   });
 
   it('renders pause + resume + execution-position + back buttons', () => {
