@@ -336,7 +336,7 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.queue.usage': 'Usage: /queue <text message> (multiline plain text supported; rich text and attachments are not supported yet)',
-  'cmd.queue.unsupported': '/queue currently supports Codex App sessions only.',
+  'cmd.queue.unsupported': '/queue currently supports Codex App or Remote Runner sessions only.',
   'cmd.queue.not_ready': 'Session is not ready. Start the session before retrying /queue.',
   'cmd.queue.accepted': 'Accepted: runs as a separate turn after the active task, or starts immediately when idle.',
   'cmd.queue.identity_window': 'Later messages during the wait may invalidate this turn’s bytedcli/lark-cli identity. If a turn mismatch is reported, resend the task.',

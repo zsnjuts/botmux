@@ -9,6 +9,9 @@ import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
   queueAfterActiveTurn?: true;
+  /** Explicit Remote Runner in-turn steer. It may cross an existing durable
+   * turn barrier but remains subordinate to that turn's final ownership. */
+  activeTurnSteer?: true;
   content: string;
   /** The real user turn represented by `content` when delivery uses a short
    * adapter command. Transcript bridges fingerprint this value, while the PTY
@@ -152,10 +155,11 @@ export function pendingInputAllowsTypeAhead(
   next: PendingCliInput | undefined,
   directRpcTurnInFlight = false,
 ): boolean {
-  return adapterSupportsTypeAhead
-    && !durableTurnInFlight
+  const activeTurnSteer = next?.activeTurnSteer === true;
+  return (adapterSupportsTypeAhead || activeTurnSteer)
+    && (!durableTurnInFlight || activeTurnSteer)
     && !directRpcTurnInFlight
-    && next?.dispatchAttempt === undefined
+    && (next?.dispatchAttempt === undefined || activeTurnSteer)
     && !next?.vcMeetingImTurnOrigin;
 }
 
@@ -296,8 +300,11 @@ export function shouldStopPendingBatch(
 
 /** A durable attempt is a hard head-of-line barrier even if screen detection
  * says the CLI looks idle. Only its exact terminal may release the queue. */
-export function pendingInputMayFlush(durableTurnInFlight: boolean): boolean {
-  return !durableTurnInFlight;
+export function pendingInputMayFlush(
+  durableTurnInFlight: boolean,
+  next?: PendingCliInput,
+): boolean {
+  return !durableTurnInFlight || next?.activeTurnSteer === true;
 }
 
 export function terminalReleasesDurableTurn(

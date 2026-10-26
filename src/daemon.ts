@@ -672,6 +672,7 @@ import {
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
+import type { RemoteRunnerConfig } from './adapters/backend/remote-runner-config.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import { createPluginCardActionGateway } from './core/plugins/card-actions/gateway.js';
 import { createInputCaptureStore } from './core/plugins/input-capture/store.js';
@@ -6147,8 +6148,13 @@ async function submitQueuedMessage(
   const sender = await resolveSender(ds.larkAppId, message.senderId, message.senderType);
   if (!isCurrent()) return false;
   const bot = getBot(ds.larkAppId);
+  const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId
+    ?? ds.session.cliId
+    ?? bot.config.cliId;
+  const remoteRunnerQueue = (ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner';
   const input = buildFollowUpCliInput(text, ds.session.sessionId, {
-    cliId: 'codex-app', sender, codexAppText: text,
+    cliId: effectiveCliId, sender,
+    ...(isCodexAppCliId(effectiveCliId) ? { codexAppText: text } : {}),
     mentions: message.mentions,
     larkAppId: ds.larkAppId, chatId: ds.session.chatId,
     selfMention: { name: bot.botName, openId: bot.botOpenId },
@@ -6196,10 +6202,11 @@ async function submitQueuedMessage(
   // and carried across runner recovery; user-written text cannot enable it.
   if (!sendWorkerInput(ds, input, message.messageId, {
     notifyRejection: false,
+    queueAfterActiveTurn: true,
     trustedCaller,
   })) { rollbackReplyContext(); return false; }
   ds.session.lastCallerOpenId = message.senderId;
-  beginNewTurn(ds, text, message.messageId);
+  if (!remoteRunnerQueue) beginNewTurn(ds, text, message.messageId);
   rememberLastCliInput(ds, text, input);
   markSessionActivity(ds, Date.now(), { human: senderIsBot === false });
   sessionStore.updateSession(ds.session);
@@ -23398,12 +23405,14 @@ function hasDurablePrimaryInputCommit(ds: DaemonSession, turnId: string): boolea
 function durablePrimaryTurnDisposition(
   ds: DaemonSession,
   turnId: string,
+  opts: { allowActiveTurnSteer?: boolean } = {},
 ): ReturnType<typeof durablePrimaryExistingTurnDisposition> {
   return durablePrimaryExistingTurnDisposition({
     session: ds.session,
     worker: ds.worker,
     cliReady: ds.cliReady,
     activeInteractiveTurn: ds.activeInteractiveTurn,
+    ...(opts.allowActiveTurnSteer ? { allowActiveTurnSteer: true } : {}),
     // Durable queued-activation state is recovery input, not proof that a live
     // handler owns this dead worker generation. Only a pending repository
     // choice or another handler's live claim token blocks a cold refork.
@@ -23413,6 +23422,35 @@ function durablePrimaryTurnDisposition(
         ? 'in-flight-claim'
         : undefined,
   }, turnId);
+}
+
+/** A Remote Runner steer is opt-in on both sides and may only inherit the
+ * exact active principal. This helper reads the frozen live worker config,
+ * never a newly edited bot default, so capability changes take effect only on
+ * a new worker generation. */
+function durablePrimaryActiveTurnSteerAuthorized(
+  ds: DaemonSession,
+  caller: TrustedCaller | undefined,
+  opts: { explicitBotSteer?: boolean } = {},
+): boolean {
+  const active = ds.activeInteractiveTurn;
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  const remoteConfig = backendType === 'remote-runner'
+    ? ds.initConfig?.backendConfig as RemoteRunnerConfig | undefined
+    : undefined;
+  // Match the existing single-machine steer contract: an authenticated human
+  // may append normally, while a positively classified peer bot must opt in
+  // with the consumed `@steer` directive.  The bot stays a bot in the trusted
+  // caller/audit tuple; the directive never borrows its configured human owner.
+  const callerRequestedSteer = caller?.senderType === 'user'
+    || (caller?.senderType === 'bot' && opts.explicitBotSteer === true);
+  return backendType === 'remote-runner'
+    && remoteConfig?.requiredCapabilities?.includes('turn_steer') === true
+    && callerRequestedSteer
+    && !!active
+    && hasDurablePrimaryInputCommit(ds, active.turnId)
+    && (sameTrustedPrincipal(active.caller, caller)
+      || sameTrustedPrincipal(active.controller, caller));
 }
 
 function retryDurablePrimaryIngress(ctx: RoutingContext, reason: string): boolean {
@@ -26745,6 +26783,7 @@ async function handleThreadReplyAdmitted(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(runtimeSessionKey);
+  let durablePrimaryActiveTurnSteer = false;
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
@@ -26758,7 +26797,24 @@ async function handleThreadReplyAdmitted(
   // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
   // retry must be a pure claim-state transition.
   if (ds && ctx.durablePrimaryDispatch) {
-    const disposition = durablePrimaryTurnDisposition(ds, parsed.messageId);
+    durablePrimaryActiveTurnSteer = durablePrimaryActiveTurnSteerAuthorized(
+      ds,
+      threadTrustedCaller,
+      { explicitBotSteer: botSteerDirective.requested },
+    )
+      && !ds.adoptedFrom
+      && !ds.initConfig?.adoptMode
+      && !ds.session.principalLane
+      && !ds.session.xpiSharedCwdAdmissionGroupId
+      && !substituteTrigger
+      && !threadGrill
+      && !ctx.completionProposalContinuation
+      && !ctx.messageListener
+      && !ds.session.vcMeetingReceiver
+      && !ctx.vcMeetingImTurnOrigin;
+    const disposition = durablePrimaryTurnDisposition(ds, parsed.messageId, {
+      ...(durablePrimaryActiveTurnSteer ? { allowActiveTurnSteer: true } : {}),
+    });
     if (disposition === 'committed') {
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       markSessionActivity(ds, Date.now(), {
@@ -26816,6 +26872,9 @@ async function handleThreadReplyAdmitted(
       );
       return;
     }
+    // Frozen for the live-worker send below. The active turn may settle during
+    // resource preparation; the worker/backend then returns an untouched
+    // rejection and this durable claim retries as an ordinary successor.
   }
   if (ds && fillNativeTopicId(ds.session, scope, parsed.threadId)) {
     sessionStore.updateSession(ds.session);
@@ -27793,6 +27852,7 @@ async function handleThreadReplyAdmitted(
               }
             : {}),
           ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(durablePrimaryActiveTurnSteer ? { activeTurnSteer: true as const } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
           ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
         });
@@ -27805,8 +27865,8 @@ async function handleThreadReplyAdmitted(
       if (accepted) {
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
         markIngressAdmitted(ctx);
-        beginNewTurn(ds, parsed.content, parsed.messageId);
-        if (threadTrustedCaller) {
+        if (!durablePrimaryActiveTurnSteer) beginNewTurn(ds, parsed.content, parsed.messageId);
+        if (threadTrustedCaller && !durablePrimaryActiveTurnSteer) {
           setActiveInteractiveTurn(
             ds,
             parsed.messageId,
@@ -27814,7 +27874,7 @@ async function handleThreadReplyAdmitted(
             stripCrossPrincipalAsToken(parsed.content).text,
           );
         }
-        rememberLastCliInput(ds, promptContent, cliInput);
+        if (!durablePrimaryActiveTurnSteer) rememberLastCliInput(ds, promptContent, cliInput);
         if (ctx.durablePrimaryDispatch) {
           try {
             await waitForDurablePrimaryInputCommit(
@@ -27831,6 +27891,24 @@ async function handleThreadReplyAdmitted(
               + `${error instanceof Error ? error.message : String(error)}`,
             );
             return;
+          }
+          if (durablePrimaryActiveTurnSteer && ctx.queuePostAdmissionOutput) {
+            const providerUuid = `turn_steer_accepted_${createHash('sha256')
+              .update(JSON.stringify([
+                ds.larkAppId,
+                ds.session.sessionId,
+                parsed.messageId,
+                'turn-steer-accepted',
+              ]))
+              .digest('hex')
+              .slice(0, 24)}`;
+            ctx.queuePostAdmissionOutput({
+              target: durableOutboxTargetForTurn(ds, parsed.messageId),
+              content: tr('worker.steer_accepted', undefined, localeForBot(ds.larkAppId)),
+              msgType: 'text',
+              providerUuid,
+              hookContext: { sessionId: ds.session.sessionId, turnId: parsed.messageId },
+            });
           }
         }
       }
