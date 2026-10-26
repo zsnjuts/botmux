@@ -2465,6 +2465,7 @@ export type NativeSubagentRuntimeConfigState =
 
 const bots = new Map<string, BotState>();
 let parsedNativeSubagentRuntimeStatus = new WeakMap<BotConfig, NativeSubagentRuntimeConfigState['status']>();
+let processBotConfigReadSnapshot: (() => BotConfig[]) | null = null;
 
 export function __testOnly_resetBotRegistry(): void {
   clearCodexInstanceBots();
@@ -2478,6 +2479,7 @@ export function __testOnly_resetBotRegistry(): void {
   cachedLarkUploadHttpPool = undefined;
   usageDisplayCache = null;
   replyStyleCache = null;
+  processBotConfigReadSnapshot = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -2509,6 +2511,24 @@ export function getLoadedConfigPath(): string | undefined {
  */
 export function getLoadedConfigProvenance(): BotsConfigProvenance | undefined {
   return loadedConfigProvenance;
+}
+
+/**
+ * 将当前进程的 Bot 配置读取切到 last-known-good 内存快照。Dashboard 由此避免在
+ * HTTP event loop 上 open 共享存储；daemon / CLI 仍保留原来的直接文件语义。
+ */
+export function installBotConfigReadSnapshot(provider: () => BotConfig[]): () => void {
+  const previous = processBotConfigReadSnapshot;
+  processBotConfigReadSnapshot = provider;
+  return () => {
+    if (processBotConfigReadSnapshot === provider) processBotConfigReadSnapshot = previous;
+  };
+}
+
+/** 将已经成功解析的异步快照登记为当前进程的配置来源。 */
+export function adoptBotConfigSnapshotSource(filePath: string): void {
+  loadedConfigPath = resolve(filePath);
+  loadedConfigProvenance = 'loaded';
 }
 
 // Route Lark SDK output through our logger so it inherits the same sink
@@ -2949,6 +2969,19 @@ let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null 
 
 function refreshRegisteredOncallChatsFromDisk(): void {
   if (underReadIsolation()) return;
+  if (processBotConfigReadSnapshot) {
+    const byAppId = new Map(processBotConfigReadSnapshot().map(config => [config.larkAppId, config.oncallChats ?? []] as const));
+    const chats = new Map<string, OncallChat>();
+    for (const botChats of byAppId.values()) {
+      for (const chat of botChats) chats.set(chat.chatId, chat);
+    }
+    for (const [larkAppId, bot] of bots) {
+      const botChats = byAppId.get(larkAppId);
+      if (botChats) bot.config.oncallChats = botChats;
+    }
+    oncallChatCache = { mtimeMs: -1, chats };
+    return;
+  }
   const path = loadedConfigProvenance === 'loaded' ? loadedConfigPath : undefined;
   if (!path) return;
   try {
@@ -3116,6 +3149,9 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
   }
   const inMem = bots.get(larkAppId);
   if (inMem) return inMem.config.brandLabel;
+  if (processBotConfigReadSnapshot) {
+    return processBotConfigReadSnapshot().find(config => config.larkAppId === larkAppId)?.brandLabel;
+  }
   const path = loadedConfigPath ?? botsConfigDiskPath();
   if (!path) return undefined;
   try {
@@ -3152,6 +3188,10 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
     const env = process.env.BOTMUX_USAGE_DISPLAY;
     if (env === 'streaming' || env === 'footer' || env === 'off') return env;
     return DEFAULT_USAGE_DISPLAY;
+  }
+  if (processBotConfigReadSnapshot) {
+    const config = processBotConfigReadSnapshot().find(candidate => candidate.larkAppId === larkAppId);
+    return config ? normalizeUsageDisplay(config) : DEFAULT_USAGE_DISPLAY;
   }
   const path = loadedConfigPath ?? botsConfigDiskPath();
   if (!path) return DEFAULT_USAGE_DISPLAY;
@@ -3198,6 +3238,10 @@ export function resolveReplyStyleConfig(larkAppId: string): ReplyStyleConfig | u
 
   const inMem = bots.get(larkAppId);
   if (inMem) return inMem.config.replyStyle;
+
+  if (processBotConfigReadSnapshot) {
+    return processBotConfigReadSnapshot().find(config => config.larkAppId === larkAppId)?.replyStyle;
+  }
 
   const path = loadedConfigPath ?? botsConfigDiskPath();
   if (!path) return undefined;
@@ -3248,6 +3292,7 @@ export function botAcceptsSlashFromBots(larkAppId: string): boolean {
  *    (riff's in-sandbox headless service).
  */
 export function loadBotConfigs(): BotConfig[] {
+  if (processBotConfigReadSnapshot) return processBotConfigReadSnapshot();
   const synthetic = maybeSynthesizeCoreOnlyConfig();
   if (synthetic) return synthetic;
   return parseBotConfigFile(resolveBotConfigPath());

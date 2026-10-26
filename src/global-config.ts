@@ -825,65 +825,115 @@ function readRawConfig(): Record<string, unknown> {
 const READ_CACHE_TTL_MS = 2_000;
 let readCache: { path: string; value: GlobalConfig; at: number } | null = null;
 let vcMeetingAgentLiveCache: { path: string; mtimeMs: number; config: VcMeetingAgentGlobalConfig } | null = null;
+let processReadSnapshot: {
+  read: () => GlobalConfig;
+  refresh?: () => void;
+} | null = null;
+
+/**
+ * 将当前进程的配置热读路径切到与存储后端解耦的快照。
+ *
+ * Dashboard 启动时安装一次，保证请求处理不再同步 open 共享/NFS 配置；CLI 与 daemon
+ * 仍保留原来的短 TTL 文件语义。返回 disposer 供测试和嵌入式宿主清理，生产
+ * Dashboard 则在整个进程生命周期内保留 provider。
+ */
+export function installGlobalConfigReadSnapshot(provider: {
+  read: () => GlobalConfig;
+  refresh?: () => void;
+}): () => void {
+  const previous = processReadSnapshot;
+  processReadSnapshot = provider;
+  return () => {
+    if (processReadSnapshot === provider) processReadSnapshot = previous;
+  };
+}
 
 /** Typed view of the global config. Validates `lang` so a malformed file
  *  can't propagate a bad value into the i18n module. */
 export function readGlobalConfig(): GlobalConfig {
+  if (processReadSnapshot) return processReadSnapshot.read();
   const path = globalConfigPath();
   if (readCache && readCache.path === path && Date.now() - readCache.at < READ_CACHE_TTL_MS) {
     return readCache.value;
   }
   const raw = readRawConfig();
+  const out = normalizeGlobalConfig(raw);
+  readCache = { path, value: out, at: Date.now() };
+  return out;
+}
+
+/**
+ * 将机器级原始配置文档纯函数、宽容地投影为类型化配置。
+ *
+ * 与 {@link readGlobalConfig} 分离后，常驻进程可以通过非阻塞存储适配器读取字节，
+ * 同时复用传统同步 CLI 路径完全相同的校验和默认值规则。
+ */
+export function normalizeGlobalConfig(raw: unknown): GlobalConfig {
+  const record = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
   const out: GlobalConfig = {};
-  if (isLocale(raw.lang)) out.lang = raw.lang;
-  const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
+  if (isLocale(record.lang)) out.lang = record.lang;
+  const linkRefs = normalizeLinkRefConfig(record.linkRefs);
   if (linkRefs) out.linkRefs = linkRefs;
-  const groupNamePrefix = normalizeGroupNamePrefix(raw.groupNamePrefix);
+  const groupNamePrefix = normalizeGroupNamePrefix(record.groupNamePrefix);
   if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
-  const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
+  const repoPickerMode = readRepoPickerMode(record.repoPickerMode);
   if (repoPickerMode) out.repoPickerMode = repoPickerMode;
-  const dashboard = readDashboard(raw.dashboard);
+  const dashboard = readDashboard(record.dashboard);
   if (dashboard) out.dashboard = dashboard;
-  const voice = readVoice(raw.voice);
+  const voice = readVoice(record.voice);
   if (voice) out.voice = voice;
-  const worker = readWorker(raw.worker);
+  const worker = readWorker(record.worker);
   if (worker) out.worker = worker;
-  const maintenance = readMaintenance(raw.maintenance);
+  const maintenance = readMaintenance(record.maintenance);
   if (maintenance) out.maintenance = maintenance;
-  const whiteboard = readWhiteboard(raw.whiteboard);
+  const whiteboard = readWhiteboard(record.whiteboard);
   if (whiteboard) out.whiteboard = whiteboard;
-  const codexNotifier = readCodexNotifier(raw.codexNotifier);
+  const codexNotifier = readCodexNotifier(record.codexNotifier);
   if (codexNotifier) out.codexNotifier = codexNotifier;
-  const hostOverloadAlert = readHostOverloadAlert(raw.hostOverloadAlert);
+  const hostOverloadAlert = readHostOverloadAlert(record.hostOverloadAlert);
   if (hostOverloadAlert) out.hostOverloadAlert = hostOverloadAlert;
-  const sessionCleanup = readSessionCleanup(raw.sessionCleanup);
+  const sessionCleanup = readSessionCleanup(record.sessionCleanup);
   if (sessionCleanup) out.sessionCleanup = sessionCleanup;
-  const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
+  const vcMeetingAgent = readVcMeetingAgent(record.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
-  const workflow = readWorkflowFeature(raw.workflow);
+  const workflow = readWorkflowFeature(record.workflow);
   if (workflow) out.workflow = workflow;
-  const multiTopic = readMultiTopic(raw.multiTopic);
+  const multiTopic = readMultiTopic(record.multiTopic);
   if (multiTopic) out.multiTopic = multiTopic;
-  if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
+  if (typeof record.httpProxy === 'string' && record.httpProxy.trim()) out.httpProxy = record.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
-  if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
-    out.oauthRedirectBase = raw.oauthRedirectBase.trim();
+  if (typeof record.oauthRedirectBase === 'string' && /^https?:\/\//.test(record.oauthRedirectBase.trim())) {
+    out.oauthRedirectBase = record.oauthRedirectBase.trim();
   }
-  const skills = readGlobalSkills(raw.skills);
+  const skills = readGlobalSkills(record.skills);
   if (skills) out.skills = skills;
-  const plugins = normalizePluginIdList(raw.plugins);
+  const plugins = normalizePluginIdList(record.plugins);
   if (plugins) out.plugins = plugins;
-  if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
+  if (typeof record.remoteAccess === 'boolean') out.remoteAccess = record.remoteAccess;
   // Lenient: keep any non-empty string. IANA validity is enforced on write and
   // re-checked in scheduleTimeZone() (invalid ⇒ falls back to the host zone),
   // so a stale/hand-edited bad value degrades gracefully rather than crashing.
-  if (typeof raw.scheduleTimeZone === 'string' && raw.scheduleTimeZone.trim()) {
-    out.scheduleTimeZone = raw.scheduleTimeZone.trim();
+  if (typeof record.scheduleTimeZone === 'string' && record.scheduleTimeZone.trim()) {
+    out.scheduleTimeZone = record.scheduleTimeZone.trim();
   }
-  const scheduleDelegation = readScheduleDelegation(raw.scheduleDelegation);
+  const scheduleDelegation = readScheduleDelegation(record.scheduleDelegation);
   if (scheduleDelegation) out.scheduleDelegation = scheduleDelegation;
-  readCache = { path, value: out, at: Date.now() };
   return out;
+}
+
+/** 不接触文件系统，直接解析一份 global-config 文档。 */
+export function parseGlobalConfigFromText(jsonText: string): {
+  raw: Record<string, unknown>;
+  config: GlobalConfig;
+} {
+  const parsed: unknown = JSON.parse(jsonText);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Global config file must contain a JSON object');
+  }
+  const raw = parsed as Record<string, unknown>;
+  return { raw, config: normalizeGlobalConfig(raw) };
 }
 
 /** Drop the short-TTL read cache so the next readGlobalConfig re-reads from
@@ -894,6 +944,7 @@ export function readGlobalConfig(): GlobalConfig {
 export function invalidateGlobalConfigCache(): void {
   readCache = null;
   vcMeetingAgentLiveCache = null;
+  processReadSnapshot?.refresh?.();
 }
 
 /** Live VC meeting listener global config. Missing config means enabled.
