@@ -727,6 +727,55 @@ describe('/retry command', () => {
     expect(sendWorkerInput.mock.calls[0][3].trustedCaller.botOwner).toBeUndefined();
   });
 
+  it('binds an ambiguous retry to the exact failed turn id', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({
+        lastFailedTurn: makeFailedTurn({
+          turnId: 'turn-ambiguous-1',
+          status: 'ambiguous',
+          errorCode: 'remote_runner_turn_ambiguous',
+        }),
+      }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(sendWorkerInput.mock.calls[0][3].trustedCaller).toMatchObject({
+      source: 'failed_turn_recovery',
+      recoveryOfTurnId: 'turn-ambiguous-1',
+    });
+  });
+
+  it('keeps the original ambiguous target when its cleanup retry fails before admission', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({
+        lastFailedTurn: makeFailedTurn({
+          turnId: 'turn-cleanup-failure',
+          status: 'failed',
+          errorCode: 'remote_runner_ambiguous_recovery_failed',
+          trustedCaller: {
+            requestLarkAppId: LARK_APP_ID,
+            requestUserOpenId: 'ou_sender',
+            senderType: 'user',
+            source: 'failed_turn_recovery',
+            recoveryOfTurnId: 'turn-ambiguous-1',
+          },
+        }),
+      }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(sendWorkerInput.mock.calls[0][3].trustedCaller).toMatchObject({
+      source: 'failed_turn_recovery',
+      recoveryOfTurnId: 'turn-ambiguous-1',
+    });
+  });
+
   it('replies cooldown and does not inject while the cooldown is active', async () => {
     const ds = makeDaemonSession({
       worker: aliveWorker() as any,

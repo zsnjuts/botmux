@@ -3622,7 +3622,7 @@ export async function handleCommand(
           && attestedInvocationCaller.senderType === retrySenderType
           && (message.senderUnionId === undefined
             || attestedInvocationCaller.requestUserUnionId === message.senderUnionId);
-        const retryCaller: TrustedCaller | undefined = invocationCallerMatches
+        const retryCallerBase: TrustedCaller | undefined = invocationCallerMatches
           ? {
               ...attestedInvocationCaller,
               ...(attestedInvocationCaller.botOwner
@@ -3639,6 +3639,24 @@ export async function handleCommand(
                 senderType: retrySenderType,
               }
             : undefined;
+        const recoveryOfTurnId = failedTurn.status === 'ambiguous'
+          ? failedTurn.turnId
+          : failedTurn.errorCode === 'remote_runner_ambiguous_recovery_failed'
+            ? failedTurn.trustedCaller?.recoveryOfTurnId
+            : undefined;
+        const retryCaller: TrustedCaller | undefined = retryCallerBase
+          ? recoveryOfTurnId ? {
+              ...retryCallerBase,
+              source: 'failed_turn_recovery',
+              recoveryOfTurnId,
+            }
+            : retryCallerBase
+          : undefined;
+        // A slash-command retry is not a scheduled execution, even if a stale
+        // injected caller accidentally carried schedule provenance. Keep the
+        // identity, but make the two mutually exclusive provenance shapes
+        // impossible on the wire.
+        if (retryCaller?.recoveryOfTurnId) delete retryCaller.taskId;
         const invocationTarget = deps.invocationReplyTarget;
         const retryReplyRoot = invocationTarget?.mode === 'thread'
           || invocationTarget?.mode === 'quote'

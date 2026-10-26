@@ -121,6 +121,7 @@ export interface RemoteRunnerTrustedCaller {
   requestLarkAppId?: string;
   source?: 'schedule_creator' | 'failed_turn_recovery';
   taskId?: string;
+  recoveryOfTurnId?: string;
   senderType?: 'user' | 'bot';
   botOwner?: {
     openId: string;
