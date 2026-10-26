@@ -12,7 +12,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionListHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -211,6 +211,7 @@ afterEach(async () => {
   resetAskBrokerForTest();
   setExactChatGrantHandler(null);
   setCrossPrincipalInterruptionDisableHandler(null);
+  setDurableSessionLifecycleHandler(null);
   setDurableSessionListHandler(null);
   setDurableSessionSendHandler(null);
   if (ORIGINAL_COORDINATION_MODE === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
@@ -5491,6 +5492,51 @@ describe('PUT /api/bot-read-isolation', () => {
 });
 
 describe('POST /api/sessions/:sessionId/resume', () => {
+  it('routes a trusted Dashboard resume through durable lifecycle control in primary mode', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const lifecycle = vi.fn(async () => ({ ok: true as const, outcome: 'active' as const }));
+    setDurableSessionLifecycleHandler(lifecycle);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const path = '/api/sessions/session-canonical-only/resume';
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...trustedHostHeaders('POST', path, handle.port),
+      },
+      body: JSON.stringify({ rootId: 'om_root', reconcileStreamingCard: true }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, outcome: 'active' });
+    expect(lifecycle).toHaveBeenCalledWith({
+      sessionId: 'session-canonical-only',
+      action: 'resume',
+      rootId: 'om_root',
+    });
+  });
+
+  it('refuses replica-local resume without trusted host authority in primary mode', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    const lifecycle = vi.fn(async () => ({ ok: true as const, outcome: 'active' as const }));
+    setDurableSessionLifecycleHandler(lifecycle);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(
+      `http://127.0.0.1:${handle.port}/api/sessions/session-canonical-only/resume`,
+      { method: 'POST' },
+    );
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      ok: false,
+      error: 'durable_primary_requires_host_control',
+    });
+    expect(lifecycle).not.toHaveBeenCalled();
+  });
+
   it('treats a null JSON body as empty and still resumes the closed session', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-null-body-'));
     const prevConfigDataDir = config.session.dataDir;
