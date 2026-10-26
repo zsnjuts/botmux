@@ -128,8 +128,8 @@ vi.mock('../src/utils/timezone.js', () => ({ scheduleTimeZone: vi.fn() }));
 // vi.mock factories are hoisted above imports, so the shared fakes must be
 // created with vi.hoisted to be referenceable inside the factories.
 const { sendWorkerInput, forkWorker, rememberLastCliInput } = vi.hoisted(() => ({
-  sendWorkerInput: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
-  forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
+  sendWorkerInput: vi.fn<(ds: any, payload: any, turnId?: string, opts?: any) => boolean>(),
+  forkWorker: vi.fn<(ds: any, payload: any, resumeOrTurnId?: any, opts?: any) => boolean>(),
   rememberLastCliInput: vi.fn<(ds: any, userPrompt: string, cliInput: any, opts?: any) => void>(),
 }));
 
@@ -274,7 +274,10 @@ vi.mock('../src/core/session-title.js', () => ({ updateSessionTitle: vi.fn() }))
 vi.mock('../src/core/session-rename.js', () => ({ requestAgentSessionRename: vi.fn() }));
 vi.mock('../src/core/session-mutation-guard.js', () => ({ hasProtectedSessionMutationOwnership: vi.fn(() => false) }));
 vi.mock('../src/core/bot-turn-mutation-gate.js', () => ({ withBotTurnMutation: vi.fn(async (_id: string, action: () => any) => action()) }));
-vi.mock('../src/core/reply-target.js', () => ({ rehomeReplyTargetState: vi.fn() }));
+vi.mock('../src/core/reply-target.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/core/reply-target.js')>(),
+  rehomeReplyTargetState: vi.fn(),
+}));
 vi.mock('../src/core/cli-runtime-display.js', () => ({
   configuredRuntimeDisplayName: vi.fn(() => undefined),
   sessionConfiguredRuntimeDisplayName: vi.fn(() => undefined),
@@ -342,9 +345,10 @@ function makeDaemonSession(overrides: Partial<DaemonSession> = {}): DaemonSessio
 
 function makeLarkMessage(content: string): LarkMessage {
   return {
-    messageId: 'msg_001',
+    messageId: 'om_msg_001',
     rootId: ROOT_ID,
     senderId: 'ou_sender',
+    senderUnionId: 'on_sender',
     senderType: 'user',
     msgType: 'text',
     content,
@@ -360,6 +364,7 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps & { sessionReply: Retu
     sessionReply: vi.fn(async () => 'reply-msg-id'),
     getActiveCount: vi.fn(() => activeSessions.size),
     lastRepoScan: new Map(),
+    prepareTurn: vi.fn(async () => {}),
     prewarmDocCommentSession: vi.fn(async () => {}),
   };
 }
@@ -371,6 +376,10 @@ function aliveWorker(): { killed: boolean } {
 beforeEach(() => {
   vi.clearAllMocks();
   sendWorkerInput.mockReturnValue(true);
+  forkWorker.mockImplementation((_ds, _payload, _resumeOrTurnId, opts) => {
+    opts?.onAdmission?.('accepted');
+    return true;
+  });
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -379,7 +388,7 @@ describe('/retry command', () => {
   it('replies no_session when the topic has no active session', async () => {
     const deps = makeDeps();
     await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
-    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('没有活跃的会话'), undefined, LARK_APP_ID, 'msg_001');
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('没有活跃的会话'), undefined, LARK_APP_ID, 'om_msg_001');
     expect(sendWorkerInput).not.toHaveBeenCalled();
   });
 
@@ -387,7 +396,7 @@ describe('/retry command', () => {
     const ds = makeDaemonSession({ worker: aliveWorker() as any });
     const deps = makeDeps(ds);
     await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
-    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('没有失败或被中断的 turn'), undefined, LARK_APP_ID, 'msg_001');
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('没有失败或被中断的 turn'), undefined, LARK_APP_ID, 'om_msg_001');
     expect(sendWorkerInput).not.toHaveBeenCalled();
   });
 
@@ -400,9 +409,28 @@ describe('/retry command', () => {
     await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
 
     expect(sendWorkerInput).toHaveBeenCalledTimes(1);
-    const [sentDs, payload] = sendWorkerInput.mock.calls[0];
+    const [sentDs, payload, turnId, opts] = sendWorkerInput.mock.calls[0];
     expect(sentDs).toBe(ds);
     expect(payload).toMatchObject({ content: '<user-prompt>fix the flaky test</user-prompt>' });
+    expect(turnId).toBe('om_msg_001');
+    expect(opts).toMatchObject({
+      notifyRejection: false,
+      trustedCaller: {
+        requestLarkAppId: LARK_APP_ID,
+        requestUserOpenId: 'ou_sender',
+        requestUserUnionId: 'on_sender',
+        senderType: 'user',
+      },
+    });
+    expect(deps.prepareTurn).toHaveBeenCalledWith(ds, 'om_msg_001');
+    expect(ds.session.replyTargets?.om_msg_001).toMatchObject({
+      senderOpenId: 'ou_sender',
+      participants: [{ openId: 'ou_sender', isBot: false }],
+    });
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId: 'om_msg_001',
+      caller: { requestUserOpenId: 'ou_sender', senderType: 'user' },
+    });
     expect(forkWorker).not.toHaveBeenCalled();
     // Cooldown/retry state stamped onto the persisted record.
     expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
@@ -412,7 +440,106 @@ describe('/retry command', () => {
       content: '<user-prompt>fix the flaky test</user-prompt>',
     }));
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
-    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'msg_001');
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'om_msg_001');
+  });
+
+  it('uses the injected durable submitter and delays success until post-admission delivery', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    deps.submitRetryTurn = vi.fn(async () => ({ kind: 'accepted' as const }));
+    deps.postAdmissionReply = vi.fn(async () => 'out_command_reply');
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(deps.submitRetryTurn).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      turnId: 'om_msg_001',
+      userPrompt: 'fix the flaky test',
+      trustedCaller: expect.objectContaining({
+        requestUserOpenId: 'ou_sender',
+        senderType: 'user',
+      }),
+      payload: expect.objectContaining({
+        content: '<user-prompt>fix the flaky test</user-prompt>',
+      }),
+    }));
+    expect(sendWorkerInput).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(deps.postAdmissionReply).toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('已重新提交'),
+    );
+    expect(deps.sessionReply).not.toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('已重新提交'),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('keeps reply identity but withholds success while a durable provider receipt is pending', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    deps.submitRetryTurn = vi.fn(async () => ({ kind: 'retry' as const, inputAccepted: true }));
+    deps.postAdmissionReply = vi.fn(async () => 'out_command_reply');
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(ds.session.replyTargets?.om_msg_001).toBeDefined();
+    expect(ds.session.turnReplyContexts?.om_msg_001).toBeDefined();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(rememberLastCliInput).not.toHaveBeenCalled();
+    expect(deps.postAdmissionReply).not.toHaveBeenCalled();
+    expect(deps.sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('rolls back reply identity when durable admission retries before worker acceptance', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    deps.submitRetryTurn = vi.fn(async () => ({ kind: 'retry' as const, inputAccepted: false }));
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(ds.session.replyTargets?.om_msg_001).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.om_msg_001).toBeUndefined();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(deps.sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('bypasses retry cooldown when the exact durable command turn is replaying a commit receipt', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({
+        lastFailedTurn: makeFailedTurn({ lastRetryAt: new Date().toISOString() }),
+      }),
+    });
+    const deps = makeDeps(ds);
+    deps.isRetryTurnCommitted = vi.fn(() => true);
+    deps.submitRetryTurn = vi.fn(async () => ({ kind: 'accepted' as const }));
+    deps.postAdmissionReply = vi.fn(async () => 'out_command_reply');
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(deps.isRetryTurnCommitted).toHaveBeenCalledWith(ds, 'om_msg_001');
+    expect(deps.submitRetryTurn).toHaveBeenCalledOnce();
+    expect(deps.postAdmissionReply).toHaveBeenCalledOnce();
+    expect(deps.sessionReply).not.toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('重试冷却中'),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it('forks a fresh worker when the current one is dead', async () => {
@@ -425,11 +552,228 @@ describe('/retry command', () => {
 
     expect(sendWorkerInput).not.toHaveBeenCalled();
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    const [forkedDs, payload, hasHistory] = forkWorker.mock.calls[0];
+    const [forkedDs, payload, forkIdentity] = forkWorker.mock.calls[0];
     expect(forkedDs).toBe(ds);
     expect(payload).toMatchObject({ content: '<user-prompt>fix the flaky test</user-prompt>' });
-    expect(hasHistory).toBe(true);
-    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'msg_001');
+    expect(forkIdentity).toMatchObject({
+      resume: true,
+      turnId: 'om_msg_001',
+      trustedCaller: {
+        requestLarkAppId: LARK_APP_ID,
+        requestUserOpenId: 'ou_sender',
+        requestUserUnionId: 'on_sender',
+        senderType: 'user',
+      },
+    });
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'om_msg_001');
+  });
+
+  it('does not claim success when identity preparation fails', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    vi.mocked(deps.prepareTurn!).mockRejectedValue(new Error('identity unavailable'));
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(sendWorkerInput).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(ds.session.replyTargets?.om_msg_001).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.om_msg_001).toBeUndefined();
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+    expect(ds.preparingInteractiveTurn).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('重试提交失败'),
+      undefined,
+      LARK_APP_ID,
+      'om_msg_001',
+    );
+  });
+
+  it('does not claim success when a dead-worker fork rejects admission', async () => {
+    forkWorker.mockImplementation((_ds, _payload, _resumeOrTurnId, opts) => {
+      opts?.onAdmission?.('rejected');
+      return true;
+    });
+    const ds = makeDaemonSession({
+      worker: { killed: true } as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(ds.session.replyTargets?.om_msg_001).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.om_msg_001).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('重试提交失败'),
+      undefined,
+      LARK_APP_ID,
+      'om_msg_001',
+    );
+  });
+
+  it('keeps an app-authored retry attributed to the bot, never a human', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    const message = makeLarkMessage('/retry');
+    message.senderType = 'app';
+    message.senderId = 'ou_peer_bot';
+    message.senderUnionId = 'on_peer_bot';
+
+    await handleCommand('/retry', ROOT_ID, message, deps, LARK_APP_ID);
+
+    expect(sendWorkerInput.mock.calls[0][3]).toMatchObject({
+      trustedCaller: {
+        requestUserOpenId: 'ou_peer_bot',
+        requestUserUnionId: 'on_peer_bot',
+        senderType: 'bot',
+      },
+    });
+    expect(ds.session.replyTargets?.om_msg_001?.participants).toEqual([
+      { openId: 'ou_peer_bot', isBot: true },
+    ]);
+    expect(ds.activeInteractiveTurn?.caller.senderType).toBe('bot');
+  });
+
+  it('preserves a daemon-attested bot owner before retry identity preparation', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    const message = makeLarkMessage('/retry');
+    message.senderType = 'app';
+    message.senderId = 'ou_peer_bot';
+    message.senderUnionId = 'on_peer_bot';
+    const attested = {
+      requestLarkAppId: LARK_APP_ID,
+      requestUserOpenId: 'ou_peer_bot',
+      requestUserUnionId: 'on_peer_bot',
+      senderType: 'bot' as const,
+      botOwner: {
+        openId: 'ou_verified_owner',
+        unionId: 'on_verified_owner',
+        email: 'owner@example.com',
+        source: 'bot_config' as const,
+      },
+    };
+    deps.invocationTrustedCaller = attested;
+    deps.prepareTurn = vi.fn(async target => {
+      expect(target.activeInteractiveTurn).toBeUndefined();
+      expect(target.preparingInteractiveTurn).toEqual({
+        turnId: 'om_msg_001',
+        caller: attested,
+        userPrompt: 'fix the flaky test',
+      });
+    });
+    deps.submitRetryTurn = vi.fn(async input => {
+      expect(input.trustedCaller).toEqual(attested);
+      expect(input.ds.preparingInteractiveTurn).toBeUndefined();
+      expect(input.ds.activeInteractiveTurn).toBeUndefined();
+      return { kind: 'accepted' as const };
+    });
+
+    await handleCommand('/retry', ROOT_ID, message, deps, LARK_APP_ID);
+
+    expect(deps.prepareTurn).toHaveBeenCalledOnce();
+    expect(deps.submitRetryTurn).toHaveBeenCalledOnce();
+    expect(ds.preparingInteractiveTurn).toBeUndefined();
+    expect(ds.activeInteractiveTurn?.caller).toEqual(attested);
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
+  });
+
+  it('does not borrow an attested caller from a different slash sender', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    deps.invocationTrustedCaller = {
+      requestLarkAppId: LARK_APP_ID,
+      requestUserOpenId: 'ou_other_bot',
+      requestUserUnionId: 'on_other_bot',
+      senderType: 'bot',
+      botOwner: {
+        openId: 'ou_other_owner',
+        unionId: 'on_other_owner',
+        email: 'other@example.com',
+        source: 'bot_config',
+      },
+    };
+    const message = makeLarkMessage('/retry');
+    message.senderType = 'app';
+    message.senderId = 'ou_peer_bot';
+    message.senderUnionId = 'on_peer_bot';
+
+    await handleCommand('/retry', ROOT_ID, message, deps, LARK_APP_ID);
+
+    expect(sendWorkerInput.mock.calls[0][3]).toMatchObject({
+      trustedCaller: {
+        requestUserOpenId: 'ou_peer_bot',
+        requestUserUnionId: 'on_peer_bot',
+        senderType: 'bot',
+      },
+    });
+    expect(sendWorkerInput.mock.calls[0][3].trustedCaller.botOwner).toBeUndefined();
+  });
+
+  it('binds an ambiguous retry to the exact failed turn id', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({
+        lastFailedTurn: makeFailedTurn({
+          turnId: 'turn-ambiguous-1',
+          status: 'ambiguous',
+          errorCode: 'remote_runner_turn_ambiguous',
+        }),
+      }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(sendWorkerInput.mock.calls[0][3].trustedCaller).toMatchObject({
+      source: 'failed_turn_recovery',
+      recoveryOfTurnId: 'turn-ambiguous-1',
+    });
+  });
+
+  it('keeps the original ambiguous target when its cleanup retry fails before admission', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({
+        lastFailedTurn: makeFailedTurn({
+          turnId: 'turn-cleanup-failure',
+          status: 'failed',
+          errorCode: 'remote_runner_ambiguous_recovery_failed',
+          trustedCaller: {
+            requestLarkAppId: LARK_APP_ID,
+            requestUserOpenId: 'ou_sender',
+            senderType: 'user',
+            source: 'failed_turn_recovery',
+            recoveryOfTurnId: 'turn-ambiguous-1',
+          },
+        }),
+      }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
+
+    expect(sendWorkerInput.mock.calls[0][3].trustedCaller).toMatchObject({
+      source: 'failed_turn_recovery',
+      recoveryOfTurnId: 'turn-ambiguous-1',
+    });
   });
 
   it('replies cooldown and does not inject while the cooldown is active', async () => {
@@ -444,7 +788,7 @@ describe('/retry command', () => {
 
     expect(sendWorkerInput).not.toHaveBeenCalled();
     expect(forkWorker).not.toHaveBeenCalled();
-    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('重试冷却中'), undefined, LARK_APP_ID, 'msg_001');
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('重试冷却中'), undefined, LARK_APP_ID, 'om_msg_001');
     // 10s cooldown, 5s elapsed → ceil(5s) = 5 seconds advertised.
     expect(deps.sessionReply.mock.calls[0][1]).toContain('5');
   });
@@ -459,7 +803,7 @@ describe('/retry command', () => {
     await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
 
     expect(sendWorkerInput).toHaveBeenCalledTimes(1);
-    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('重试提交失败'), undefined, LARK_APP_ID, 'msg_001');
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('重试提交失败'), undefined, LARK_APP_ID, 'om_msg_001');
     // Rejected attempt must not stamp the cooldown.
     expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
     expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined();

@@ -70,14 +70,20 @@ export interface TrustedCaller {
   /** Where this identity came from. Absent = the ordinary IM path (the sender of
    *  the inbound message that opened this turn). `'schedule_creator'` = a
    *  daemon-fired scheduled turn running as the task's creator; `taskId` names
-   *  the task. `'failed_turn_recovery'` = automatic recovery of a recorded
-   *  failed human turn; it does not prove a new human action. Consumers that must
+   *  the task. `'failed_turn_recovery'` = recovery of a recorded failed turn;
+   *  the source alone does not prove a new human action because it is also used
+   *  by automatic recovery. Consumers that must
    *  distinguish "a human asked just now" from
    *  "someone's scheduled task is running" (audit trails, approval gates) read
    *  this instead of inferring it. */
   source?: 'schedule_creator' | 'failed_turn_recovery';
   /** Scheduled task id — set only alongside `source: 'schedule_creator'`. */
   taskId?: string;
+  /** Exact prior turn named by an explicit `/retry`. Set only alongside
+   *  `source: 'failed_turn_recovery'`. Remote providers may use this as a
+   *  fail-closed fence for abandoning that exact ambiguous turn; it never
+   *  authorizes abandoning a different or merely inferred turn. */
+  recoveryOfTurnId?: string;
   /** Type of the sender whose message opened this turn. Absent when no inbound
    *  message opened it (a daemon-fired scheduled turn — `source` says what that
    *  is instead), when the host cannot tell what opened it (platform

@@ -577,6 +577,14 @@ export interface DaemonSession {
      * that happened to start the current CLI turn. */
     controller?: import('../types.js').TrustedCaller;
   };
+  /** Exact caller exposed only while daemon-owned turn identity preparation is
+   * running. Unlike activeInteractiveTurn this is not worker-admission proof
+   * and must never make a durable Inbox replay look busy. In-memory only. */
+  preparingInteractiveTurn?: {
+    turnId: string;
+    caller: import('../types.js').TrustedCaller;
+    userPrompt?: string;
+  };
   /** Daemon-authenticated scheduled creator identities waiting for the worker
    * to publish the matching managed-turn capability. Keyed by the exact
    * daemon-minted schedule turn id and never persisted. The worker can name a
