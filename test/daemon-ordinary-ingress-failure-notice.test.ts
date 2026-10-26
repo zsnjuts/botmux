@@ -542,6 +542,101 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ));
   });
 
+  it('queues durable /close when the trusted self mention lives in the stripped reply footer', async () => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_event_footer_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_footer_self_bot_card_close';
+    const session = seedThreadSession(anchor, 'footer self durable bot card close');
+    const queuedControl = vi.fn();
+    const messageId = 'om_footer_self_bot_card_close';
+    const cardOpenBotId = 'ou_card_footer_self_bot';
+    const fullCard = {
+      schema: '2.0',
+      body: {
+        direction: 'vertical',
+        elements: [
+          { tag: 'markdown', element_id: '_2', content: '/close' },
+          { tag: 'hr', element_id: '_3' },
+          {
+            tag: 'markdown',
+            element_id: 'botmux_reply_footer',
+            content: `<font color='grey'>发送给：</font>`
+              + `<at id=${cardOpenBotId} mention_key=@_user_1></at>`
+              + `<font color='grey'>⁣⁣⁣⁣</font>`,
+          },
+        ],
+      },
+      config: { enable_forward_interaction: false, streaming_mode: false, width_mode: 'fill' },
+    };
+    const event = makeBotEventData(messageId, '/close', anchor);
+    event.message.message_type = 'interactive';
+    event.message.content = JSON.stringify({
+      title: null,
+      elements: [[
+        { tag: 'img', image_key: 'img_fallback' },
+        { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+      ]],
+      user_dsl: JSON.stringify(fullCard),
+    });
+    event.message.mentions = [{
+      key: '@_user_1',
+      name: 'TargetBot',
+      id: {
+        open_id: 'ou_event_footer_self_bot',
+        user_id: '',
+        union_id: 'on_event_footer_self_bot',
+      },
+      mentioned_type: 'bot',
+    }];
+    mocks.getMessageDetail
+      .mockResolvedValueOnce({
+        items: [{
+          msg_type: 'interactive',
+          body: {
+            content: JSON.stringify({
+              title: null,
+              elements: [[
+                { tag: 'img', image_key: 'img_fallback' },
+                { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+              ]],
+            }),
+          },
+        }],
+      })
+      .mockResolvedValueOnce({
+        items: [{
+          msg_type: 'interactive',
+          body: { content: JSON.stringify(fullCard) },
+        }],
+      });
+    const ctx = {
+      ...makeCtx(anchor, messageId),
+      queuePostAdmissionControl: queuedControl,
+    };
+
+    await handleThreadReply(event, ctx);
+
+    expect(queuedControl).toHaveBeenCalledOnce();
+    expect(queuedControl).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: `lark-command.session-control:${APP}:${messageId}`,
+      lane: 'session-control',
+      payload: expect.objectContaining({
+        type: 'botmux.session.control',
+        action: 'close',
+        sessionId: session.session.sessionId,
+        operatorOpenId: 'ou_proposer_bot',
+      }),
+    }));
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(repliedText()).not.toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
   it('keeps a botmux send card without self mention evidence outside the durable close path', async () => {
     const bot = getBot(APP);
     bot.botOpenId = 'ou_stale_cached_self_bot';
