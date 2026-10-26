@@ -1,7 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
-import { beginScheduledRunSettlement } from '../src/core/scheduled-run-settlement.js';
+import {
+  beginScheduledRunSettlement,
+  observeScheduledRunTerminal,
+} from '../src/core/scheduled-run-settlement.js';
 
 const {
   emitHookEventMock,
@@ -214,10 +217,12 @@ import {
   forkWorker,
   getDaemonBootId,
   initWorkerPool,
+  killWorker,
   ensureReadonlyTaskContinuationAttached,
   ensureAutomaticTaskContinuationLease,
   codexAppCleanInputAcceptedForSession,
   promoteQueuedActivationTail,
+  retireWorkerProcessOnly,
   reserveQueuedActivationTailAdmission,
   resolveQuarantinedForkPlan,
   restartCounts,
@@ -927,7 +932,7 @@ describe('host memory pressure worker admission', () => {
     expect(sent.some(message => message.type === 'message' && message.content === 'group second')).toBe(false);
   });
 
-  it('stays silent when the session is superseded while the rescue is waiting', async () => {
+  it('rejects admission without posting when the session is superseded during reclaim', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -970,10 +975,47 @@ describe('host memory pressure worker admission', () => {
 
     expect(forkMock).not.toHaveBeenCalled();
     expect(sessionReply).not.toHaveBeenCalled();
-    expect(admissions).toEqual(['deferred']);
+    expect(admissions).toEqual(['deferred', 'rejected']);
     // The guard runs DURING the re-check, not via an unrelated early return:
     // the swap side effect proves the retry actually reached its re-read.
     expect(swapped).toBe(true);
+  });
+
+  it('rejects admission when reclaim fails after the session is superseded', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const registry = new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]);
+    setActiveSessionsRegistry(registry);
+    const replacement = makeDs();
+    checkWorkerAdmissionMock
+      .mockReturnValueOnce(marginalDecision as any)
+      .mockImplementationOnce(() => {
+        registry.set(activeSessionKey(ds), replacement);
+        throw new Error('recheck unavailable');
+      });
+    const admissions: string[] = [];
+
+    expect(forkWorker(ds, 'scheduled reminder', {
+      resume: true,
+      turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000023',
+    }, {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
+    expect(admissions).toEqual(['deferred']);
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['deferred', 'rejected']);
   });
 
   it('rejects with the blocked notice when the single re-check is still marginal', async () => {
@@ -7380,6 +7422,165 @@ describe('managed turn authority worker generations', () => {
 });
 
 describe('worker startup failure delivery', () => {
+  it('does not treat a delivered turn-failure notice as scheduled success', async () => {
+    const sessionReply = vi.fn(async () => 'om_failure_notice');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000010';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      turnId,
+      lastUuid: 'failure-notice-uuid',
+      content: 'Model service refused this turn',
+      turnFailed: true,
+      turnFailureNotice: 'Model service refused this turn',
+    });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+    });
+    await expect(settlement.settled).rejects.toThrow(
+      'failed (provider_server_error)',
+    );
+  });
+
+  it('settles a scheduled run when explicit close retires its worker', async () => {
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000011';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    // A close can race before the worker publishes managed_turn_origin.  The
+    // daemon records scheduled admission independently of creator identity.
+    expect(ds.scheduledRunTurnIds?.has(turnId)).toBe(true);
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+    killWorker(ds);
+
+    await expect(settlement.settled).rejects.toThrow('worker_retired');
+  });
+
+  it('settles a scheduled run when suspend retires its worker', async () => {
+    const ds = makeDs({ initConfig: { backendType: 'tmux' } as any });
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000012';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'suspend-capability',
+      turnId,
+    });
+    ds.initConfig = { backendType: 'tmux' } as any;
+    expect(suspendWorker(ds, 'scheduled-test')).toBe(true);
+
+    await expect(settlement.settled).rejects.toThrow('worker_suspended');
+  });
+
+  it('settles an ownerless scheduled run when process-only retirement kills its worker', async () => {
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000017';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    expect(ds.scheduledRunTurnIds?.has(turnId)).toBe(true);
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+    retireWorkerProcessOnly(ds, 'scheduled-test');
+
+    await expect(settlement.settled).rejects.toThrow('worker_process_retired');
+  });
+
+  it('settles a scheduled run when a different turn explicitly re-forks the worker', async () => {
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000013';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'refork-capability',
+      turnId,
+    });
+    forkWorker(ds, 'replacement turn', 'om_replacement_turn');
+
+    await expect(settlement.settled).rejects.toThrow('worker_replaced');
+  });
+
+  it('keeps settlement pending when a replacement generation takes the same turn', async () => {
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000014';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+    let settled = false;
+    void settlement.settled.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    firstWorker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'same-turn-capability',
+      turnId,
+    });
+    forkWorker(ds, 'retry same reminder', turnId);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    const replacement = forkMock.mock.results.at(-1)!.value;
+    replacement.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId,
+      status: 'failed',
+      errorCode: 'replacement_failed',
+    });
+    await expect(settlement.settled).rejects.toThrow('replacement_failed');
+  });
+
   it('does not accept a CLI-writable explicit marker as the scheduled delivery receipt', async () => {
     const ds = makeDs();
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000000';
@@ -7446,6 +7647,110 @@ describe('worker startup failure delivery', () => {
     worker.emit('exit', 1, null);
 
     await expect(settlement.settled).rejects.toThrow('worker_exit');
+  });
+
+  it('settles a scheduled follow-up when a ready worker exits before publishing origin', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'ordinary opening', 'om_opening');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+
+    const taskId = 'deadbeef';
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000015';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId,
+      requireFinalDelivery: true,
+    });
+    expect(sendWorkerInput(ds, 'ownerless scheduled follow-up', turnId)).toBe(true);
+    expect(ds.scheduledRunTurnIds?.has(turnId)).toBe(true);
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+    expect(ds.managedTurnOrigin).toBeUndefined();
+
+    worker.emit('exit', 1, null);
+    await expect(settlement.settled).rejects.toThrow('worker_exit');
+  });
+
+  it('settles an ownerless queued scheduled follow-up after promotion and pre-origin exit', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'ordinary opening', 'om_opening');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    ds.initialStartPending = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = 'opening-token';
+    ds.session.queuedActivationInput = { content: 'ordinary opening' };
+
+    const taskId = 'deadbeef';
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000018';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId,
+      requireFinalDelivery: true,
+    });
+    expect(sendWorkerInput(ds, 'ownerless queued reminder', turnId)).toBe(true);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId }),
+    ]);
+    expect(ds.scheduledRunTurnIds?.has(turnId)).toBe(true);
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+
+    // Opening ACK releases the durable gate; promotion is the final worker-IPC
+    // admission, but the worker exits before publishing managed origin.
+    ds.session.queuedActivationPending = false;
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+    expect(vi.mocked(worker.send).mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'message',
+      turnId,
+    });
+    expect(ds.managedTurnOrigin).toBeUndefined();
+
+    worker.emit('exit', 1, null);
+    await expect(settlement.settled).rejects.toThrow('worker_exit');
+  });
+
+  it('does not settle a scheduled turn while its worker is routing-transfer detached', async () => {
+    const ds = makeDs();
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000016';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+    let settled = false;
+    void settlement.settled.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+
+    forkWorker(ds, 'deliver reminder', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    expect(ds.scheduledRunTurnIds?.has(turnId)).toBe(true);
+    const detaching = detachWorkerForTransfer(ds, { timeoutMs: 1_000 });
+    const detachMessage = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .find(message => message?.type === 'detach_for_transfer');
+    if (!detachMessage || detachMessage.type !== 'detach_for_transfer') {
+      throw new Error('transfer detach request was not sent');
+    }
+    expect(detachMessage.requestId).toEqual(expect.any(String));
+    worker.emit('message', {
+      type: 'transfer_detached',
+      requestId: detachMessage.requestId,
+    });
+    worker.emit('exit', 0, null);
+
+    await expect(detaching).resolves.toBe(true);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    observeScheduledRunTerminal({
+      turnId,
+      status: 'failed',
+      errorCode: 'test_cleanup',
+    });
+    await expect(settlement.settled).rejects.toThrow('test_cleanup');
   });
 
   it('keeps the clean init payload and reports a structured failure once to its exact originating turn', async () => {

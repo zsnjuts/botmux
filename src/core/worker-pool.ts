@@ -6089,6 +6089,45 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
 /**
+ * A deliberate worker-generation retirement cannot leave the scheduler's
+ * in-memory rendezvous pending forever.  Only an explicit same-turn handoff
+ * may keep the settlement alive for the replacement generation; routing
+ * transfer uses its own detach path and does not call this helper.
+ */
+function settleScheduledRunBeforeWorkerRetirement(
+  ds: DaemonSession,
+  errorCode: string,
+  takeoverTurnId?: string,
+  fallbackTurnId?: string,
+): void {
+  const retiredTurnIds = new Set<string>();
+  const managedTurnId = ds.managedTurnOrigin?.turnId;
+  if (managedTurnId) retiredTurnIds.add(managedTurnId);
+  for (const turnId of ds.scheduledTurnCallers?.keys() ?? []) {
+    retiredTurnIds.add(turnId);
+  }
+  for (const turnId of ds.scheduledRunTurnIds ?? []) {
+    retiredTurnIds.add(turnId);
+  }
+  if (ds.currentTurnId && parseScheduledTurnId(ds.currentTurnId)) {
+    retiredTurnIds.add(ds.currentTurnId);
+  }
+  if (fallbackTurnId && parseScheduledTurnId(fallbackTurnId)) {
+    retiredTurnIds.add(fallbackTurnId);
+  }
+  for (const retiredTurnId of retiredTurnIds) {
+    if (retiredTurnId === takeoverTurnId) continue;
+    observeScheduledRunTerminal({
+      turnId: retiredTurnId,
+      status: 'failed',
+      errorCode,
+    });
+    forgetScheduledTurnCaller(ds, retiredTurnId);
+    forgetScheduledRunTurn(ds, retiredTurnId);
+  }
+}
+
+/**
  * Retire a session's worker (and, worker-less, its orphaned backing session).
  *
  * CONTRACT FOR REMOTE BACKENDS (riff / mojo): a LIVE remote worker is refused
@@ -6142,6 +6181,7 @@ export function killWorker(
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  settleScheduledRunBeforeWorkerRetirement(ds, 'worker_retired');
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
   // daemon-side copy synchronously; the worker may never get a chance to send
@@ -6226,6 +6266,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  settleScheduledRunBeforeWorkerRetirement(ds, 'worker_process_retired');
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
@@ -8678,6 +8719,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
     // No live worker ⟹ no live CLI prompt; converge the flag with reality.
     ds.cliReady = false;
     // There is no live generation that can still own this capability.
+    settleScheduledRunBeforeWorkerRetirement(ds, 'worker_missing');
     ds.managedTurnOrigin = undefined;
     invalidateTuiPrompt(ds, 'suspendWorker:no_worker');
     return false;
@@ -8690,6 +8732,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
     clearLifecycleRetirement(ds, w);
     return false;
   }
+  settleScheduledRunBeforeWorkerRetirement(ds, 'worker_suspended');
   try {
     w.send({ type: 'suspend' } as DaemonToWorker);
   } catch {
@@ -12487,10 +12530,24 @@ function rememberScheduledTurnCaller(
   (ds.scheduledTurnCallers ??= new Map()).set(turnId, { ...expected });
 }
 
+/** Track scheduler settlement ownership independently of creator identity.
+ * The daemon alone supplies accepted worker turn ids; parsing keeps ordinary
+ * IM turns out of this lifecycle registry. */
+function rememberScheduledRunTurn(ds: DaemonSession, turnId: string | undefined): void {
+  if (!turnId || !parseScheduledTurnId(turnId)) return;
+  (ds.scheduledRunTurnIds ??= new Set()).add(turnId);
+}
+
 function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined): void {
   if (!turnId || !ds.scheduledTurnCallers) return;
   ds.scheduledTurnCallers.delete(turnId);
   if (ds.scheduledTurnCallers.size === 0) ds.scheduledTurnCallers = undefined;
+}
+
+function forgetScheduledRunTurn(ds: DaemonSession, turnId: string | undefined): void {
+  if (!turnId || !ds.scheduledRunTurnIds) return;
+  ds.scheduledRunTurnIds.delete(turnId);
+  if (ds.scheduledRunTurnIds.size === 0) ds.scheduledRunTurnIds = undefined;
 }
 
 /** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
@@ -12613,6 +12670,7 @@ export function sendWorkerInput(
           ? { dispatchAttempt: opts.dispatchAttempt }
           : {}),
       });
+      rememberScheduledRunTurn(ds, queuedTurnId);
       return true;
     } catch (err) {
       logger.error(
@@ -12731,6 +12789,7 @@ export function sendWorkerInput(
     );
     return false;
   }
+  rememberScheduledRunTurn(ds, effectiveTurnId ?? routingTurnId);
   rememberScheduledTurnCaller(ds, effectiveTurnId ?? routingTurnId, opts.trustedCaller);
   {
     const admittedTurnId = effectiveTurnId ?? routingTurnId ?? `admitted-turn-${randomUUID()}`;
@@ -13127,6 +13186,10 @@ export function promoteQueuedActivationTail(
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
+    // Defense in depth for restored/pre-existing tails: admission normally
+    // registered this at durable staging time, but promotion is the last
+    // authoritative boundary before the worker owns the turn.
+    rememberScheduledRunTurn(ds, head.turnId);
     rememberScheduledTurnCaller(ds, head.turnId, exactInput.trustedCaller);
     recordAdmittedOrdinaryUserTurn(ds, head.turnId, {
       beginRecovery: true,
@@ -13823,7 +13886,10 @@ export function forkWorker(
       }).then(outcome => {
         // The session may have been closed/superseded while we waited; the
         // registry guard also rejects revived-generation forks.
-        if (findActiveBySessionId(ds.session.sessionId) !== ds) return;
+        if (findActiveBySessionId(ds.session.sessionId) !== ds) {
+          opts.onAdmission?.('rejected');
+          return;
+        }
         if (outcome.result !== 'allowed') {
           notifyBlocked(outcome.decision, outcome.reclaimed);
           opts.onAdmission?.('rejected');
@@ -13881,8 +13947,12 @@ export function forkWorker(
         );
         if (findActiveBySessionId(ds.session.sessionId) === ds) {
           notifyBlocked(admission, 0);
-          opts.onAdmission?.('rejected');
         }
+        // The scheduler owns a pending settlement even if the Session was
+        // replaced while reclaim/re-check failed.  UI belongs only to the
+        // current Session, but admission rejection must always reach its exact
+        // caller so the durable task cannot remain running forever.
+        opts.onAdmission?.('rejected');
       });
       return true;
     }
@@ -14062,6 +14132,7 @@ export function forkWorker(
   if (ds.worker && !ds.worker.killed) {
     const replacedWorker = ds.worker;
     logger.warn(`[${t}] Worker already running (pid: ${replacedWorker.pid}), killing before re-fork`);
+    settleScheduledRunBeforeWorkerRetirement(ds, 'worker_replaced', initAttributionTurnId);
     trackLifecycleRetirement(ds, replacedWorker);
     try { replacedWorker.send({ type: 'close' } as DaemonToWorker); } catch { /* ignore */ }
     try { replacedWorker.kill(); } catch { /* ignore */ }
@@ -14356,6 +14427,7 @@ export function forkWorker(
         status: 'failed',
         errorCode: 'worker_fork_error',
       });
+      forgetScheduledRunTurn(ds, initAttributionTurnId);
     }
     if (ds.worker === worker) {
       if (ds.session.queuedActivationPending) {
@@ -14755,6 +14827,7 @@ export function forkWorker(
   ds.cliReady = false;
   ds.worker = worker;
   initializeWorkerIpcBootstrap(worker);
+  rememberScheduledRunTurn(ds, initAttributionTurnId);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   {
     const initCallerOpenId = turnCallerOpenIdFor(ds, initMsg.turnId);
@@ -18129,6 +18202,7 @@ function setupWorkerHandlers(
             + `(turn=${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
           );
         }
+        forgetScheduledRunTurn(ds, msg.turnId);
         forgetScheduledTurnCaller(ds, msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         // Defense in depth: the worker sends a token-matched revoke before the
@@ -19411,14 +19485,19 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.workerCardViewToken = null;
-      const interruptedTurnId = ds.managedTurnOrigin?.turnId
-        ?? (preReadyExit ? startupState.initTurnId : undefined);
-      if (unexpectedWorkerExit && interruptedTurnId) {
-        observeScheduledRunTerminal({
-          turnId: interruptedTurnId,
-          status: 'ambiguous',
-          errorCode: 'worker_exit',
-        });
+      if (unexpectedWorkerExit) {
+        // A ready worker can accept a scheduled follow-up and die before it
+        // publishes managed_turn_origin.  scheduledTurnCallers is already a
+        // daemon-verified exact-turn admission record, so settle every pending
+        // scheduled turn owned by this generation before clearing that map.
+        // Routing transfer and deliberate lifecycle retirement are excluded by
+        // unexpectedWorkerExit and have their own handoff/retirement fences.
+        settleScheduledRunBeforeWorkerRetirement(
+          ds,
+          'worker_exit',
+          undefined,
+          preReadyExit ? startupState.initTurnId : undefined,
+        );
       }
       ds.managedTurnOrigin = undefined;
       ds.scheduledTurnCallers = undefined;
@@ -20746,7 +20825,12 @@ function deliverFinalOutput(
       const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await (managedReceiver
         ? sendFinal(canonicalOutput.content)
         : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
-      observeScheduledRunDaemonProviderDelivery(msg.turnId, messageId);
+      // A turn-failure notice is user-visible, but it is not the scheduled
+      // task's successful final answer.  Keep the settlement pending so the
+      // ordered failed terminal below rejects it after this delivery drains.
+      if (!msg.turnFailed) {
+        observeScheduledRunDaemonProviderDelivery(msg.turnId, messageId);
+      }
       if (!isStillOwned()) {
         // The provider already returned its stable message id. Ownership loss
         // only suppresses later local bookkeeping; it cannot make that external
@@ -21132,6 +21216,7 @@ export function forkAdoptWorker(
   if (ds.worker && !ds.worker.killed) {
     const replacedWorker = ds.worker;
     logger.warn(`[${t}] Worker already running, killing before adopt-fork`);
+    settleScheduledRunBeforeWorkerRetirement(ds, 'worker_replaced', opts?.turnId);
     trackLifecycleRetirement(ds, replacedWorker);
     try { replacedWorker.send({ type: 'close' } as DaemonToWorker); } catch {}
     try { replacedWorker.kill(); } catch {}

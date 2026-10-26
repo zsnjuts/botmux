@@ -143,9 +143,13 @@ export async function executeScheduledRunAwaitingSettlement(
     await dispatch();
     return await settlement.settled;
   } catch (error) {
-    if (abortScheduledRunSettlement(input.turnId, error)) {
-      await settlement.settled.catch(() => undefined);
-    }
+    abortScheduledRunSettlement(input.turnId, error);
+    // Dispatch may have synchronously terminalized the exact turn before
+    // throwing (for example, worker admission reports rejected and its caller
+    // then raises).  In that case abort returns false because the pending row
+    // is already gone, but the rejected rendezvous still needs an attached
+    // consumer or Node can surface an unhandled rejection in the daemon.
+    await settlement.settled.catch(() => undefined);
     throw error;
   }
 }

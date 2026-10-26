@@ -5057,6 +5057,16 @@ export async function executeScheduledTask(
       forkScheduledWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+      // A fresh candidate is registered immediately before fork so no rival
+      // can claim the anchor.  Synchronous admission rejection happens before
+      // any worker/activation journal exists; retaining that candidate would
+      // leave initialStartPending permanently occupying the route.  Remove
+      // only our exact owner, close only its exact durable row, then let a later
+      // fire create a clean candidate.
+      if (activeSessions.get(key) === ds) activeSessions.delete(key);
+      ds.initialStartPending = false;
+      ds.pendingPrompt = undefined;
+      sessionStore.closeSession(session.sessionId);
       throw err;
     }
     ds.initialStartPending = false;

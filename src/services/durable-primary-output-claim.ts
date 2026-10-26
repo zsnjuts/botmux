@@ -48,18 +48,23 @@ export function resolveDurablePrimaryOutputClaim(input: {
   daemonSession: Pick<DaemonSession, 'larkAppId' | 'chatId' | 'managedTurnOrigin' | 'session'>;
   authority?: ScheduleAuthorityRecord;
 }): DurableLarkMessageClaim {
-  let admissions: DurablePrimarySessionAdmission[] = [];
+  const taskId = parseScheduledTurnId(input.turnId);
   if (input.current) {
     const parsed = parseDurablePrimarySessionRecord(input.current);
     if (parsed.session.sessionId !== input.daemonSession.session.sessionId) {
-      throw new Error('durable primary Session snapshot belongs to another logical Session');
+      if (!taskId
+          || parsed.session.status !== 'closed'
+          || !input.authority
+          || input.authority.task.id !== taskId
+          || input.authority.task.boundSessionId !== undefined) {
+        throw new Error('durable primary Session snapshot belongs to another logical Session');
+      }
+    } else {
+      const exact = parsed.admissions.find(entry => entry.messageId === input.turnId);
+      if (exact) return claimFromAdmission(exact);
     }
-    admissions = parsed.admissions;
-    const exact = admissions.find(entry => entry.messageId === input.turnId);
-    if (exact) return claimFromAdmission(exact);
   }
 
-  const taskId = parseScheduledTurnId(input.turnId);
   if (!taskId) {
     if (!input.current) throw new Error('durable primary Session snapshot is unavailable');
     throw new Error(

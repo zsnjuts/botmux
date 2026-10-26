@@ -302,11 +302,26 @@ describe('executeScheduledTask — silent thread fire', () => {
       args[3]?.onAdmission?.('rejected');
       return true;
     });
+    const active = new Map<string, DaemonSession>();
     await expect(executeScheduledTask(
       baseTask({ rootMessageId: ROOT, scope: 'thread' }),
-      new Map<string, DaemonSession>(),
+      active,
       refreshCliVersion,
     )).rejects.toThrow('worker admission was rejected');
+
+    const rejected = [...store.values()].find(session => session.status === 'closed');
+    expect(rejected).toBeDefined();
+    expect(active.size).toBe(0);
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith(rejected!.sessionId);
+
+    // A transient refusal must not strand initial_start_pending on the anchor.
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread' }),
+      active,
+      refreshCliVersion,
+    )).resolves.toBeUndefined();
+    expect(active.size).toBe(1);
+    expect([...active.values()][0]!.session.sessionId).not.toBe(rejected!.sessionId);
   });
 
   it('settles a deferred worker-admission rejection after dispatch returned', async () => {

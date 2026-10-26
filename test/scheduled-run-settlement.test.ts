@@ -82,4 +82,30 @@ describe('scheduled run settlement', () => {
     observeScheduledRunProviderReadbackDelivery(turnId, 'om_receipt');
     await expect(execution).resolves.toEqual({ messageId: 'om_receipt' });
   });
+
+  it('consumes a terminal rejection when dispatch terminalizes before throwing', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000006';
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const execution = executeScheduledRunAwaitingSettlement({
+        turnId,
+        taskId: 'deadbeef',
+        requireFinalDelivery: true,
+      }, async () => {
+        expect(observeScheduledRunTerminal({
+          turnId,
+          status: 'failed',
+          errorCode: 'worker_admission_rejected',
+        })).toBe(true);
+        throw new Error('scheduled dispatch rejected');
+      });
+
+      await expect(execution).rejects.toThrow('scheduled dispatch rejected');
+      await new Promise(resolve => setImmediate(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
 });
