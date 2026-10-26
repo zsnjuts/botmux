@@ -111,10 +111,11 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       workerGeneration: 7,
       dispatchAttempt: 2,
     })!;
-    const card = stampScheduledFinalDeliveryProof(markGroupContextCardPurpose({
+    const stamped = stampScheduledFinalDeliveryProof({
       schema: '2.0',
       body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
-    }, 'message'), proof);
+    }, proof);
+    const card = markGroupContextCardPurpose(stamped, 'message');
     vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
       message_id: 'om_answer_final',
       chat_id: 'oc_sess-a',

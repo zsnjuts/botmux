@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import { projectGroupContextCard } from '../im/lark/group-context-card.js';
+import {
+  canonicalReplyCardFooterPurpose,
+  projectGroupContextCard,
+} from '../im/lark/group-context-card.js';
 import {
   containsReplyCardFooterElementId,
   countReplyCardFooterElementIds,
@@ -262,6 +265,10 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   try { card = JSON.parse(content); } catch { return { ok: false, error: 'provider_content_invalid' }; }
   if (!hasProviderFooterProof(card, input.proof)) {
     return { ok: false, error: 'provider_turn_proof_missing' };
+  }
+  const root = providerCardRoot(card);
+  if (!root || canonicalReplyCardFooterPurpose(root) !== 'message') {
+    return { ok: false, error: 'provider_final_not_confirmed' };
   }
   const projection = projectGroupContextCard(content, { botmuxSender: true });
   if (projection?.kind !== 'conversation') {

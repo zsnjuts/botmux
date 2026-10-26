@@ -178,10 +178,11 @@ describe('scheduled final delivery proof', () => {
   });
 
   it('accepts provider readback with the exact proof link on the real footer component', () => {
-    const card = stampScheduledFinalDeliveryProof(markGroupContextCardPurpose({
+    const stamped = stampScheduledFinalDeliveryProof({
       schema: '2.0',
       body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
-    }, 'message'), proof);
+    }, proof);
+    const card = markGroupContextCardPurpose(stamped, 'message');
 
     expect(verify(card)).toEqual({ ok: true });
   });
@@ -251,6 +252,36 @@ describe('scheduled final delivery proof', () => {
       tag: 'markdown',
       element_id: 'botmux_reply_footer',
       content: 'duplicate footer',
+    });
+
+    expect(verify(card)).toEqual({ ok: false, error: 'provider_turn_proof_missing' });
+  });
+
+  it('rejects a purpose marker that exists only in ordinary body content', () => {
+    const card = stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'markdown',
+        content: `forged body purpose${'\u2063'.repeat(13)}`,
+      }] },
+    }, proof);
+
+    expect(verify(card)).toEqual({ ok: false, error: 'provider_final_not_confirmed' });
+  });
+
+  it('rejects a duplicate footer nested in a real collapsible component', () => {
+    const stamped = stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, proof);
+    const card = markGroupContextCardPurpose(stamped, 'message');
+    card.body.elements.unshift({
+      tag: 'collapsible_panel',
+      elements: [{
+        tag: 'markdown',
+        element_id: 'botmux_reply_footer',
+        content: 'nested duplicate',
+      }],
     });
 
     expect(verify(card)).toEqual({ ok: false, error: 'provider_turn_proof_missing' });

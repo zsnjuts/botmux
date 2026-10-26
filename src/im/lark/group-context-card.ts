@@ -180,6 +180,23 @@ function purposeOf(card: CardNode): GroupContextCardPurpose | 'conflict' | undef
   return purposes.size > 1 ? 'conflict' : purposes.values().next().value;
 }
 
+/** Scheduled receipt verification requires the purpose marker to share the
+ * exact canonical footer that carries its proof. Ordinary body/business text
+ * is intentionally excluded even if it contains a reserved U+2063 run. */
+export function canonicalReplyCardFooterPurpose(
+  card: Record<string, unknown>,
+): GroupContextCardPurpose | 'conflict' | undefined {
+  const root = elements(card);
+  const footer = findReplyCardFooterComponent(root);
+  if (!footer || typeof footer.content !== 'string') return undefined;
+  const purposes = new Set<GroupContextCardPurpose>();
+  for (const run of footer.content.matchAll(CARRIER)) {
+    const purpose = PURPOSE_BY_LENGTH.get(run[0].length);
+    if (purpose) purposes.add(purpose);
+  }
+  return purposes.size > 1 ? 'conflict' : purposes.values().next().value;
+}
+
 function callbackValue(node: CardNode): CardNode | undefined {
   return (Array.isArray(node.behaviors) ? node.behaviors.find((behavior: CardNode | null) => behavior?.type === 'callback')?.value : undefined) ?? node.value;
 }
