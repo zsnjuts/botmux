@@ -6149,11 +6149,10 @@ const server = createServer(async (req, res) => {
         : typeof row?.chatId === 'string' && row.chatId
           ? row.chatId
           : undefined;
-      // Defensive client-side deadline: the daemon side of every op here replies
-      // promptly (close resolves its fence on the worker's flushed ACK; restart/
-      // resume/start return after a fire-and-forget IPC). Close gets a separate
-      // 60s budget because Riff's 23s remote-cancel prepare and 29s worker-kill
-      // backstop are serialized; all other actions stay bounded at 15s.
+      // Defensive client-side deadline. Durable close and resume wait for their
+      // lifecycle transition to commit (including remote cancel/readiness), so
+      // both use the extended budget; locate/restart/start stay bounded by the
+      // ordinary short budget.
       let upstream: Response;
       try {
         upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, {
