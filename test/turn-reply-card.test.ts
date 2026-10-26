@@ -535,6 +535,7 @@ describe('one reply card per turn', () => {
       messageId: 'om_scheduled_overflow',
       larkAppId: key.larkAppId,
       chatId: input.chatId,
+      expectedTarget: { mode: 'plain', chatId: input.chatId },
       proof,
     })).toEqual({ ok: true });
     expect(cards.get(final.messageId!)!).toContain('Markdown 附件');

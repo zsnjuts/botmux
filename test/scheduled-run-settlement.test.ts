@@ -49,6 +49,32 @@ describe('scheduled run settlement', () => {
     await expect(run.settled).resolves.toEqual({});
   });
 
+  it('allows a silent run that publishes a final to verify it before self-delete', async () => {
+    const run = beginScheduledRunSettlement({
+      turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000103',
+      taskId: 'deadbeef',
+      requireFinalDelivery: false,
+    });
+
+    expect(observeScheduledRunProviderReadbackDelivery(run.turnId, 'om_silent_final')).toBe(true);
+    await expect(run.settled).resolves.toEqual({ messageId: 'om_silent_final' });
+  });
+
+  it('reissues the same trusted receipt after settlement without accepting a rebind', async () => {
+    const run = beginScheduledRunSettlement({
+      turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000104',
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    expect(observeScheduledRunProviderReadbackDelivery(run.turnId, 'om_replayed')).toBe(true);
+    await expect(run.settled).resolves.toEqual({ messageId: 'om_replayed' });
+    expect(observeScheduledRunProviderReadbackDelivery(run.turnId, 'om_replayed')).toBe(true);
+    expect(observeScheduledRunProviderReadbackDelivery(run.turnId, 'om_other')).toBe(false);
+    expect(revokeScheduledRunSettlements('deadbeef')).toBe(1);
+    expect(observeScheduledRunProviderReadbackDelivery(run.turnId, 'om_replayed')).toBe(false);
+  });
+
   it('propagates dispatch failure and rejects duplicate settlement identity', async () => {
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000004';
     const run = beginScheduledRunSettlement({

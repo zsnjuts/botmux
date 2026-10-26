@@ -5,7 +5,9 @@
  * A scheduler callback must not report success merely because a worker accepted
  * the prompt. Non-silent runs settle only after Lark returned a concrete
  * message id for the turn's final answer. Silent runs intentionally have no
- * delivery requirement and settle on a successful terminal event instead.
+ * delivery requirement and normally settle on a successful terminal event;
+ * if they publish a verified final, that receipt may settle them first so a
+ * same-turn self-delete cannot revoke an otherwise successful run.
  *
  * The durable task row remains the restart boundary: if the daemon exits while
  * a run is pending, scheduler startup recovery turns the persisted `running`
@@ -28,7 +30,18 @@ interface PendingSettlement {
   reject: (error: Error) => void;
 }
 
+interface ConfirmedFinalReceipt {
+  taskId: string;
+  larkAppId?: string;
+  messageId: string;
+}
+
 const pending = new Map<string, PendingSettlement>();
+// Keep a bounded replay window after the one-shot scheduler rendezvous has
+// resolved. The CLI may need to retry only the verified receipt/self-delete
+// tail after the Provider message was already published.
+const confirmed = new Map<string, ConfirmedFinalReceipt>();
+const MAX_CONFIRMED_FINAL_RECEIPTS = 2_048;
 const LARK_MESSAGE_ID = /^om_[A-Za-z0-9_-]{1,128}$/;
 
 export function isConfirmedLarkMessageId(value: unknown): value is string {
@@ -58,7 +71,7 @@ export function beginScheduledRunSettlement(input: {
   requireFinalDelivery: boolean;
   authorityIsCurrent?: () => boolean;
 }): ScheduledRunSettlement {
-  if (pending.has(input.turnId)) {
+  if (pending.has(input.turnId) || confirmed.has(input.turnId)) {
     throw new Error(`scheduled run settlement already exists for ${input.turnId}`);
   }
   let resolve!: PendingSettlement['resolve'];
@@ -86,15 +99,27 @@ function settleScheduledRunFinalDelivery(
   turnId: string,
   messageId: string | undefined,
 ): boolean {
-  const record = pending.get(turnId);
-  if (!record || !record.requireFinalDelivery) return false;
   if (!isConfirmedLarkMessageId(messageId)) return false;
+  const previous = confirmed.get(turnId);
+  if (previous) return previous.messageId === messageId;
+  const record = pending.get(turnId);
+  if (!record) return false;
   if (!authorityIsCurrent(record)) {
     pending.delete(turnId);
     record.reject(settlementError(turnId, 'schedule authority was revoked before delivery'));
     return false;
   }
   pending.delete(turnId);
+  confirmed.set(turnId, {
+    taskId: record.taskId,
+    ...(record.larkAppId !== undefined ? { larkAppId: record.larkAppId } : {}),
+    messageId,
+  });
+  while (confirmed.size > MAX_CONFIRMED_FINAL_RECEIPTS) {
+    const oldest = confirmed.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    confirmed.delete(oldest);
+  }
   record.resolve({ messageId });
   return true;
 }
@@ -109,7 +134,8 @@ export function observeScheduledRunDaemonProviderDelivery(
 }
 
 /** The daemon independently read the message back from Lark and verified its
- * exact scheduled-turn proof, generation, sender, chat and final-card shape. */
+ * exact scheduled-turn proof, generation, sender, visible target and final-card
+ * shape. */
 export function observeScheduledRunProviderReadbackDelivery(
   turnId: string,
   messageId: string | undefined,
@@ -167,6 +193,12 @@ export function revokeScheduledRunSettlements(
     record.reject(settlementError(turnId, 'schedule authority was revoked'));
     revoked += 1;
   }
+  for (const [turnId, record] of confirmed) {
+    if (record.taskId !== taskId
+        || (larkAppId !== undefined && record.larkAppId !== larkAppId)) continue;
+    confirmed.delete(turnId);
+    revoked += 1;
+  }
   return revoked;
 }
 
@@ -203,4 +235,5 @@ export function __testOnlyResetScheduledRunSettlements(): void {
     record.reject(settlementError(turnId, 'test reset'));
   }
   pending.clear();
+  confirmed.clear();
 }

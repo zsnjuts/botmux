@@ -152,6 +152,7 @@ import {
   verifyScheduledFinalDeliveryReadback,
 } from './scheduled-final-delivery-proof.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
+import { frozenReplyContextForTurn } from './reply-target.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -2102,8 +2103,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/link-refs/resolve', async (req, res, 
 });
 
 /** Host receipt for a final answer already accepted by Lark. The daemon binds
- * it to the exact live turn, records the completion row idempotently, and uses
- * an explicit final receipt to settle a non-silent scheduled run. */
+ * it to the exact live turn and visible target, records the completion row
+ * idempotently, and uses an explicit final receipt to settle a scheduled run. */
 ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, async (req, res, params) => {
   let body: Record<string, unknown> | undefined;
   try {
@@ -2162,6 +2163,7 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
         messageId,
         larkAppId: ds!.larkAppId,
         chatId: ds!.chatId,
+        expectedTarget: frozenReplyContextForTurn(ds!, liveTurnId).target,
         proof: expectedProof,
       });
       if (!proof.ok) return jsonRes(res, 409, { ok: false, error: proof.error });

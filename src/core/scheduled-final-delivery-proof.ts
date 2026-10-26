@@ -12,6 +12,7 @@ import {
 } from '../im/lark/reply-card-footer-signature.js';
 import { isConfirmedLarkMessageId } from './scheduled-run-settlement.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
+import type { FrozenSessionReplyTarget } from '../types.js';
 
 const PROOF_PREFIX = 'bmxsfr_';
 const PROOF_PATTERN = /^bmxsfr_[0-9a-f]{13}$/;
@@ -228,12 +229,39 @@ export type ScheduledFinalDeliveryReadback =
   | { ok: true }
   | { ok: false; error: string };
 
+function nonemptyProviderId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/** Match the visible Provider destination selected by the daemon for this
+ * exact turn. A chat id alone is insufficient: two topics in the same group
+ * share it, while quote replies and in-thread replies are distinct surfaces. */
+function hasExpectedProviderTarget(
+  item: Record<string, unknown>,
+  expected: FrozenSessionReplyTarget,
+): boolean {
+  const rootId = nonemptyProviderId(item.root_id);
+  const parentId = nonemptyProviderId(item.parent_id);
+  const threadId = nonemptyProviderId(item.thread_id);
+  if (expected.mode === 'plain') {
+    // A native topic root may already carry its own thread_id, so top-level is
+    // proven by the absence of reply ancestry rather than thread_id alone.
+    return item.chat_id === expected.chatId
+      && rootId === undefined && parentId === undefined;
+  }
+  if (expected.mode === 'thread') {
+    return rootId === expected.rootMessageId && threadId?.startsWith('omt_') === true;
+  }
+  return parentId === expected.rootMessageId && threadId === undefined;
+}
+
 /** Verify the authoritative provider readback before scheduler settlement. */
 export function verifyScheduledFinalDeliveryReadback(input: {
   detail: unknown;
   messageId: string;
   larkAppId: string;
   chatId: string;
+  expectedTarget: FrozenSessionReplyTarget;
   proof: string;
 }): ScheduledFinalDeliveryReadback {
   if (!isConfirmedLarkMessageId(input.messageId)) {
@@ -246,6 +274,9 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   }
   if (item.deleted !== false) return { ok: false, error: 'provider_message_deleted' };
   if (item.chat_id !== input.chatId) return { ok: false, error: 'provider_chat_mismatch' };
+  if (!hasExpectedProviderTarget(item, input.expectedTarget)) {
+    return { ok: false, error: 'provider_target_mismatch' };
+  }
   if (item.msg_type !== 'interactive') {
     return { ok: false, error: 'provider_message_type_mismatch' };
   }

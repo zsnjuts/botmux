@@ -23,11 +23,22 @@ function verify(
   expectedProof = proof,
   deletion: { deleted?: boolean; omit?: boolean } = {},
   msgType = 'interactive',
+  routing: {
+    expectedTarget?:
+      | { mode: 'plain'; chatId: string }
+      | { mode: 'thread' | 'quote'; rootMessageId: string };
+    rootId?: string;
+    parentId?: string;
+    threadId?: string;
+  } = {},
 ) {
   return verifyScheduledFinalDeliveryReadback({
     detail: { items: [{
       message_id: 'om_provider_receipt',
       chat_id: 'oc_exact',
+      ...(routing.rootId ? { root_id: routing.rootId } : {}),
+      ...(routing.parentId ? { parent_id: routing.parentId } : {}),
+      ...(routing.threadId ? { thread_id: routing.threadId } : {}),
       ...(deletion.omit ? {} : { deleted: deletion.deleted ?? false }),
       msg_type: msgType,
       sender: { id: 'cli_exact', id_type: 'app_id', sender_type: 'app' },
@@ -36,6 +47,7 @@ function verify(
     messageId: 'om_provider_receipt',
     larkAppId: 'cli_exact',
     chatId: 'oc_exact',
+    expectedTarget: routing.expectedTarget ?? { mode: 'plain', chatId: 'oc_exact' },
     proof: expectedProof,
   });
 }
@@ -187,6 +199,40 @@ describe('scheduled final delivery proof', () => {
     const card = markGroupContextCardPurpose(stamped, 'message');
 
     expect(verify(card)).toEqual({ ok: true });
+  });
+
+  it('binds provider readback to the daemon-frozen visible target', () => {
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, proof), 'message');
+
+    expect(verify(card, proof, {}, 'interactive', {
+      expectedTarget: { mode: 'thread', rootMessageId: 'om_exact_topic' },
+      rootId: 'om_exact_topic',
+      parentId: 'om_exact_topic',
+      threadId: 'omt_exact_topic',
+    })).toEqual({ ok: true });
+    expect(verify(card, proof, {}, 'interactive', {
+      expectedTarget: { mode: 'thread', rootMessageId: 'om_exact_topic' },
+      rootId: 'om_wrong_topic',
+      parentId: 'om_wrong_topic',
+      threadId: 'omt_wrong_topic',
+    })).toEqual({ ok: false, error: 'provider_target_mismatch' });
+    expect(verify(card, proof, {}, 'interactive', {
+      expectedTarget: { mode: 'thread', rootMessageId: 'om_exact_topic' },
+    })).toEqual({ ok: false, error: 'provider_target_mismatch' });
+    expect(verify(card, proof, {}, 'interactive', {
+      expectedTarget: { mode: 'quote', rootMessageId: 'om_exact_quote' },
+      rootId: 'om_exact_quote',
+      parentId: 'om_exact_quote',
+    })).toEqual({ ok: true });
+    expect(verify(card, proof, {}, 'interactive', {
+      expectedTarget: { mode: 'plain', chatId: 'oc_exact' },
+      rootId: 'om_other_topic',
+      parentId: 'om_other_topic',
+      threadId: 'omt_other_topic',
+    })).toEqual({ ok: false, error: 'provider_target_mismatch' });
   });
 
   it('keeps the purpose marker on the real footer when callback data collides with its id', () => {

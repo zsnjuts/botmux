@@ -119,6 +119,9 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
       message_id: 'om_answer_final',
       chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
       deleted: false,
       msg_type: 'interactive',
       sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
@@ -154,6 +157,27 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       },
     });
     await expect(settlement.settled).resolves.toEqual({ messageId: 'om_answer_final' });
+
+    const replay = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_answer_final',
+      content: 'final answer',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      ok: true,
+      duplicate: true,
+      trustedFinalReceipt: {
+        domain: 'botmux.scheduled-final-receipt.v1',
+        messageId: 'om_answer_final',
+        turnId,
+      },
+    });
   });
 
   it('does not settle a client-reported id that provider readback cannot prove', async () => {
@@ -183,6 +207,53 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     });
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'provider_message_not_found' });
+    let settled = false;
+    void settlement.settled.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+  });
+
+  it('rejects a proved final delivered to another topic in the same chat', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000112';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'misrouted final' }] },
+    }, proof), 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_wrong_topic_final',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_other_topic',
+      parent_id: 'om_other_topic',
+      thread_id: 'omt_other_topic',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_wrong_topic_final',
+      content: 'misrouted final',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'provider_target_mismatch' });
     let settled = false;
     void settlement.settled.then(() => { settled = true; }, () => { settled = true; });
     await Promise.resolve();
