@@ -30,7 +30,7 @@
 
 未配置 `cliPathOverride` 时，BotMux 从 `PATH` 查找 `botmux-remote-runner`。`remoteRunner` 只保存协议预期，不应包含 token、cookie 或账号凭据；provider 凭据应通过受限权限文件或部署环境注入。
 
-`handshakeTimeoutMs` 同时约束 `hello` 和后续 `start` / `resume` 到 `ready` 的等待窗口，允许范围为 100–300000 ms。`operationTimeoutMs` 约束 turn 的 durable `busy` 回执以及 status/cancel/detach 等操作，允许范围为 100–1200000 ms；首次 turn 若要先创建远端 compute、准备 workspace 与 Actor，再持久化输入后回 `busy`，部署方必须按该完整路径的实测上界留出预算。两类超时都会 fail closed，BotMux 不会把未 ready 的 provider 或尚未 durable admission 的 turn 当成成功。
+`handshakeTimeoutMs` 同时约束 `hello` 和后续 `start` / `resume` 到 `ready` 的等待窗口，允许范围为 100–300000 ms。`operationTimeoutMs` 约束 turn 的 durable `busy` 回执以及 status/cancel/detach 等操作，允许范围为 100–1200000 ms；首次 turn 若要先创建远端 compute、准备 workspace 与 Actor，再持久化输入后回 `busy`，部署方必须按该完整路径的实测上界留出预算。显式关闭的 control-worker 唤醒会分别保留 `hello` 与 `resume` 两段 handshake 预算，`close_result` 外层等待保留完整 operation 预算；graceful shutdown 也把 active-turn drain 与 detach/reattach operation 拆成独立预算，并让 daemon/fleet supervisor 覆盖公共协议上限。两类超时都会 fail closed，BotMux 不会把未 ready 的 provider 或尚未 durable admission 的 turn 当成成功。
 
 `envPolicy.mode: "strict"` 不支持 `remote-runner`：BotMux 可以收窄本机 provider 子进程的环境，但无法证明 provider 背后的远端进程同样满足 strict 环境契约，因此启动会 fail closed。
 

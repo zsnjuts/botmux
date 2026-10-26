@@ -54,6 +54,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  __testOnly_remoteRunnerCloseWakeTimeoutMs,
   __testOnly_remoteRunnerCloseResultTimeoutMs,
   __testOnly_setRemoteRunnerExplicitCloseWake,
   __testOnly_setupWorkerHandlers,
@@ -160,6 +161,12 @@ describe('remote runner explicit close', () => {
     expect(__testOnly_remoteRunnerCloseResultTimeoutMs(900_000)).toBe(905_000);
     expect(__testOnly_remoteRunnerCloseResultTimeoutMs(1_200_000)).toBe(1_205_000);
     expect(__testOnly_remoteRunnerCloseResultTimeoutMs(1_200_001)).toBe(35_000);
+  });
+
+  it('covers hello plus close-control resume with the normalized handshake budget', () => {
+    expect(__testOnly_remoteRunnerCloseWakeTimeoutMs(undefined)).toBe(45_000);
+    expect(__testOnly_remoteRunnerCloseWakeTimeoutMs(300_000)).toBe(605_000);
+    expect(__testOnly_remoteRunnerCloseWakeTimeoutMs(300_001)).toBe(45_000);
   });
 
   it('uses prepare/commit before publishing a live remote session closed', async () => {

@@ -5,6 +5,10 @@ import * as sessionStore from '../services/session-store.js';
 import { logger } from '../utils/logger.js';
 import type { DaemonSession } from './types.js';
 import { isRemoteBackendType } from './persistent-backend.js';
+import {
+  REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
+  type RemoteRunnerConfig,
+} from '../adapters/backend/remote-runner-config.js';
 import { waitForFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import {
   REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
@@ -12,6 +16,7 @@ import {
   REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
+  REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
 } from './shutdown-budgets.js';
 
 type ShutdownPhase = 'prepare' | 'abort';
@@ -147,6 +152,33 @@ function label(ds: DaemonSession): string {
   return ds.session.sessionId.slice(0, 8);
 }
 
+export function __testOnly_remoteRunnerShutdownOperationTimeoutMs(
+  operationTimeoutMs: number | undefined,
+): number {
+  const normalized = typeof operationTimeoutMs === 'number'
+      && Number.isSafeInteger(operationTimeoutMs)
+      && operationTimeoutMs >= 100
+      && operationTimeoutMs <= REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS
+    ? operationTimeoutMs
+    : 30_000;
+  return Math.min(
+    REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
+    normalized + 5_000,
+  );
+}
+
+function shutdownOperationTimeoutMs(ds: DaemonSession): number {
+  const backend = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (backend !== 'remote-runner') return 0;
+  return __testOnly_remoteRunnerShutdownOperationTimeoutMs(
+    (ds.initConfig?.backendConfig as RemoteRunnerConfig | undefined)?.operationTimeoutMs,
+  );
+}
+
+function admissionRestoreTimeoutMs(ds: DaemonSession): number {
+  return Math.max(REMOTE_ADMISSION_RESTORE_TIMEOUT_MS, shutdownOperationTimeoutMs(ds));
+}
+
 function workerHasExited(worker: ChildProcess): boolean {
   return (worker.exitCode !== null && worker.exitCode !== undefined)
     || (worker.signalCode !== null && worker.signalCode !== undefined);
@@ -169,6 +201,7 @@ function requestPhase(
   requestId: string,
   phase: ShutdownPhase,
   timeoutMs: number,
+  prepareDrainTimeoutMs = timeoutMs,
 ): Promise<ShutdownPhaseResult> {
   return new Promise(resolve => {
     let settled = false;
@@ -209,7 +242,7 @@ function requestPhase(
     worker.on('message', onMessage);
     worker.once('exit', onExit);
     const message: DaemonToWorker = phase === 'prepare'
-      ? { type: 'remote_shutdown_prepare', requestId, drainTimeoutMs: timeoutMs }
+      ? { type: 'remote_shutdown_prepare', requestId, drainTimeoutMs: prepareDrainTimeoutMs }
       : { type: 'remote_shutdown_abort', requestId };
     if (!send(worker, message)) {
       finish({ ok: false, taskId: null, error: `remote_shutdown_${phase}_send_failed` });
@@ -381,13 +414,15 @@ export async function prepareRemoteSessionForShutdown(
   }
 
   const now = options.now ?? Date.now;
-  const abortReserveMs = options.abortTimeoutMs ?? REMOTE_ADMISSION_RESTORE_TIMEOUT_MS;
+  const operationTimeoutMs = shutdownOperationTimeoutMs(ds);
+  const abortReserveMs = options.abortTimeoutMs ?? admissionRestoreTimeoutMs(ds);
   let drainTimeoutMs = options.drainTimeoutMs ?? REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS;
   if (options.deadlineMs !== undefined) {
     const availableDrainMs = options.deadlineMs
       - now()
       - REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
-      - abortReserveMs;
+      - abortReserveMs
+      - operationTimeoutMs;
     if (availableDrainMs <= 0) {
       return unfencedRefusal(ds, 'insufficient_abort_budget_before_fence');
     }
@@ -428,6 +463,7 @@ export async function prepareRemoteSessionForShutdown(
     worker,
     requestId,
     'prepare',
+    drainTimeoutMs + operationTimeoutMs,
     drainTimeoutMs,
   );
   if (!prepared.ok) {
@@ -913,7 +949,7 @@ export async function abortPreparedRemoteShutdown(
       ds,
       prepared.worker,
       prepared.requestId,
-      options.abortTimeoutMs ?? REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
+      options.abortTimeoutMs ?? admissionRestoreTimeoutMs(ds),
       prepared.lineageVerified,
       { taskId: prepared.taskId },
     );
@@ -922,7 +958,7 @@ export async function abortPreparedRemoteShutdown(
     ds,
     prepared.worker,
     prepared.requestId,
-    options.abortTimeoutMs ?? REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
+    options.abortTimeoutMs ?? admissionRestoreTimeoutMs(ds),
     prepared.lineageVerified,
     { taskId: prepared.taskId },
   );
@@ -974,13 +1010,13 @@ export async function abortRemoteShutdownFleet(
   } = {},
 ): Promise<RemoteFleetAbortResult[]> {
   const now = options.now ?? Date.now;
-  const configuredTimeout = options.abortTimeoutMs ?? REMOTE_ADMISSION_RESTORE_TIMEOUT_MS;
-  const remaining = options.deadlineMs === undefined
-    ? configuredTimeout
-    : Math.max(0, options.deadlineMs - now());
-  const timeoutMs = Math.min(configuredTimeout, remaining);
 
   return Promise.all(entries.map(async ({ ds, result: participant }) => {
+    const configuredTimeout = options.abortTimeoutMs ?? admissionRestoreTimeoutMs(ds);
+    const remaining = options.deadlineMs === undefined
+      ? configuredTimeout
+      : Math.max(0, options.deadlineMs - now());
+    const timeoutMs = Math.min(configuredTimeout, remaining);
     if (timeoutMs <= 0) {
       return {
         ds,

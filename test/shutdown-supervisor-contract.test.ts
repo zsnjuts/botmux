@@ -22,6 +22,7 @@ import {
   REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
   REMOTE_SHUTDOWN_MODE,
+  REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
 } from '../src/core/shutdown-budgets.js';
 import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from '../src/core/fleet-supervisor-policy.js';
@@ -54,14 +55,20 @@ describe('graceful shutdown supervisor contract', () => {
       BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
       + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
       + REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS
+      + REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS
       + REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS
       + REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
-      + Math.max(REMOTE_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
+      + Math.max(
+        REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
+        REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
+        DAEMON_WORKER_EXIT_GRACE_MS,
+      )
       + DAEMON_SHUTDOWN_OVERHEAD_MS,
     );
-    expect(DAEMON_SHUTDOWN_MAX_MS).toBeLessThanOrEqual(48_000);
-    expect(FLEET_DAEMON_KILL_TIMEOUT_MS).toBe(49_000);
-    expect(FLEET_DAEMON_EXIT_WAIT_MS).toBe(DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS);
+    expect(DAEMON_SHUTDOWN_MAX_MS).toBe(2_447_000);
+    expect(FLEET_DAEMON_KILL_TIMEOUT_MS).toBe(2_448_000);
+    expect(FLEET_DAEMON_EXIT_WAIT_MS).toBe(2_452_500);
+    expect(FLEET_DAEMON_EXIT_WAIT_MS).toBeGreaterThan(DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS);
   });
 
   it('strictly parses the provider-neutral remote drain override', () => {
@@ -137,7 +144,9 @@ describe('graceful shutdown supervisor contract', () => {
   it('derives every outer wait budget from a widened remote drain', () => {
     const widenedDrainMs = 3_660_000;
     const budgets = deriveShutdownBudgets(widenedDrainMs);
-    expect(budgets.daemonShutdownMaxMs).toBe(widenedDrainMs + 36_000);
+    expect(budgets.daemonShutdownMaxMs).toBe(
+      widenedDrainMs + 2 * REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS + 25_000,
+    );
     expect(budgets.fleetDaemonKillTimeoutMs).toBe(budgets.daemonShutdownMaxMs + 1_000);
     expect(budgets.fleetDaemonExitWaitMs).toBeGreaterThan(
       budgets.fleetDaemonKillTimeoutMs + FLEET_SUCCESSOR_SETTLE_MS,
@@ -167,9 +176,9 @@ describe('graceful shutdown supervisor contract', () => {
     expect(child.status, String(child.stderr)).toBe(0);
     expect(JSON.parse(String(child.stdout))).toEqual({
       REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS: 3_660_000,
-      DAEMON_SHUTDOWN_MAX_MS: 3_696_000,
-      FLEET_DAEMON_KILL_TIMEOUT_MS: 3_697_000,
-      FLEET_DAEMON_EXIT_WAIT_MS: 3_701_500,
+      DAEMON_SHUTDOWN_MAX_MS: 6_095_000,
+      FLEET_DAEMON_KILL_TIMEOUT_MS: 6_096_000,
+      FLEET_DAEMON_EXIT_WAIT_MS: 6_100_500,
     });
   });
 

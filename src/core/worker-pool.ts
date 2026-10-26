@@ -144,6 +144,7 @@ import {
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
 import {
+  REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS,
   REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
   type RemoteRunnerConfig,
 } from '../adapters/backend/remote-runner-config.js';
@@ -7683,8 +7684,22 @@ type RemoteRunnerExplicitCloseWake = (
   wakeRequestId: string,
 ) => Promise<boolean>;
 type RemoteRunnerCloseFork = typeof forkWorker;
-const REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS = 45_000;
 const REMOTE_RUNNER_CLOSE_WAKE_POLL_MS = 50;
+
+export function __testOnly_remoteRunnerCloseWakeTimeoutMs(
+  handshakeTimeoutMs: number | undefined,
+): number {
+  const normalized = typeof handshakeTimeoutMs === 'number'
+      && Number.isSafeInteger(handshakeTimeoutMs)
+      && handshakeTimeoutMs >= 100
+      && handshakeTimeoutMs <= REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS
+    ? handshakeTimeoutMs
+    : 15_000;
+  // Worker startup performs hello, then close-control resume. Either protocol
+  // phase may consume the configured handshake budget; preserve the historical
+  // 45s default floor and add a bounded IPC scheduling margin.
+  return Math.max(45_000, normalized * 2 + 5_000);
+}
 
 /**
  * Materialize only the generic provider control channel for an explicit close.
@@ -7702,6 +7717,9 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
   wakeRequestId: string,
   forkImpl: RemoteRunnerCloseFork = forkWorker,
 ): Promise<boolean> {
+  const closeWakeTimeoutMs = __testOnly_remoteRunnerCloseWakeTimeoutMs(
+    (ds.initConfig?.backendConfig as RemoteRunnerConfig | undefined)?.handshakeTimeoutMs,
+  );
   if (ds.worker && !ds.worker.killed) {
     // Active-session takeover publishes the local DaemonSession immediately
     // after fork admission, before the replacement worker has necessarily
@@ -7710,7 +7728,7 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
     // the exact admitted generation instead of treating mere process existence
     // as control readiness.
     const worker = ds.worker;
-    const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+    const deadline = Date.now() + closeWakeTimeoutMs;
     while (Date.now() < deadline) {
       if (findActiveBySessionId(ds.session.sessionId) !== ds
           || ds.session.status !== 'active'
@@ -7774,7 +7792,7 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
   }
 
   const worker = ds.worker;
-  const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+  const deadline = Date.now() + closeWakeTimeoutMs;
   while (Date.now() < deadline) {
     if (findActiveBySessionId(ds.session.sessionId) !== ds
         || ds.session.status !== 'active'
