@@ -239,11 +239,34 @@ function providerCardRoot(value: unknown): Record<string, unknown> | undefined {
   }
 }
 
-function footerHasExactProofLink(content: string, proof: string): boolean {
-  for (const match of content.matchAll(MARKDOWN_LINK_PATTERN)) {
-    if (match[1] === '·' && isProofUrl(match[2], proof)) return true;
-  }
-  return false;
+function footerHasUniqueExactProofLink(content: string, proof: string): boolean {
+  const carriers = [...content.matchAll(MARKDOWN_LINK_PATTERN)]
+    .filter(match => isProofUrl(match[2]));
+  return carriers.length === 1
+    && carriers[0]?.[1] === '·'
+    && isProofUrl(carriers[0]?.[2], proof);
+}
+
+/** Require every Provider sender identity field that is present to agree.
+ * Lark surfaces may omit either the sender kind or id kind, but contradictory
+ * metadata cannot prove that the exact App produced the visible message. */
+export function providerMessageHasExactAppSender(
+  sender: unknown,
+  larkAppId: string,
+): boolean {
+  if (!sender || typeof sender !== 'object' || Array.isArray(sender)) return false;
+  const record = sender as Record<string, unknown>;
+  if (record.id !== larkAppId) return false;
+  const senderType = record.sender_type;
+  if (senderType !== undefined && senderType !== 'app' && senderType !== 'bot') return false;
+  const idType = record.id_type;
+  const senderIdType = record.sender_id_type;
+  if (idType !== undefined && idType !== 'app_id') return false;
+  if (senderIdType !== undefined && senderIdType !== 'app_id') return false;
+  return senderType === 'app'
+    || senderType === 'bot'
+    || idType === 'app_id'
+    || senderIdType === 'app_id';
 }
 
 /** Match only the canonical top-level footer markdown and its exact proof link.
@@ -260,7 +283,7 @@ function hasProviderFooterProof(value: unknown, proof: string): boolean {
   return footer?.tag === 'markdown'
     && footer.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
     && typeof footer.content === 'string'
-    && footerHasExactProofLink(footer.content, proof);
+    && footerHasUniqueExactProofLink(footer.content, proof);
 }
 
 export function scheduledFinalCardHasExactProof(
@@ -334,14 +357,7 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   if (item.msg_type !== 'interactive') {
     return { ok: false, error: 'provider_message_type_mismatch' };
   }
-  const sender = item.sender;
-  const senderType = sender?.sender_type;
-  const senderIdType = sender?.id_type ?? sender?.sender_id_type;
-  const senderAppId = typeof sender?.id === 'string'
-    && (senderType === 'app' || senderType === 'bot' || senderIdType === 'app_id')
-    ? sender.id
-    : undefined;
-  if (senderAppId !== input.larkAppId) {
+  if (!providerMessageHasExactAppSender(item.sender, input.larkAppId)) {
     return { ok: false, error: 'provider_sender_mismatch' };
   }
   const content = item.body?.content ?? item.content;

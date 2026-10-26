@@ -69,7 +69,10 @@ import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, Codex
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
-import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import {
+  hasProtectedSessionMutationOwnership,
+  protectedSessionMutationReasons,
+} from './session-mutation-guard.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import {
@@ -4360,6 +4363,8 @@ async function buildScheduledTargetNotice(params: {
   );
 }
 
+const scheduledFreshAdmissionEpochs = new WeakMap<DaemonSession, object>();
+
 export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
@@ -4442,27 +4447,36 @@ export async function executeScheduledTask(
     target: DaemonSession,
     input: string | CliTurnPayload,
     resumeOrTurnId: Parameters<typeof forkWorker>[2],
-    onAsynchronousRejected?: () => void,
-  ): void => {
+    onAsynchronousAdmission?: (
+      admission: import('./worker-pool.js').WorkerForkAdmission,
+    ) => void,
+  ): import('./worker-pool.js').WorkerForkAdmission | undefined => {
     let synchronousAdmission: import('./worker-pool.js').WorkerForkAdmission | undefined;
     let inForkCall = true;
+    let admissionFinalized = false;
     forkWorker(target, input, resumeOrTurnId, {
       onAdmission(admission) {
+        if (admission !== 'deferred') {
+          if (admissionFinalized) return;
+          admissionFinalized = true;
+        }
         if (inForkCall) synchronousAdmission = admission;
-        if (admission !== 'rejected') return;
-        if (silent) disarmSilentScheduledTurn(target, scheduledTurnId);
-        observeScheduledRunTerminal({
-          turnId: scheduledTurnId,
-          status: 'failed',
-          errorCode: 'worker_admission_rejected',
-        });
-        if (!inForkCall) onAsynchronousRejected?.();
+        if (admission === 'rejected') {
+          if (silent) disarmSilentScheduledTurn(target, scheduledTurnId);
+          observeScheduledRunTerminal({
+            turnId: scheduledTurnId,
+            status: 'failed',
+            errorCode: 'worker_admission_rejected',
+          });
+        }
+        if (!inForkCall) onAsynchronousAdmission?.(admission);
       },
     });
     inForkCall = false;
     if (synchronousAdmission === 'rejected') {
       throw new Error(`scheduled task ${task.id} worker admission was rejected`);
     }
+    return synchronousAdmission;
   };
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
@@ -5055,30 +5069,61 @@ export async function executeScheduledTask(
     }
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
-    try {
-      forkScheduledWorker(ds, prompt, scheduledTurnId, () => {
-        // Deferred admission can reject after executeScheduledTask returned.
-        // Remove only this fire's exact fresh owner, and only while it still
-        // has no worker or protected activation/dispatch ownership. Existing
-        // continuations never install this callback.
-        if (activeSessions.get(key) !== ds
-            || ds.session.status !== 'active'
-            || (ds.worker && !ds.worker.killed)
-            || hasProtectedSessionMutationOwnership(ds)) return;
-        activeSessions.delete(key);
-        if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+    const admissionEpoch = {};
+    const admissionPrompt = ds.lastCliInput;
+    scheduledFreshAdmissionEpochs.set(ds, admissionEpoch);
+    const ownsFreshAdmission = (): boolean =>
+      scheduledFreshAdmissionEpochs.get(ds) === admissionEpoch
+      && ds.initialStartPending === true
+      && ds.pendingPrompt === firePrompt
+      && ds.lastCliInput === admissionPrompt;
+    const settleFreshAdmission = (
+      admission: import('./worker-pool.js').WorkerForkAdmission,
+    ): void => {
+      if (admission === 'deferred' || !ownsFreshAdmission()) return;
+      scheduledFreshAdmissionEpochs.delete(ds);
+      if (activeSessions.get(key) !== ds || ds.session.status !== 'active') return;
+      if (admission === 'accepted') {
         ds.initialStartPending = false;
         ds.pendingPrompt = undefined;
-        ds.lastUserPrompt = undefined;
-        ds.lastCliInput = undefined;
-        ds.lastCodexAppInput = undefined;
-        ds.session.lastUserPrompt = undefined;
-        ds.session.lastCliInput = undefined;
-        ds.session.lastCodexAppInput = undefined;
-        sessionStore.updateSession(ds.session);
-        sessionStore.closeSession(session.sessionId);
-      });
+        return;
+      }
+      // If this exact admission acquired durable ownership before reporting a
+      // rejection, keep the row and let that owner recover it. The immutable
+      // epoch still prevents a later callback from acting on a new admission.
+      if ((ds.worker && !ds.worker.killed)
+          || protectedSessionMutationReasons(ds).some(reason => reason !== 'initial_start')) {
+        ds.initialStartPending = false;
+        ds.pendingPrompt = undefined;
+        return;
+      }
+      activeSessions.delete(key);
+      if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+      ds.initialStartPending = false;
+      ds.pendingPrompt = undefined;
+      ds.lastUserPrompt = undefined;
+      ds.lastCliInput = undefined;
+      ds.lastCodexAppInput = undefined;
+      ds.session.lastUserPrompt = undefined;
+      ds.session.lastCliInput = undefined;
+      ds.session.lastCodexAppInput = undefined;
+      sessionStore.updateSession(ds.session);
+      sessionStore.closeSession(session.sessionId);
+    };
+    try {
+      const admission = forkScheduledWorker(
+        ds,
+        prompt,
+        scheduledTurnId,
+        settleFreshAdmission,
+      );
+      // Real forkWorker always reports synchronously. Preserve the historical
+      // accepted default for narrow test doubles that omit the callback.
+      settleFreshAdmission(admission ?? 'accepted');
     } catch (err) {
+      if (scheduledFreshAdmissionEpochs.get(ds) === admissionEpoch) {
+        scheduledFreshAdmissionEpochs.delete(ds);
+      }
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
       // A fresh candidate is registered immediately before fork so no rival
       // can claim the anchor.  Synchronous admission rejection happens before
@@ -5099,8 +5144,6 @@ export async function executeScheduledTask(
       sessionStore.closeSession(session.sessionId);
       throw err;
     }
-    ds.initialStartPending = false;
-    ds.pendingPrompt = undefined;
 
     logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
   });

@@ -32,6 +32,7 @@ function verify(
     rootId?: string;
     parentId?: string;
     threadId?: string;
+    sender?: Record<string, unknown>;
   } = {},
 ) {
   return verifyScheduledFinalDeliveryReadback({
@@ -43,7 +44,7 @@ function verify(
       ...(routing.threadId ? { thread_id: routing.threadId } : {}),
       ...(deletion.omit ? {} : { deleted: deletion.deleted ?? false }),
       msg_type: msgType,
-      sender: { id: 'cli_exact', id_type: 'app_id', sender_type: 'app' },
+      sender: routing.sender ?? { id: 'cli_exact', id_type: 'app_id', sender_type: 'app' },
       body: { content: JSON.stringify(card) },
     }] },
     messageId: 'om_provider_receipt',
@@ -226,6 +227,46 @@ describe('scheduled final delivery proof', () => {
       body: exactCard.body,
     }, proof)).toBe(false);
     expect(scheduledFinalCardHasExactProof('{invalid', proof)).toBe(false);
+  });
+
+  it.each([
+    ['duplicate exact proof', proof],
+    ['conflicting generation proof', deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 8,
+      dispatchAttempt: 2,
+    })!],
+  ])('rejects a canonical footer with a second %s carrier', (_label, secondProof) => {
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, proof), 'message');
+    const footer = card.body.elements.find((element: any) =>
+      element.element_id === 'botmux_reply_footer');
+    expect(footer).toBeDefined();
+    footer!.content += ` [·](https://github.com/deepcoldy/bot%6Dux#${secondProof})`;
+
+    expect(scheduledFinalCardHasExactProof(card, proof)).toBe(false);
+    expect(verify(card)).toEqual({ ok: false, error: 'provider_turn_proof_missing' });
+  });
+
+  it.each([
+    ['user with app id', { id: 'cli_exact', sender_type: 'user', id_type: 'app_id' }],
+    ['app with open id', { id: 'cli_exact', sender_type: 'app', id_type: 'open_id' }],
+    ['conflicting id aliases', {
+      id: 'cli_exact', sender_type: 'app', id_type: 'app_id', sender_id_type: 'open_id',
+    }],
+    ['untyped sender', { id: 'cli_exact' }],
+  ])('rejects contradictory Provider sender metadata: %s', (_label, sender) => {
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, proof), 'message');
+
+    expect(verify(card, proof, {}, 'interactive', { sender })).toEqual({
+      ok: false,
+      error: 'provider_sender_mismatch',
+    });
   });
 
   it('binds provider readback to the daemon-frozen visible target', () => {

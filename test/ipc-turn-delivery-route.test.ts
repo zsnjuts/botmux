@@ -484,6 +484,54 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     });
   });
 
+  it('rejects feedback readback with contradictory Provider sender metadata', async () => {
+    const turnId = 'om_feedback_sender_conflict';
+    const ds = liveSession('sess-a', CAP_A, turnId, {
+      ownerOpenId: 'ou_owner',
+      turnReplyContexts: {
+        [turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_root_sess-a' },
+          replyTargetSenderOpenId: 'ou_requester',
+        },
+      },
+    });
+    await setup({ 'sess-a': ds });
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+      config: {
+        apiOnly: false,
+        feedback: { enabled: true, audience: 'requester' },
+        chatFeedbackPolicies: {},
+      },
+    } as any);
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_feedback_sender_conflict',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'user' },
+      body: { content: JSON.stringify({
+        schema: '2.0',
+        body: { elements: [{ tag: 'markdown', content: 'feedback final' }] },
+      }) },
+    }] });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_feedback_sender_conflict',
+      content: 'feedback final',
+      responseKind: 'final',
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'turn_delivery_feedback_readback_invalid',
+    });
+    expect(await rowFor('om_feedback_sender_conflict')).toBeUndefined();
+  });
+
   it('403s a capability presented against another session and writes nothing', async () => {
     await setup({
       'sess-a': liveSession('sess-a', CAP_A, 'turn-a'),

@@ -1308,6 +1308,8 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     await expect(executeScheduledTask(scheduledTask, active, vi.fn())).resolves.toBeUndefined();
     const first = [...active.values()][0];
     expect(first).toBeDefined();
+    expect(first.initialStartPending).toBe(true);
+    expect(first.pendingPrompt).toContain('scheduled prompt');
     expect(first.session.lastCliInput).toBeTruthy();
 
     rejectAdmission?.();
@@ -1325,5 +1327,40 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     expect(replacement).toBeDefined();
     expect(replacement).not.toBe(first);
     expect(replacement.session.sessionId).not.toBe(first.session.sessionId);
+  });
+
+  it('holds a deferred fresh admission until its exact final decision and ignores a stale rejection', async () => {
+    const active = new Map<string, DaemonSession>();
+    let settleFirst: ((admission: 'accepted' | 'deferred' | 'rejected') => void) | undefined;
+    forkWorkerMock.mockImplementationOnce((_ds, _input, _resume, opts) => {
+      opts.onAdmission?.('deferred');
+      settleFirst = opts.onAdmission;
+      return true;
+    });
+
+    await expect(executeScheduledTask(task(), active, vi.fn())).resolves.toBeUndefined();
+    const first = active.get(sessionKey(ROOT, APP));
+    expect(first).toBeDefined();
+    expect(first?.initialStartPending).toBe(true);
+    await expect(executeScheduledTask(task(), active, vi.fn()))
+      .rejects.toThrow('initial_start_pending');
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+
+    settleFirst?.('accepted');
+    expect(first?.initialStartPending).toBe(false);
+    expect(first?.pendingPrompt).toBeUndefined();
+
+    forkWorkerMock.mockImplementationOnce((_ds, _input, _resume, opts) => {
+      opts.onAdmission?.('accepted');
+      return true;
+    });
+    await expect(executeScheduledTask(task(), active, vi.fn())).resolves.toBeUndefined();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(first);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(2);
+
+    settleFirst?.('rejected');
+    await Promise.resolve();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(first);
+    expect(store.get(first!.session.sessionId)?.status).toBe('active');
   });
 });

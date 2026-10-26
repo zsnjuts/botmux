@@ -148,6 +148,7 @@ import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TUR
 import { observeScheduledRunProviderReadbackDelivery } from './scheduled-run-settlement.js';
 import {
   deriveScheduledFinalDeliveryProof,
+  providerMessageHasExactAppSender,
   providerMessageHasExpectedTarget,
   scheduledFinalReceiptEnvelope,
   verifyScheduledFinalDeliveryReadback,
@@ -2158,14 +2159,7 @@ function providerFinalCardFromReadback(input: {
       || item.chat_id !== input.chatId
       || item.msg_type !== 'interactive'
       || !providerMessageHasExpectedTarget(item, input.expectedTarget)) return undefined;
-  const sender = item.sender;
-  const senderType = sender?.sender_type;
-  const senderIdType = sender?.id_type ?? sender?.sender_id_type;
-  const senderAppId = typeof sender?.id === 'string'
-    && (senderType === 'app' || senderType === 'bot' || senderIdType === 'app_id')
-    ? sender.id
-    : undefined;
-  if (senderAppId !== input.larkAppId) return undefined;
+  if (!providerMessageHasExactAppSender(item.sender, input.larkAppId)) return undefined;
   const content = item.body?.content ?? item.content;
   if (typeof content !== 'string') return undefined;
   try {
