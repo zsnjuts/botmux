@@ -31,7 +31,11 @@ import {
   type RemoteRunnerSessionToolResult,
   type RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
-import type { RemoteRunnerConfig } from './remote-runner-config.js';
+import {
+  REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS,
+  REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
+  type RemoteRunnerConfig,
+} from './remote-runner-config.js';
 
 type PendingRequest = {
   command: RemoteRunnerCommand;
@@ -67,8 +71,8 @@ const MAX_OUTBOUND_MESSAGES_PER_TURN = 10;
 const MAX_SESSION_TOOLS_PER_TURN = 30;
 const MAX_DEFERRED_RECOVERED_EVENTS = 128;
 
-function boundedTimeout(value: number | undefined, fallback: number): number {
-  if (!Number.isSafeInteger(value) || value! < 100 || value! > 300_000) return fallback;
+function boundedTimeout(value: number | undefined, fallback: number, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value! < 100 || value! > maximum) return fallback;
   return value!;
 }
 
@@ -168,8 +172,16 @@ export class RemoteRunnerBackend implements SessionBackend {
     initialState?: RemoteRunnerBackendState,
   ) {
     this.requiredCapabilities = config.requiredCapabilities ?? REMOTE_RUNNER_BASE_CAPABILITIES;
-    this.handshakeTimeoutMs = boundedTimeout(config.handshakeTimeoutMs, 15_000);
-    this.operationTimeoutMs = boundedTimeout(config.operationTimeoutMs, 30_000);
+    this.handshakeTimeoutMs = boundedTimeout(
+      config.handshakeTimeoutMs,
+      15_000,
+      REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS,
+    );
+    this.operationTimeoutMs = boundedTimeout(
+      config.operationTimeoutMs,
+      30_000,
+      REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
+    );
     if (initialState) {
       const normalized = normalizeRemoteRunnerBackendState(initialState);
       if (!normalized) throw new Error('remote runner initial state is invalid');

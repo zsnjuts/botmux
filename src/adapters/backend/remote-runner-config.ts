@@ -16,11 +16,18 @@ export interface RemoteRunnerConfig {
 
 const CAPABILITIES = new Set<string>(REMOTE_RUNNER_CAPABILITIES);
 const PROVIDER_RE = /^[a-z][a-z0-9._-]{0,63}$/;
+export const REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS = 300_000;
+export const REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS = 1_200_000;
 
 function optionalTimeout(value: unknown, field: string): number | undefined {
   if (value === undefined) return undefined;
-  if (!Number.isSafeInteger(value) || Number(value) < 100 || Number(value) > 300_000) {
-    throw new Error(`remoteRunner.${field} must be an integer between 100 and 300000`);
+  const maximum = field === 'handshakeTimeoutMs'
+    ? REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS
+    : REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS;
+  if (!Number.isSafeInteger(value) || Number(value) < 100 || Number(value) > maximum) {
+    throw new Error(
+      `remoteRunner.${field} must be an integer between 100 and ${maximum}`,
+    );
   }
   return Number(value);
 }
