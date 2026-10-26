@@ -11691,6 +11691,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    if (scheduledTurn && !scheduleRemoveSelfTaskId) {
+      await reportTrustedFinalDelivery(
+        existingTurnPrimary.messageId,
+        expectedLinkRenderedContent,
+      );
+    }
     await removeScheduleSelfAfterVerifiedFinal(
       existingTurnPrimary.messageId,
       expectedLinkRenderedContent,

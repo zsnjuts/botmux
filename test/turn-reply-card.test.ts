@@ -15,6 +15,7 @@ import { extractCotEntries } from '../src/services/claude-transcript.js';
 import {
   deriveScheduledFinalDeliveryProof,
   stampScheduledFinalDeliveryProof,
+  verifyScheduledFinalDeliveryReadback,
 } from '../src/core/scheduled-final-delivery-proof.js';
 
 const key = { larkAppId: 'app_test', sessionId: 'session', turnId: 'om_turn' };
@@ -522,6 +523,20 @@ describe('one reply card per turn', () => {
     expect(renderedFooter?.content).toContain(`#${proof}`);
     expect(rendered.body.elements.some((element: any) => element.tag === 'hr'
       && element.element_id === proof)).toBe(false);
+    expect(verifyScheduledFinalDeliveryReadback({
+      detail: { items: [{
+        message_id: 'om_scheduled_overflow',
+        chat_id: input.chatId,
+        deleted: false,
+        msg_type: 'interactive',
+        sender: { id: key.larkAppId, id_type: 'app_id', sender_type: 'app' },
+        body: { content: JSON.stringify(rendered) },
+      }] },
+      messageId: 'om_scheduled_overflow',
+      larkAppId: key.larkAppId,
+      chatId: input.chatId,
+      proof,
+    })).toEqual({ ok: true });
     expect(cards.get(final.messageId!)!).toContain('Markdown 附件');
     expect(io.sendOverflow).toHaveBeenCalledWith(text, expect.any(String));
   });

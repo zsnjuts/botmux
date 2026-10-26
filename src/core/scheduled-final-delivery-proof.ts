@@ -267,7 +267,8 @@ export function verifyScheduledFinalDeliveryReadback(input: {
     return { ok: false, error: 'provider_turn_proof_missing' };
   }
   const root = providerCardRoot(card);
-  if (!root || canonicalReplyCardFooterPurpose(root) !== 'message') {
+  const purpose = root ? canonicalReplyCardFooterPurpose(root) : undefined;
+  if (purpose !== 'message' && purpose !== 'turn-message') {
     return { ok: false, error: 'provider_final_not_confirmed' };
   }
   const projection = projectGroupContextCard(content, { botmuxSender: true });

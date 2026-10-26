@@ -347,6 +347,37 @@ describe('botmux send per-turn final idempotency', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
 
+  it('re-reports a scheduled receipt on early replay without self cleanup', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const extraEnv: NodeJS.ProcessEnv = {};
+    const f = createFixture(
+      undefined,
+      { scope: 'chat', workerGeneration: 7 },
+      scheduledTurn,
+      extraEnv,
+    );
+    try {
+      const first = f.run('final', 'scheduled answer');
+      expect(first.result.status, String(first.result.stderr)).toBe(0);
+      expect(first.requests).toHaveLength(1);
+      expect(String(first.result.stderr)).toContain('daemon IPC unavailable');
+
+      extraEnv.BOTMUX_DAEMON_IPC_PORT = '7951';
+      extraEnv.BOTMUX_TEST_DURABLE_SEND = '1';
+      const retry = f.run('final', 'scheduled answer');
+      expect(retry.result.status, String(retry.result.stderr)).toBe(0);
+      expect(retry.requests).toHaveLength(0);
+      const daemonRequests = String(retry.result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      expect(daemonRequests.map(request => request.path)).toEqual([
+        `/api/sessions/${f.sessionId}/turn-delivery`,
+      ]);
+      expect(JSON.parse(String(retry.result.stdout).split('\n').findLast(line => line.startsWith('{'))!))
+        .toMatchObject({ messageId: 'om_separate_message', replayed: true });
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
   it('deletes a scheduled task only after the trusted final receipt is verified', () => {
     const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
     const f = createFixture(
