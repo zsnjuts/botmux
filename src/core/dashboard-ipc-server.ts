@@ -5196,12 +5196,39 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // JSON accepts null, arrays, and scalars. Treat all non-record input as an
   // empty option bag before resuming, so a malformed optional body can never
   // turn a successful state transition into a 500 below.
-  const body: { reconcileStreamingCard?: unknown } = parsedBody !== null
+  const body: { reconcileStreamingCard?: unknown; rootId?: unknown } = parsedBody !== null
     && typeof parsedBody === 'object'
     && !Array.isArray(parsedBody)
-    ? parsedBody as { reconcileStreamingCard?: unknown }
+    ? parsedBody as { reconcileStreamingCard?: unknown; rootId?: unknown }
     : {};
   const sessionId = params.sessionId;
+  if (coordinationModeIsPrimary()) {
+    // The PostgreSQL Session row is canonical in primary mode. Resuming only
+    // this replica would start a remote provider while the canonical row stays
+    // closed, so the next inbound message could start a second provider for
+    // the same logical Session. Route trusted Dashboard/host requests through
+    // the same fenced durable lifecycle path as close; session capabilities
+    // remain unable to promote themselves to trusted-host authority.
+    if (!isTrustedHostIpcRequest(req)) {
+      return jsonRes(res, 409, { ok: false, error: 'durable_primary_requires_host_control' });
+    }
+    if (!durableSessionLifecycleHandler) {
+      return jsonRes(res, 503, { ok: false, error: 'durable_primary_unavailable' });
+    }
+    try {
+      const result = await durableSessionLifecycleHandler({
+        sessionId,
+        action: 'resume',
+        ...(typeof body.rootId === 'string' ? { rootId: body.rootId } : {}),
+      });
+      return jsonRes(res, result.ok ? 200 : 409, result);
+    } catch (error) {
+      return jsonRes(res, 503, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
   const sourceSession = findSessionRecord(sessionId);
   if (!sourceSession) return jsonRes(res, 404, { ok: false, error: 'not_found' });
   // Legacy persisted sessions may carry an empty larkAppId and are hydrated
