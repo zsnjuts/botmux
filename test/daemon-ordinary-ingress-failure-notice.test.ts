@@ -1470,6 +1470,56 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ]);
   });
 
+  it('commits a primary /queue turn before its post-admission receipt and later final', async () => {
+    vi.useFakeTimers();
+    const anchor = 'om_thread_primary_queue_command_route';
+    const turnId = 'om_primary_queue_command_route_turn';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    const queuePostAdmissionOutput = vi.fn();
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 7,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+
+    try {
+      await handleThreadReply(
+        makeEventData(turnId, '/queue 只回复 HUMAN_QUEUE_V1_OK', anchor),
+        ctx,
+      );
+
+      expect(ctx.ingressAdmission).toEqual({ admitted: true });
+      expect(workerSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'message',
+        turnId,
+        queueAfterActiveTurn: true,
+        content: expect.stringContaining('HUMAN_QUEUE_V1_OK'),
+        trustedCaller: expect.objectContaining({
+          requestUserOpenId: OWNER,
+          senderType: 'user',
+        }),
+      }), expect.any(Function));
+      expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+        target: { kind: 'reply', messageId: anchor, replyInThread: true },
+        content: expect.stringContaining('将在当前任务结束后作为独立一轮执行'),
+        msgType: 'text',
+        providerUuid: expect.stringMatching(/^command_reply_[a-f0-9]{24}$/),
+        hookContext: { sessionId: ds.session.sessionId, turnId },
+      }));
+      expect(repliedText()).not.toContain('将在当前任务结束后作为独立一轮执行');
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('replays a queued activation journal after worker death before the durable follower', async () => {
     const anchor = 'om_thread_primary_queued_recovery';
     const openingTurnId = 'om_primary_queued_opening';

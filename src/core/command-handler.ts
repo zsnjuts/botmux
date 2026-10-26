@@ -1908,9 +1908,12 @@ export async function handleCommand(
           break;
         }
         const accepted = await deps.submitQueuedMessage?.(ds, message, text, deps.invocationReplyTarget);
-        await sessionReply(rootId, t(accepted ? 'cmd.queue.accepted' : 'cmd.queue.failed', undefined, loc)
+        const result = t(accepted ? 'cmd.queue.accepted' : 'cmd.queue.failed', undefined, loc)
           + (accepted && getBot(ds.larkAppId).config.triggerUserAuth?.enabled
-            ? '\n' + t('cmd.queue.identity_window', undefined, loc) : ''));
+            ? '\n' + t('cmd.queue.identity_window', undefined, loc) : '');
+        await (accepted && deps.postAdmissionReply
+          ? deps.postAdmissionReply(rootId, result)
+          : sessionReply(rootId, result));
         break;
       }
 
