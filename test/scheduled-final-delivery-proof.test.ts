@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   deriveScheduledFinalDeliveryProof,
+  matchesScheduledFinalReceiptEnvelope,
+  scheduledFinalReceiptEnvelope,
   stampScheduledFinalDeliveryProof,
   verifyScheduledFinalDeliveryReadback,
 } from '../src/core/scheduled-final-delivery-proof.js';
@@ -46,6 +48,19 @@ describe('scheduled final delivery proof', () => {
       workerGeneration: 7,
       dispatchAttempt: 3,
     })).not.toBe(proof);
+  });
+
+  it('matches only the versioned exact trusted-receipt tuple', () => {
+    const receipt = scheduledFinalReceiptEnvelope({
+      messageId: 'om_provider_receipt',
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+      proof,
+    });
+    expect(matchesScheduledFinalReceiptEnvelope(receipt, receipt)).toBe(true);
+    expect(matchesScheduledFinalReceiptEnvelope({ ok: true }, receipt)).toBe(false);
+    expect(matchesScheduledFinalReceiptEnvelope({ ...receipt, workerGeneration: 8 }, receipt)).toBe(false);
   });
 
   it('stamps the exact link into an existing footer separator without changing rendered text', () => {
@@ -169,6 +184,27 @@ describe('scheduled final delivery proof', () => {
     }, 'message'), proof);
 
     expect(verify(card)).toEqual({ ok: true });
+  });
+
+  it('keeps the purpose marker on the real footer when callback data collides with its id', () => {
+    const stamped = stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'Run' },
+          behaviors: [{ type: 'callback', value: {
+            element_id: 'botmux_reply_footer',
+            content: 'business data',
+          } }],
+        },
+        { tag: 'markdown', content: 'final answer' },
+      ] },
+    }, proof);
+    const marked = markGroupContextCardPurpose(stamped, 'message');
+
+    expect(marked.body.elements[0].behaviors[0].value.content).toBe('business data');
+    expect(verify(marked)).toEqual({ ok: true });
   });
 
   it.each([

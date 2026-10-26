@@ -1,4 +1,8 @@
-import { REPLY_CARD_FOOTER_ELEMENT_ID, REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
+import {
+  findReplyCardFooterComponent,
+  REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER,
+} from './reply-card-footer-signature.js';
 
 export const GROUP_CONTEXT_CARD_CONTENT_VERSION = 1;
 export type GroupContextCardPurpose = 'runtime' | 'message' | 'turn-message';
@@ -133,8 +137,8 @@ export function markGroupContextCardPurpose(card: string | Record<string, any>, 
   }
   const marker = '\u2063'.repeat(PURPOSE_LENGTH[purpose]);
   const mediaMarker = '\u2063'.repeat(PURPOSE_LENGTH[purpose] + 3);
-  const footer = nodes(root).find(node => node.element_id === REPLY_CARD_FOOTER_ELEMENT_ID && typeof node.content === 'string');
-  if (footer) {
+  const footer = findReplyCardFooterComponent(root);
+  if (footer && typeof footer.content === 'string') {
     if (footer.content.includes(REPLY_CARD_FOOTER_MARKER)) footer.content = footer.content.replace(CARRIER, marker);
     else footer.content = footer.content.replace(/(?=<\/font>\s*$)|$/, marker);
   } else if (!inlinePurposeCarrier(root, marker)

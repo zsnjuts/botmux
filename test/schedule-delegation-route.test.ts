@@ -135,6 +135,7 @@ describe('delegated schedule add route', () => {
     });
     h.body.task.schedule = '30m';
     delete h.ds.session.turnReplyContexts.om_kickoff.sourceMessageCreateTime;
+    h.scope.getGroupContextMessage.mockReturnValue({ createTime: 1792907999000 });
     h.scope.readGlobalConfig = () => ({});
     h.scope.getBot = () => ({ config: {} });
 

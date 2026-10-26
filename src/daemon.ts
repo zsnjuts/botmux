@@ -214,7 +214,6 @@ import {
 } from './services/group-context-settings-store.js';
 import { setGroupContextSettingsResolver } from './services/group-context-ingest.js';
 import { prepareGroupContextForTurn, captureNativeGroupContextInput } from './services/group-context-runtime.js';
-import { getGroupContextMessage } from './services/group-context-store.js';
 import { groupContextConversationForTurn } from './services/group-context-location.js';
 import { groupContextQuery } from './services/group-context.js';
 import { ensureGroupContextRecallHealth } from './services/group-context-health.js';
@@ -7889,19 +7888,7 @@ function scheduleReferenceTimeForTurn(
   turnId: string,
   schedule: string,
 ): number | undefined {
-  let sourceMessageCreateTime = ds.session.turnReplyContexts?.[turnId]?.sourceMessageCreateTime;
-  try {
-    sourceMessageCreateTime ??= getGroupContextMessage(
-      ds.larkAppId,
-      ds.chatId,
-      ds.session.turnReplyContexts?.[turnId]?.sourceMessageId ?? turnId,
-    )?.createTime;
-  } catch (error) {
-    logger.warn(
-      `[scheduler] Failed to read source-message time for ${turnId.slice(0, 12)}: `
-      + `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
+  const sourceMessageCreateTime = ds.session.turnReplyContexts?.[turnId]?.sourceMessageCreateTime;
   const referenceTimeMs = resolveScheduleReferenceTime({ sourceMessageCreateTime });
   if (referenceTimeMs === undefined && scheduleRequiresReferenceTime(schedule)) {
     throw new Error('schedule_reference_time_unavailable');
@@ -32198,7 +32185,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ? scheduleAuthorityStore?.getRecord(request.daemonSession.larkAppId, scheduledTaskId)
           : undefined,
       });
-      const trustedFinalDelivery = request.responseKind === 'final'
+      const trustedFinalTarget = request.responseKind === 'final'
         && scheduledTaskId !== null
         && sameDurableOutboxTarget(
           request.target,
@@ -32238,9 +32225,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!isConfirmedLarkMessageId(providerMessageId)) {
         return { kind: 'ambiguous', error: 'delivered outbox receipt lacks provider message id' };
       }
-      if (trustedFinalDelivery) {
-        observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId);
-      }
+      const trustedFinalDelivery = trustedFinalTarget
+        && observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId);
       return {
         kind: 'delivered' as const,
         messageId: providerMessageId,
@@ -32607,7 +32593,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 await executeScheduledRunAwaitingSettlement({
                   turnId: scheduledTurnId,
                   taskId: targetTask.id,
+                  larkAppId: effectiveAppId,
                   requireFinalDelivery: targetTask.silent !== true,
+                  authorityIsCurrent: () => {
+                    if (scheduleAuthorityStore) {
+                      const authority = scheduleAuthorityStore.getRecord(effectiveAppId, targetTask.id);
+                      return authority?.state === 'active'
+                        && authority.task.lastStatus === 'running'
+                        && authority.task.lastRunId === executionContext.runId;
+                    }
+                    const current = scheduleStore.getTask(targetTask.id, effectiveAppId);
+                    return current?.lastStatus === 'running'
+                      && current.lastRunId === executionContext.runId;
+                  },
                 }, () => withBotTurnAdmission(
                   effectiveAppId,
                   () => executeScheduledTask(

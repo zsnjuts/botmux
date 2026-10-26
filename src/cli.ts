@@ -35,6 +35,8 @@ import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
 import {
   deriveScheduledFinalDeliveryProof,
+  matchesScheduledFinalReceiptEnvelope,
+  scheduledFinalReceiptEnvelope,
   stampScheduledFinalDeliveryProof,
 } from './core/scheduled-final-delivery-proof.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
@@ -11521,9 +11523,27 @@ async function cmdSend(rest: string[]): Promise<void> {
               }
             : {}),
         });
-        if (!res.ok) {
-          const detail = await res.json().catch(() => undefined) as { error?: string } | undefined;
+        const detail = await res.json().catch(() => undefined) as {
+          ok?: boolean;
+          error?: string;
+          trustedFinalReceipt?: unknown;
+        } | undefined;
+        if (!res.ok || detail?.ok !== true) {
           throw new Error(detail?.error ?? `HTTP ${res.status}`);
+        }
+        if (scheduledFinalDeliveryIdentity && scheduledFinalDeliveryProof) {
+          const expected = scheduledFinalReceiptEnvelope({
+            messageId,
+            turnId: scheduledFinalDeliveryIdentity.turnId,
+            workerGeneration: scheduledFinalDeliveryIdentity.workerGeneration,
+            ...(scheduledFinalDeliveryIdentity.dispatchAttempt !== undefined
+              ? { dispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
+              : {}),
+            proof: scheduledFinalDeliveryProof,
+          });
+          if (!matchesScheduledFinalReceiptEnvelope(detail.trustedFinalReceipt, expected)) {
+            throw new Error('scheduled trusted final receipt envelope mismatch');
+          }
         }
         return true;
       } catch (error) {

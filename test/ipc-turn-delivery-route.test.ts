@@ -140,6 +140,18 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       receiptProof: proof,
     });
     expect(res.status).toBe(200);
+    expect(await res.clone().json()).toMatchObject({
+      ok: true,
+      trustedFinalReceipt: {
+        domain: 'botmux.scheduled-final-receipt.v1',
+        trusted: true,
+        messageId: 'om_answer_final',
+        turnId,
+        workerGeneration: 7,
+        dispatchAttempt: 2,
+        proof,
+      },
+    });
     await expect(settlement.settled).resolves.toEqual({ messageId: 'om_answer_final' });
   });
 

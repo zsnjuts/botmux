@@ -376,6 +376,33 @@ describe('botmux send per-turn final idempotency', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
 
+  it('keeps a scheduled task when an old daemon returns an unversioned 200 receipt', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const f = createFixture(
+      undefined,
+      { scope: 'chat', workerGeneration: 7 },
+      scheduledTurn,
+      {
+        BOTMUX_DAEMON_IPC_PORT: '7951',
+        BOTMUX_TEST_DURABLE_SEND: '1',
+        BOTMUX_TEST_LEGACY_TURN_DELIVERY: '1',
+      },
+    );
+    try {
+      const sent = f.run('final', 'scheduled answer', ['--schedule-remove-self']);
+      expect(sent.result.status, String(sent.result.stderr)).toBe(0);
+      const daemonRequests = String(sent.result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      expect(daemonRequests.map(request => request.path)).toEqual([
+        `/api/sessions/${f.sessionId}/turn-delivery`,
+      ]);
+      expect(String(sent.result.stderr)).toContain('可信飞书回执未验证');
+      expect(JSON.parse(String(sent.result.stdout).split('\n').findLast(line => line.startsWith('{'))!))
+        .toMatchObject({ scheduleSelfCleanup: { removed: false } });
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
   it('promotes auxiliary to final and quotes queued turn when active turn has delivered final and successor has not', () => {
     const f = createFixture(undefined, {
       scope: 'chat',

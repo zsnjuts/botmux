@@ -150,6 +150,34 @@ if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK
       path: target.pathname,
       body,
     }));
+    if (target.pathname.endsWith('/turn-delivery')) {
+      if (process.env.BOTMUX_TEST_LEGACY_TURN_DELIVERY === '1') {
+        return new Response(JSON.stringify({ ok: true, deliveryId: 'legacy', duplicate: false }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (typeof body?.receiptTurnId === 'string'
+          && typeof body?.receiptWorkerGeneration === 'number'
+          && typeof body?.receiptProof === 'string') {
+        return new Response(JSON.stringify({
+          ok: true,
+          deliveryId: 'current',
+          duplicate: false,
+          trustedFinalReceipt: {
+            domain: 'botmux.scheduled-final-receipt.v1',
+            trusted: true,
+            messageId: body.messageId,
+            turnId: body.receiptTurnId,
+            workerGeneration: body.receiptWorkerGeneration,
+            ...(typeof body.receiptDispatchAttempt === 'number'
+              ? { dispatchAttempt: body.receiptDispatchAttempt }
+              : {}),
+            proof: body.receiptProof,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+    }
     return new Response(JSON.stringify({
       ok: true,
       kind: 'delivered',

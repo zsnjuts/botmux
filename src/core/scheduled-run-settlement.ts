@@ -21,7 +21,9 @@ export interface ScheduledRunSettlement {
 
 interface PendingSettlement {
   taskId: string;
+  larkAppId?: string;
   requireFinalDelivery: boolean;
+  authorityIsCurrent?: () => boolean;
   resolve: (value: { messageId?: string }) => void;
   reject: (error: Error) => void;
 }
@@ -44,10 +46,17 @@ function settlementError(turnId: string, detail: string): ScheduledRunDeliveryEr
   return new ScheduledRunDeliveryError(turnId, detail);
 }
 
+function authorityIsCurrent(record: PendingSettlement): boolean {
+  if (!record.authorityIsCurrent) return true;
+  try { return record.authorityIsCurrent() === true; } catch { return false; }
+}
+
 export function beginScheduledRunSettlement(input: {
   turnId: string;
   taskId: string;
+  larkAppId?: string;
   requireFinalDelivery: boolean;
+  authorityIsCurrent?: () => boolean;
 }): ScheduledRunSettlement {
   if (pending.has(input.turnId)) {
     throw new Error(`scheduled run settlement already exists for ${input.turnId}`);
@@ -58,9 +67,15 @@ export function beginScheduledRunSettlement(input: {
     resolve = res;
     reject = rej;
   });
+  // Revocation may arrive while dispatch is still awaiting worker admission;
+  // attach a handler immediately so the preserved rejection cannot surface as
+  // unhandled before executeScheduledRunAwaitingSettlement awaits it.
+  void settled.catch(() => undefined);
   pending.set(input.turnId, {
     taskId: input.taskId,
+    larkAppId: input.larkAppId,
     requireFinalDelivery: input.requireFinalDelivery,
+    authorityIsCurrent: input.authorityIsCurrent,
     resolve,
     reject,
   });
@@ -74,6 +89,11 @@ function settleScheduledRunFinalDelivery(
   const record = pending.get(turnId);
   if (!record || !record.requireFinalDelivery) return false;
   if (!isConfirmedLarkMessageId(messageId)) return false;
+  if (!authorityIsCurrent(record)) {
+    pending.delete(turnId);
+    record.reject(settlementError(turnId, 'schedule authority was revoked before delivery'));
+    return false;
+  }
   pending.delete(turnId);
   record.resolve({ messageId });
   return true;
@@ -106,6 +126,10 @@ export function observeScheduledRunTerminal(input: {
   const record = pending.get(input.turnId);
   if (!record) return false;
   pending.delete(input.turnId);
+  if (!authorityIsCurrent(record)) {
+    record.reject(settlementError(input.turnId, 'schedule authority was revoked before terminal'));
+    return true;
+  }
   if (!record.requireFinalDelivery && input.status === 'completed') {
     record.resolve({});
     return true;
@@ -128,13 +152,33 @@ export function abortScheduledRunSettlement(turnId: string, error: unknown): boo
   return true;
 }
 
+/** Revoke every in-flight run for the exact task authority. This closes the
+ * window where a removed task could later be marked successful by a delayed
+ * Provider receipt or terminal event. */
+export function revokeScheduledRunSettlements(
+  taskId: string,
+  larkAppId?: string,
+): number {
+  let revoked = 0;
+  for (const [turnId, record] of pending) {
+    if (record.taskId !== taskId
+        || (larkAppId !== undefined && record.larkAppId !== larkAppId)) continue;
+    pending.delete(turnId);
+    record.reject(settlementError(turnId, 'schedule authority was revoked'));
+    revoked += 1;
+  }
+  return revoked;
+}
+
 /** Register before dispatch, then keep the scheduler callback pending until the
  * exact turn produces its required terminal evidence. */
 export async function executeScheduledRunAwaitingSettlement(
   input: {
     turnId: string;
     taskId: string;
+    larkAppId?: string;
     requireFinalDelivery: boolean;
+    authorityIsCurrent?: () => boolean;
   },
   dispatch: () => void | Promise<void>,
 ): Promise<{ messageId?: string }> {

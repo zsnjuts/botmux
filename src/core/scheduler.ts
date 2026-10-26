@@ -14,7 +14,10 @@ import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '.
 import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
 import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
 import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
-import { ScheduledRunDeliveryError } from './scheduled-run-settlement.js';
+import {
+  revokeScheduledRunSettlements,
+  ScheduledRunDeliveryError,
+} from './scheduled-run-settlement.js';
 
 export interface ScheduleExecutionContext {
   runId: string;
@@ -1262,6 +1265,7 @@ export function removeTask(id: string): boolean {
   if (removed && appId && authorityStore?.isInitialized(appId)) {
     scheduleStore.removeAuthoritativeTaskProjection(id, appId);
   }
+  if (removed) revokeScheduledRunSettlements(id, appId || undefined);
   if (removed) cleanupRemovedTaskSidecars(task);
   return removed;
 }

@@ -15,6 +15,18 @@ const PROOF_PATTERN = /^bmxsfr_[0-9a-f]{13}$/;
 const PROOF_LINK_BASE = 'https://github.com/deepcoldy/bot%6Dux#';
 const MARKDOWN_LINK_PATTERN = /\[([^\]]*)\]\(([^)\s]+)\)/gu;
 
+export const SCHEDULED_FINAL_RECEIPT_DOMAIN = 'botmux.scheduled-final-receipt.v1';
+
+export interface ScheduledFinalReceiptEnvelope {
+  domain: typeof SCHEDULED_FINAL_RECEIPT_DOMAIN;
+  trusted: true;
+  messageId: string;
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+  proof: string;
+}
+
 export interface ScheduledFinalDeliveryIdentity {
   turnId: string;
   workerGeneration: number;
@@ -45,6 +57,41 @@ export function deriveScheduledFinalDeliveryProof(
 
 export function isScheduledFinalDeliveryProof(value: unknown): value is string {
   return typeof value === 'string' && PROOF_PATTERN.test(value);
+}
+
+export function scheduledFinalReceiptEnvelope(input: {
+  messageId: string;
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+  proof: string;
+}): ScheduledFinalReceiptEnvelope {
+  return {
+    domain: SCHEDULED_FINAL_RECEIPT_DOMAIN,
+    trusted: true,
+    messageId: input.messageId,
+    turnId: input.turnId,
+    workerGeneration: input.workerGeneration,
+    ...(input.dispatchAttempt !== undefined
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+    proof: input.proof,
+  };
+}
+
+export function matchesScheduledFinalReceiptEnvelope(
+  value: unknown,
+  expected: ScheduledFinalReceiptEnvelope,
+): value is ScheduledFinalReceiptEnvelope {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const actual = value as Record<string, unknown>;
+  return actual.domain === expected.domain
+    && actual.trusted === true
+    && actual.messageId === expected.messageId
+    && actual.turnId === expected.turnId
+    && actual.workerGeneration === expected.workerGeneration
+    && actual.dispatchAttempt === expected.dispatchAttempt
+    && actual.proof === expected.proof;
 }
 
 function proofUrl(proof: string): string {

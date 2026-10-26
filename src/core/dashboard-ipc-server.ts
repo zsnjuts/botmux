@@ -148,6 +148,7 @@ import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TUR
 import { observeScheduledRunProviderReadbackDelivery } from './scheduled-run-settlement.js';
 import {
   deriveScheduledFinalDeliveryProof,
+  scheduledFinalReceiptEnvelope,
   verifyScheduledFinalDeliveryReadback,
 } from './scheduled-final-delivery-proof.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
@@ -2117,6 +2118,7 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   try {
     const liveTurnId = ds?.managedTurnOrigin?.turnId;
+    let trustedFinalReceipt: ReturnType<typeof scheduledFinalReceiptEnvelope> | undefined;
     const scheduledFinal = body.responseKind === 'final'
       && typeof liveTurnId === 'string'
       && parseScheduledTurnId(liveTurnId) !== null;
@@ -2163,6 +2165,15 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
         proof: expectedProof,
       });
       if (!proof.ok) return jsonRes(res, 409, { ok: false, error: proof.error });
+      trustedFinalReceipt = scheduledFinalReceiptEnvelope({
+        messageId,
+        turnId: liveTurnId,
+        workerGeneration: body.receiptWorkerGeneration,
+        ...(typeof receiptDispatchAttempt === 'number'
+          ? { dispatchAttempt: receiptDispatchAttempt }
+          : {}),
+        proof: expectedProof,
+      });
     }
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
@@ -2174,11 +2185,15 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
       webhookDestinations,
       teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
     });
-    if (result.ok && scheduledFinal && liveTurnId) {
-      observeScheduledRunProviderReadbackDelivery(liveTurnId, body.messageId as string);
+    if (result.ok && scheduledFinal && liveTurnId
+        && !observeScheduledRunProviderReadbackDelivery(liveTurnId, body.messageId as string)) {
+      return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_authority_changed' });
     }
     return result.ok
-      ? jsonRes(res, 200, result)
+      ? jsonRes(res, 200, {
+          ...result,
+          ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}),
+        })
       : jsonRes(res, result.status, { ok: false, error: result.error });
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });

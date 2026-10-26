@@ -4,8 +4,10 @@ import {
   abortScheduledRunSettlement,
   beginScheduledRunSettlement,
   executeScheduledRunAwaitingSettlement,
+  observeScheduledRunDaemonProviderDelivery,
   observeScheduledRunProviderReadbackDelivery,
   observeScheduledRunTerminal,
+  revokeScheduledRunSettlements,
 } from '../src/core/scheduled-run-settlement.js';
 
 afterEach(() => __testOnlyResetScheduledRunSettlements());
@@ -107,5 +109,41 @@ describe('scheduled run settlement', () => {
     } finally {
       process.off('unhandledRejection', unhandled);
     }
+  });
+
+  it('rejects a delayed receipt after the exact schedule authority changes', async () => {
+    let current = true;
+    const run = beginScheduledRunSettlement({
+      turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000007',
+      taskId: 'deadbeef',
+      larkAppId: 'cli_a',
+      requireFinalDelivery: true,
+      authorityIsCurrent: () => current,
+    });
+    current = false;
+
+    expect(observeScheduledRunDaemonProviderDelivery(run.turnId, 'om_delayed')).toBe(false);
+    await expect(run.settled).rejects.toThrow('schedule authority was revoked before delivery');
+  });
+
+  it('revokes only the matching app and task settlements', async () => {
+    const first = beginScheduledRunSettlement({
+      turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000008',
+      taskId: 'deadbeef',
+      larkAppId: 'cli_a',
+      requireFinalDelivery: true,
+    });
+    const other = beginScheduledRunSettlement({
+      turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000009',
+      taskId: 'deadbeef',
+      larkAppId: 'cli_b',
+      requireFinalDelivery: true,
+    });
+    const firstRejected = expect(first.settled).rejects.toThrow('schedule authority was revoked');
+
+    expect(revokeScheduledRunSettlements('deadbeef', 'cli_a')).toBe(1);
+    await firstRejected;
+    expect(observeScheduledRunProviderReadbackDelivery(other.turnId, 'om_other')).toBe(true);
+    await expect(other.settled).resolves.toEqual({ messageId: 'om_other' });
   });
 });
