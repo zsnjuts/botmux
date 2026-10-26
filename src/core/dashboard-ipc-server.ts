@@ -143,11 +143,12 @@ import type {
 } from '../services/open-platform-rename.js';
 import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
-import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
+import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
 import { observeScheduledRunProviderReadbackDelivery } from './scheduled-run-settlement.js';
 import {
   deriveScheduledFinalDeliveryProof,
+  providerMessageHasExpectedTarget,
   scheduledFinalReceiptEnvelope,
   verifyScheduledFinalDeliveryReadback,
 } from './scheduled-final-delivery-proof.js';
@@ -2142,6 +2143,45 @@ ipcRoute('POST', '/api/sessions/:sessionId/link-refs/resolve', async (req, res, 
   }
 });
 
+function providerFinalCardFromReadback(input: {
+  detail: unknown;
+  messageId: string;
+  larkAppId: string;
+  chatId: string;
+  expectedTarget: import('../types.js').FrozenSessionReplyTarget;
+}): Record<string, unknown> | undefined {
+  const detail = input.detail as any;
+  const item = detail?.items?.[0] ?? detail?.message ?? detail;
+  if (!item || typeof item !== 'object'
+      || item.message_id !== input.messageId
+      || item.deleted !== false
+      || item.chat_id !== input.chatId
+      || item.msg_type !== 'interactive'
+      || !providerMessageHasExpectedTarget(item, input.expectedTarget)) return undefined;
+  const sender = item.sender;
+  const senderType = sender?.sender_type;
+  const senderIdType = sender?.id_type ?? sender?.sender_id_type;
+  const senderAppId = typeof sender?.id === 'string'
+    && (senderType === 'app' || senderType === 'bot' || senderIdType === 'app_id')
+    ? sender.id
+    : undefined;
+  if (senderAppId !== input.larkAppId) return undefined;
+  const content = item.body?.content ?? item.content;
+  if (typeof content !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const wrapper = parsed as Record<string, unknown>;
+    if (typeof wrapper.user_dsl !== 'string') return wrapper;
+    const inner = JSON.parse(wrapper.user_dsl) as unknown;
+    return inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? inner as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Host receipt for a final answer already accepted by Lark. The daemon binds
  * it to the exact live turn and visible target, records the completion row
  * idempotently, and uses an explicit final receipt to settle a scheduled run. */
@@ -2160,6 +2200,7 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   try {
     const liveTurnId = ds?.managedTurnOrigin?.turnId;
     let trustedFinalReceipt: ReturnType<typeof scheduledFinalReceiptEnvelope> | undefined;
+    let providerDetail: unknown;
     let persistedCleanupReplay = false;
     const scheduledFinal = body.responseKind === 'final'
       && typeof liveTurnId === 'string'
@@ -2216,9 +2257,8 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
           proof: expectedProof,
         });
       }
-      let detail: unknown;
       try {
-        detail = await getMessageDetail(ds!.larkAppId, messageId, {
+        providerDetail = await getMessageDetail(ds!.larkAppId, messageId, {
           userCardContent: true,
           timeoutMs: 10_000,
         });
@@ -2230,7 +2270,7 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
         });
       }
       const proof = verifyScheduledFinalDeliveryReadback({
-        detail,
+        detail: providerDetail,
         messageId,
         larkAppId: ds!.larkAppId,
         chatId: ds!.chatId,
@@ -2242,12 +2282,64 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
     try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
+    let trustedPresentation: Parameters<typeof recordRelayedTurnDelivery>[0]['trustedPresentation'];
+    if (ds && liveTurnId) {
+      const replyContext = frozenReplyContextForTurn(ds, liveTurnId);
+      let policy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
+      try {
+        policy = resolveFeedbackPolicyForDelivery({
+          dataDir: config.session.dataDir,
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          bot: getBot(ds.larkAppId).config,
+        });
+      } catch { /* a disappearing bot has no feedback authority */ }
+      let baseCard: Record<string, unknown> | undefined;
+      if (policy) {
+        const messageId = typeof body.messageId === 'string' ? body.messageId : '';
+        if (providerDetail === undefined) {
+          try {
+            providerDetail = await getMessageDetail(ds.larkAppId, messageId, {
+              userCardContent: true,
+              timeoutMs: 10_000,
+            });
+          } catch (error) {
+            return jsonRes(res, 502, {
+              ok: false,
+              error: 'turn_delivery_feedback_readback_failed',
+              detail: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        baseCard = providerFinalCardFromReadback({
+          detail: providerDetail,
+          messageId,
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          expectedTarget: replyContext.target,
+        });
+        if (!baseCard) {
+          return jsonRes(res, 409, { ok: false, error: 'turn_delivery_feedback_readback_invalid' });
+        }
+      }
+      trustedPresentation = {
+        topicRootId: replyContext.target.mode === 'thread'
+          ? replyContext.target.rootMessageId
+          : ds.session.rootMessageId,
+        ...(policy ? { policy } : {}),
+        ...(baseCard ? { baseCard } : {}),
+        ...(replyContext.replyTargetSenderOpenId ?? ds.session.ownerOpenId
+          ? { requesterSubjectId: replyContext.replyTargetSenderOpenId ?? ds.session.ownerOpenId }
+          : {}),
+      };
+    }
     const result = recordRelayedTurnDelivery({
       ds,
       body,
       store: await getSkillFeedbackStore(config.session.dataDir),
       webhookDestinations,
       teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
+      ...(trustedPresentation ? { trustedPresentation } : {}),
     });
     if (result.ok && scheduledFinal && liveTurnId) {
       const messageId = body.messageId as string;

@@ -36,6 +36,7 @@ import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
 import {
   deriveScheduledFinalDeliveryProof,
   matchesScheduledFinalReceiptEnvelope,
+  parseScheduledFinalReceiptEnvelope,
   scheduledFinalReceiptEnvelope,
   stampScheduledFinalDeliveryProof,
   type ScheduledFinalReceiptEnvelope,
@@ -11593,10 +11594,16 @@ async function cmdSend(rest: string[]): Promise<void> {
             : {}),
           proof: scheduledFinalDeliveryProof,
         });
-        if (!matchesScheduledFinalReceiptEnvelope(detail.trustedFinalReceipt, expected)) {
-          throw new Error('scheduled trusted final receipt envelope mismatch');
+        if (matchesScheduledFinalReceiptEnvelope(detail.trustedFinalReceipt, expected)) {
+          return expected;
         }
-        return expected;
+        const persisted = parseScheduledFinalReceiptEnvelope(detail.trustedFinalReceipt);
+        if (scheduleRemoveSelfTaskId
+            && persisted?.messageId === messageId
+            && persisted.turnId === scheduledFinalDeliveryIdentity.turnId) {
+          return persisted;
+        }
+        throw new Error('scheduled trusted final receipt envelope mismatch');
       } catch (error) {
         console.error(
           `botmux send: trusted final delivery receipt failed after delivery: `

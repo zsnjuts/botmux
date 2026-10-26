@@ -38,6 +38,7 @@ import {
 } from '../src/core/scheduled-final-delivery-proof.js';
 import { markGroupContextCardPurpose } from '../src/im/lark/group-context-card.js';
 import * as larkClient from '../src/im/lark/client.js';
+import * as botRegistry from '../src/bot-registry.js';
 
 const SECRET = 'turn-delivery-narrow-secret';
 const CAP_A = 'ab12cd34'.repeat(8);
@@ -422,6 +423,64 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       status: 'delivered',
       policy: undefined,
       baseCard: undefined,
+    });
+  });
+
+  it('reconstructs feedback and an exact chat-scope topic target from Host readback', async () => {
+    const turnId = 'om_feedback_turn';
+    const ds = liveSession('sess-a', CAP_A, turnId, {
+      scope: 'chat',
+      ownerOpenId: 'ou_owner',
+      turnReplyContexts: {
+        [turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_exact_topic' },
+          replyTargetSenderOpenId: 'ou_requester',
+        },
+      },
+    });
+    ds.scope = 'chat';
+    await setup({ 'sess-a': ds });
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+      config: {
+        apiOnly: false,
+        feedback: { enabled: true, audience: 'requester' },
+        chatFeedbackPolicies: {},
+      },
+    } as any);
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: 'feedback final' },
+        { tag: 'action', element_id: 'botmux_feedback', actions: [] },
+      ] },
+    };
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_feedback_final',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_exact_topic',
+      parent_id: 'om_exact_topic',
+      thread_id: 'omt_exact_topic',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_feedback_final',
+      content: 'feedback final',
+      responseKind: 'final',
+    });
+    expect(res.status).toBe(200);
+    expect(await rowFor('om_feedback_final')).toMatchObject({
+      cardMode: 'feedback',
+      policy: { audience: 'requester' },
+      baseCard: {
+        body: { elements: [{ element_id: 'botmux_feedback' }] },
+      },
+      requesterSubjectId: 'ou_requester',
+      topicRootId: 'om_exact_topic',
     });
   });
 

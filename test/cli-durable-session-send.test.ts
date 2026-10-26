@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from '../src/cli/durable-session-send.js';
+import { deriveScheduledFinalDeliveryProof } from '../src/core/scheduled-final-delivery-proof.js';
 
 const input = {
   sessionId: 'session-1',
@@ -165,6 +166,51 @@ describe('durable Session send client', () => {
         proof: 'bmxsfr_123456789abcd',
       },
     })).resolves.toEqual({ messageId: 'om_scheduled_final' });
+  });
+
+  it('accepts an older Host-persisted cleanup envelope without re-signing it', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000011';
+    const persistedProof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const post = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      kind: 'delivered',
+      messageId: 'om_scheduled_final',
+      trustedFinalReceipt: {
+        domain: 'botmux.scheduled-final-receipt.v1',
+        trusted: true,
+        messageId: 'om_scheduled_final',
+        turnId,
+        workerGeneration: 7,
+        dispatchAttempt: 2,
+        proof: persistedProof,
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    await expect(dispatchDurableSessionMessage({ post }, {
+      ...input,
+      turnId,
+      scheduleSelfCleanup: true,
+      expectedReceipt: {
+        turnId,
+        workerGeneration: 8,
+        dispatchAttempt: 2,
+        proof: deriveScheduledFinalDeliveryProof({
+          turnId,
+          workerGeneration: 8,
+          dispatchAttempt: 2,
+        })!,
+      },
+    })).resolves.toMatchObject({
+      messageId: 'om_scheduled_final',
+      trustedFinalReceipt: {
+        workerGeneration: 7,
+        proof: persistedProof,
+      },
+    });
   });
 
   it('rejects malformed success responses', async () => {

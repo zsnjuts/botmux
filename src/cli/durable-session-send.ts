@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isConfirmedLarkMessageId } from '../core/scheduled-run-settlement.js';
 import {
   matchesScheduledFinalReceiptEnvelope,
+  parseScheduledFinalReceiptEnvelope,
   scheduledFinalReceiptEnvelope,
   type ScheduledFinalReceiptEnvelope,
 } from '../core/scheduled-final-delivery-proof.js';
@@ -110,10 +111,17 @@ export async function dispatchDurableSessionMessage(
             ...input.expectedReceipt,
           })
         : undefined;
-      const trustedFinalReceipt = expected
+      let trustedFinalReceipt = expected
         && matchesScheduledFinalReceiptEnvelope(body.trustedFinalReceipt, expected)
         ? expected
         : undefined;
+      if (!trustedFinalReceipt && input.scheduleSelfCleanup === true) {
+        const persisted = parseScheduledFinalReceiptEnvelope(body.trustedFinalReceipt);
+        if (persisted?.messageId === body.messageId
+            && persisted.turnId === input.turnId) {
+          trustedFinalReceipt = persisted;
+        }
+      }
       return { messageId: body.messageId, ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}) };
     }
     const detail = typeof body.error === 'string' && body.error.trim()

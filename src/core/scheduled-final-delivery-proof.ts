@@ -98,6 +98,44 @@ export function matchesScheduledFinalReceiptEnvelope(
     && actual.proof === expected.proof;
 }
 
+/** Parse a daemon-issued immutable receipt without substituting the caller's
+ * current worker generation. Used only for Host-persisted cleanup replay; the
+ * authority store later exact-compares its own copy before deletion. */
+export function parseScheduledFinalReceiptEnvelope(
+  value: unknown,
+): ScheduledFinalReceiptEnvelope | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  if (input.domain !== SCHEDULED_FINAL_RECEIPT_DOMAIN
+      || input.trusted !== true
+      || !isConfirmedLarkMessageId(input.messageId)
+      || typeof input.turnId !== 'string'
+      || parseScheduledTurnId(input.turnId) === null
+      || !Number.isSafeInteger(input.workerGeneration)
+      || Number(input.workerGeneration) < 1
+      || (input.dispatchAttempt !== undefined
+        && (!Number.isSafeInteger(input.dispatchAttempt)
+          || Number(input.dispatchAttempt) < 1))
+      || typeof input.proof !== 'string') return undefined;
+  const expectedProof = deriveScheduledFinalDeliveryProof({
+    turnId: input.turnId,
+    workerGeneration: Number(input.workerGeneration),
+    ...(typeof input.dispatchAttempt === 'number'
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+  });
+  if (!expectedProof || input.proof !== expectedProof) return undefined;
+  return scheduledFinalReceiptEnvelope({
+    messageId: input.messageId,
+    turnId: input.turnId,
+    workerGeneration: Number(input.workerGeneration),
+    ...(typeof input.dispatchAttempt === 'number'
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+    proof: expectedProof,
+  });
+}
+
 function proofUrl(proof: string): string {
   return `${PROOF_LINK_BASE}${proof}`;
 }
@@ -236,7 +274,7 @@ function nonemptyProviderId(value: unknown): string | undefined {
 /** Match the visible Provider destination selected by the daemon for this
  * exact turn. A chat id alone is insufficient: two topics in the same group
  * share it, while quote replies and in-thread replies are distinct surfaces. */
-function hasExpectedProviderTarget(
+export function providerMessageHasExpectedTarget(
   item: Record<string, unknown>,
   expected: FrozenSessionReplyTarget,
 ): boolean {
@@ -274,7 +312,7 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   }
   if (item.deleted !== false) return { ok: false, error: 'provider_message_deleted' };
   if (item.chat_id !== input.chatId) return { ok: false, error: 'provider_chat_mismatch' };
-  if (!hasExpectedProviderTarget(item, input.expectedTarget)) {
+  if (!providerMessageHasExpectedTarget(item, input.expectedTarget)) {
     return { ok: false, error: 'provider_target_mismatch' };
   }
   if (item.msg_type !== 'interactive') {

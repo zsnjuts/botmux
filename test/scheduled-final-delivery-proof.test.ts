@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   deriveScheduledFinalDeliveryProof,
   matchesScheduledFinalReceiptEnvelope,
+  parseScheduledFinalReceiptEnvelope,
   scheduledFinalReceiptEnvelope,
   stampScheduledFinalDeliveryProof,
   verifyScheduledFinalDeliveryReadback,
@@ -75,6 +76,11 @@ describe('scheduled final delivery proof', () => {
     expect(matchesScheduledFinalReceiptEnvelope(receipt, receipt)).toBe(true);
     expect(matchesScheduledFinalReceiptEnvelope({ ok: true }, receipt)).toBe(false);
     expect(matchesScheduledFinalReceiptEnvelope({ ...receipt, workerGeneration: 8 }, receipt)).toBe(false);
+    expect(parseScheduledFinalReceiptEnvelope(receipt)).toEqual(receipt);
+    expect(parseScheduledFinalReceiptEnvelope({ ...receipt, proof: 'bmxsfr_0000000000000' }))
+      .toBeUndefined();
+    expect(parseScheduledFinalReceiptEnvelope({ ...receipt, trusted: false }))
+      .toBeUndefined();
   });
 
   it('stamps the exact link into an existing footer separator without changing rendered text', () => {

@@ -1268,15 +1268,20 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
   });
 
-  it('retains a fresh-session reservation and opening prompt when fork pre-accept throws', async () => {
+  it('cleans a rejected fresh reservation so the next fire can create a new owner', async () => {
     const active = new Map<string, DaemonSession>();
     forkWorkerMock.mockImplementationOnce(() => { throw new Error('scheduler fork failed'); });
 
     await expect(executeScheduledTask(task(), active, vi.fn())).rejects.toThrow('scheduler fork failed');
 
-    const ds = active.get(sessionKey(ROOT, APP));
-    expect(ds?.initialStartPending).toBe(true);
-    expect(ds?.pendingPrompt).toBe('scheduled prompt');
-    expect(ds?.worker).toBeNull();
+    expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
+
+    await expect(executeScheduledTask(task(), active, vi.fn())).resolves.toBeUndefined();
+    const replacement = active.get(sessionKey(ROOT, APP));
+    expect(replacement).toBeDefined();
+    expect(replacement?.initialStartPending).toBe(false);
+    expect(replacement?.pendingPrompt).toBeUndefined();
+    expect(forkWorkerMock).toHaveBeenCalledTimes(2);
+    expect(forkWorkerMock.mock.calls[1]?.[0]).toBe(replacement);
   });
 });
