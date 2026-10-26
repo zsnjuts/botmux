@@ -1086,6 +1086,52 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toContain('已接纳');
   });
 
+  it('/queue keeps a Remote Runner message behind the active turn without stealing final ownership', async () => {
+    const root = 'om_remote_queue_root';
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(root, 'remote queue');
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliSessionId = 'remote-native-thread';
+    ds.currentTurnId = 'om_active_owner';
+    ds.activeInteractiveTurn = {
+      turnId: 'om_active_owner',
+      caller: {
+        requestUserOpenId: OWNER,
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
+    };
+    ds.workingDir = '/tmp';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+
+    await handleThreadReply(
+      makeEventData('om_remote_queue_1', '/queue later work', root),
+      makeCtx(root, 'om_remote_queue_1'),
+    );
+
+    const turn = send.mock.calls.map(([message]) => message)
+      .find(message => message.type === 'message');
+    expect(turn).toMatchObject({
+      type: 'message',
+      turnId: 'om_remote_queue_1',
+      queueAfterActiveTurn: true,
+      trustedCaller: { requestUserOpenId: OWNER, senderType: 'user' },
+    });
+    expect(turn.activeTurnSteer).toBeUndefined();
+    expect(turn.codexAppInput).toBeUndefined();
+    expect(ds.currentTurnId).toBe('om_active_owner');
+    expect(repliedText()).toContain('已接纳');
+  });
+
   it.each(['other-cli', 'no-worker', 'killed', 'pending-repo', 'empty', 'post', 'sender-denied'])(
     '/queue refuses %s without injecting model input', async mode => {
       const root = 'om_queue_refused';

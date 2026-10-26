@@ -18,6 +18,7 @@ const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs'
 const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
 const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.mjs');
 const orphanProofRunner = resolve('test/fixtures/remote-runner-orphan-proof.mjs');
+const turnSteerRunner = resolve('test/fixtures/remote-runner-turn-steer.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -44,6 +45,121 @@ afterEach(() => {
 });
 
 describe('RemoteRunnerBackend', () => {
+  it('steers a negotiated active turn without changing final ownership', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'turn-steer',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'turn_steer',
+      ],
+    }, 'session-turn-steer');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const progress: string[] = [];
+    backend.onData(data => progress.push(data));
+    spawnBackend(backend, turnSteerRunner);
+    await ready;
+
+    await expect(backend.submitTurn({
+      turnId: 'turn-owner',
+      content: 'original',
+    })).resolves.toEqual({ submitted: true });
+    const final = once<{ text: string; turnId?: string }>(cb => {
+      backend.onTurnFinal((text, turnId) => cb({ text, turnId }));
+    });
+    await expect(backend.submitTurn({
+      turnId: 'turn-follow-up',
+      content: 'new constraint',
+      activeTurnSteer: true,
+      dispatchAttempt: 3,
+    })).resolves.toEqual({ submitted: true });
+
+    await expect(final).resolves.toEqual({
+      text: 'final:original+new constraint',
+      turnId: 'turn-owner',
+    });
+    expect(progress.join('')).toContain('steered:turn-follow-up:new constraint');
+  });
+
+  it('requires bilateral capability negotiation before active-turn steering', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'turn-steer',
+      requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status'],
+    }, 'session-turn-steer-disabled');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, turnSteerRunner);
+    await ready;
+    await backend.submitTurn({ turnId: 'turn-owner', content: 'original' });
+
+    await expect(backend.submitTurn({
+      turnId: 'turn-follow-up',
+      content: 'must stay local',
+      activeTurnSteer: true,
+    })).resolves.toEqual({
+      submitted: false,
+      submissionDisposition: 'untouched',
+      failureReason: 'remote runner active-turn steer was not bilaterally negotiated',
+    });
+  });
+
+  it('keeps a definitively rejected steer local while preserving the active turn', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'turn-steer',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'turn_steer',
+      ],
+    }, 'session-turn-steer-rejected');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: string[] = [];
+    backend.onTurnFailure(failure => failures.push(failure.code));
+    spawnBackend(backend, turnSteerRunner);
+    await ready;
+    await backend.submitTurn({ turnId: 'turn-owner', content: 'original' });
+
+    await expect(backend.submitTurn({
+      turnId: 'turn-follow-up-rejected',
+      content: 'reject',
+      activeTurnSteer: true,
+    })).resolves.toEqual({
+      submitted: false,
+      submissionDisposition: 'untouched',
+      failureReason: 'steer_rejected: steer was not applied',
+    });
+    expect(failures).toEqual([]);
+  });
+
+  it('retires the provider generation when a steer outcome is ambiguous', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'turn-steer',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'turn_steer',
+      ],
+    }, 'session-turn-steer-ambiguous');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failure = once<{ turnId: string; code: string; status: string }>(cb => {
+      backend.onTurnFailure(value => cb(value));
+    });
+    spawnBackend(backend, turnSteerRunner);
+    await ready;
+    await backend.submitTurn({ turnId: 'turn-owner', content: 'original' });
+
+    await expect(backend.submitTurn({
+      turnId: 'turn-follow-up-ambiguous',
+      content: 'ambiguous',
+      activeTurnSteer: true,
+    })).resolves.toEqual(expect.objectContaining({
+      submitted: false,
+      submissionDisposition: 'dirty_unknown',
+    }));
+    await expect(failure).resolves.toMatchObject({
+      turnId: 'turn-owner',
+      code: 'remote_runner_protocol_error',
+      status: 'ambiguous',
+    });
+  });
+
   it('handshakes, starts, streams a turn, and publishes provider-neutral state', async () => {
     const backend = createBackend();
     const ready = once<void>(cb => backend.onReady(cb));

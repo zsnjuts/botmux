@@ -12,7 +12,7 @@
   "remoteRunner": {
     "expectedProvider": "example-cloud",
     "requiredCapabilities": [
-      "start", "resume", "turn", "cancel", "detach", "reattach", "status",
+      "start", "resume", "turn", "turn_steer", "cancel", "detach", "reattach", "status",
       "terminal_screen", "terminal_input", "terminal_resize", "outbound_message",
       "outbound_message_explicit_mention", "outbound_message_final",
       "outbound_message_schedule_self_cleanup",
@@ -79,6 +79,14 @@ BotMux 会发送 `reattach`，且只有收到同一 `requestId` 的 `status: rea
 
 Remote Runner 的 reasoning 选择使用 BotMux 通用的 `low|medium|high|xhigh|max|ultra`
 词表，不套用某个本地 CLI 的模型表；provider 负责接受、忽略或用结构化 `failure` 拒绝不支持的组合。
+
+### 可选 active turn steer
+
+部署的 `requiredCapabilities` 与 provider hello 同时声明 `turn_steer` 后，同一可信 principal 的普通真人追加可以进入当前 active execution，而不是长期停在 durable Inbox。BotMux 发送 `turn_steer`，其中 `turnId` 是仍拥有最终回复的原 turn，`steerId` 是本条追加消息的精确 ingress id，另携带当前 `generation`、正文、可选 `dispatchAttempt` 和可信调用者。provider 只有在追加已经取得自己的 durable/pending fence 后才能用同一 `requestId` 返回 `status: busy`。
+
+steer 成功只提交 `steerId` 的输入收据，不创建第二个 final owner；后续 `progress`、`final` 和终态 failure 仍使用原 `turnId`。provider 明确证明正文未进入远端时返回 `status: failed` 的关联 failure，BotMux 保持该 ingress 待重试；提交结果不明时返回 `status: ambiguous`，双方冻结当前 generation，不能自动重放。能力未双边协商、调用者不匹配、特殊入口或跨 principal 消息继续使用既有串行/隔离语义。
+
+用户显式 `/queue <正文>` 永远作为当前 turn 之后的独立新轮，不设置 `activeTurnSteer`；用户显式 `/stop` 仍走终端控制通道。需要 Remote Runner 支持 `/stop` 的部署必须同时要求 `terminal_input`，provider 可以把该能力收窄为只接受当前 generation active turn 的 Ctrl-C。
 
 ### 可选远端终端
 

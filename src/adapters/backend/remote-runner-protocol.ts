@@ -54,12 +54,21 @@ export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
   'orphan_reconciliation',
 ] as const;
 
+/** Optional in-turn user steering. The host enables this only through explicit
+ * bilateral negotiation: a provider must advertise it and the bot config must
+ * list it in `requiredCapabilities`. The steer augments one already-active
+ * execution; it never creates another final-owning model turn. */
+export const REMOTE_RUNNER_TURN_STEER_CAPABILITIES = [
+  'turn_steer',
+] as const;
+
 export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_BASE_CAPABILITIES,
   ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
   ...REMOTE_RUNNER_OUTBOUND_CAPABILITIES,
   ...REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES,
   ...REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES,
+  ...REMOTE_RUNNER_TURN_STEER_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -305,6 +314,17 @@ export type RemoteRunnerCommand =
   | (RemoteRunnerCommandBase & {
       type: 'turn';
       turnId: string;
+      content: string;
+      dispatchAttempt?: number;
+      trustedCaller?: RemoteRunnerTrustedCaller;
+    })
+  | (RemoteRunnerCommandBase & {
+      type: 'turn_steer';
+      /** Existing final-owning turn that must still be active. */
+      turnId: string;
+      /** Exact host ingress identity of this subordinate user input. */
+      steerId: string;
+      generation: number;
       content: string;
       dispatchAttempt?: number;
       trustedCaller?: RemoteRunnerTrustedCaller;

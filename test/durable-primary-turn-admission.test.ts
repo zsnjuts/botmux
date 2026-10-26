@@ -51,6 +51,21 @@ describe('durable primary existing-turn admission', () => {
       state({ activeInteractiveTurn: { turnId: 'om_current' } }),
       'om_next',
     )).toBe('retry');
+    expect(durablePrimaryExistingTurnDisposition(
+      state({
+        activeInteractiveTurn: { turnId: 'om_current' },
+        allowActiveTurnSteer: true,
+      }),
+      'om_next',
+    )).toBe('ready');
+    expect(durablePrimaryExistingTurnDisposition(
+      state({
+        cliReady: false,
+        activeInteractiveTurn: { turnId: 'om_current' },
+        allowActiveTurnSteer: true,
+      }),
+      'om_next',
+    )).toBe('retry');
   });
 
   it('reuses a provider-submit marker before considering runtime busy state', () => {

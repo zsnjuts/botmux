@@ -4525,6 +4525,36 @@ describe('handleCommand', () => {
       );
     });
 
+    it('uses the negotiated Remote Runner terminal input channel for /stop', async () => {
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: vi.fn() } as any,
+        session: makeSession({
+          cliId: 'remote-runner' as any,
+          backendType: 'remote-runner',
+        }),
+        initConfig: {
+          type: 'init',
+          backendType: 'remote-runner',
+          backendConfig: { requiredCapabilities: ['terminal_input'] },
+        } as any,
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+
+      expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, {
+        type: 'term_action',
+        key: 'ctrlc',
+      });
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已发送停止信号'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
     it('does not treat /stop without a session as a normal prompt', async () => {
       const deps = makeDeps();
 

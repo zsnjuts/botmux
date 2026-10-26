@@ -127,6 +127,10 @@ export function herdrConfigForChatType(
 export interface BackendTurnInput {
   content: string;
   turnId: string;
+  /** Add this input to the currently active provider execution. Success commits
+   * `turnId` as a subordinate ingress receipt while final/output ownership stays
+   * with the pre-existing active turn. */
+  activeTurnSteer?: true;
   replyTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';

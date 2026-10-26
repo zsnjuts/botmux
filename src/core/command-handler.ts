@@ -1896,7 +1896,9 @@ export async function handleCommand(
           break;
         }
         const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-        if (cliId !== 'codex-app' || ds.adoptedFrom || ds.initConfig?.adoptMode) {
+        const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        if ((cliId !== 'codex-app' && backendType !== 'remote-runner')
+            || ds.adoptedFrom || ds.initConfig?.adoptMode) {
           await sessionReply(rootId, t('cmd.queue.unsupported', undefined, loc));
           break;
         }
@@ -2861,7 +2863,13 @@ export async function handleCommand(
           break;
         }
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
+        const effectiveBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        const remoteRunnerInterrupt = effectiveBackendType === 'remote-runner'
+          && (ds.initConfig?.backendConfig as { requiredCapabilities?: string[] } | undefined)
+            ?.requiredCapabilities?.includes('terminal_input') === true;
+        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app'
+            || ((isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds))
+              && !remoteRunnerInterrupt)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
         }

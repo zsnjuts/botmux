@@ -12624,6 +12624,7 @@ export function sendWorkerInput(
   payload: string | CliTurnPayload,
   turnId?: string,
   opts: {
+    queueAfterActiveTurn?: true;
     dispatchAttempt?: number;
     durablePrimaryInbox?: true;
     /** A command handler may own its single rejection reply. */
@@ -12632,6 +12633,8 @@ export function sendWorkerInput(
      * Persisted on the accepted ledger entry and forwarded to the worker so the
      * serial runner may steer this turn into an active one. */
     codexAppSteerable?: true;
+    /** Explicit Remote Runner in-turn steer authorization. */
+    activeTurnSteer?: true;
     /** At-most-once (idempotency lease): forward to the worker so a keyed
      * follow-up delivered to a LIVE worker is tagged noReplay and never replays
      * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
@@ -12811,11 +12814,13 @@ export function sendWorkerInput(
     ...(opts.durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+    ...(opts.activeTurnSteer ? { activeTurnSteer: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined && isSerialGroupInput(ds, opts.trustedCaller)
+    ...(opts.queueAfterActiveTurn
+      || (opts.dispatchAttempt === undefined && isSerialGroupInput(ds, opts.trustedCaller))
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
