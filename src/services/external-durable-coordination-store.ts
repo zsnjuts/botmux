@@ -101,11 +101,14 @@ export class ExternalDurableCoordinationProviderError extends Error {
  * stay in inherited environment/file references owned by the provider.
  */
 export class ExternalDurableCoordinationStore implements DurableCoordinationStore {
-  private readonly child: ChildProcessWithoutNullStreams;
+  private child: ChildProcessWithoutNullStreams | undefined;
+  private readonly config: ExternalDurableCoordinationStoreConfig;
   private readonly handshakeTimeoutMs: number;
   private readonly requestTimeoutMs: number;
   private readonly pending = new Map<string, Pending>();
+  private connecting: Promise<void> | undefined;
   private stdoutBuffer = '';
+  private connected = false;
   private closing = false;
   private closed = false;
   private failure: Error | undefined;
@@ -113,32 +116,15 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
 
   private constructor(config: ExternalDurableCoordinationStoreConfig) {
     if (!config.command.trim()) throw new Error('durable coordination provider command is required');
+    this.config = config;
     this.handshakeTimeoutMs = boundedTimeout(config.handshakeTimeoutMs, 10_000);
     this.requestTimeoutMs = boundedTimeout(config.requestTimeoutMs, 10_000);
-    this.child = spawn(config.command, [...(config.args ?? [])], {
-      ...(config.cwd ? { cwd: config.cwd } : {}),
-      env: config.env ?? process.env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: false,
-    });
-    this.child.stdout.setEncoding('utf8');
-    this.child.stdout.on('data', chunk => this.consumeStdout(String(chunk)));
-    // Provider stderr may contain deployment-specific details. Drain it so the
-    // pipe cannot block, but never copy it into BotMux logs or protocol errors.
-    this.child.stderr.on('data', () => {});
-    this.child.on('error', error => this.fail(new Error(`durable coordination provider process error: ${error.message}`)));
-    this.child.on('exit', (code, signal) => {
-      if (this.closing || this.closed) return;
-      this.fail(new Error(`durable coordination provider exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`));
-    });
   }
 
   static async connect(config: ExternalDurableCoordinationStoreConfig): Promise<ExternalDurableCoordinationStore> {
     const store = new ExternalDurableCoordinationStore(config);
     try {
-      const response = await store.request(providerHelloRequest(store.requestId('hello')), 'hello', store.handshakeTimeoutMs);
-      if (response.type !== 'hello') throw new Error('durable coordination provider did not complete hello');
-      store.providerName = response.provider;
+      await store.ensureConnected();
       return store;
     } catch (error) {
       store.terminate();
@@ -154,11 +140,80 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
     return `${prefix}:${randomUUID()}`;
   }
 
-  private consumeStdout(chunk: string): void {
-    if (this.closed || this.failure) return;
+  private spawnProvider(): ChildProcessWithoutNullStreams {
+    const child = spawn(this.config.command, [...(this.config.args ?? [])], {
+      ...(this.config.cwd ? { cwd: this.config.cwd } : {}),
+      env: this.config.env ?? process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+    });
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => this.consumeStdout(child, String(chunk)));
+    // Provider stderr may contain deployment-specific details. Drain it so the
+    // pipe cannot block, but never copy it into BotMux logs or protocol errors.
+    child.stderr.on('data', () => {});
+    child.on('error', error => this.fail(
+      new Error(`durable coordination provider process error: ${error.message}`),
+      child,
+    ));
+    child.on('exit', (code, signal) => {
+      if (this.closing || this.closed || this.child !== child) return;
+      this.fail(
+        new Error(`durable coordination provider exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`),
+        child,
+      );
+    });
+    return child;
+  }
+
+  private async connectProvider(): Promise<void> {
+    if (this.closed || this.closing) {
+      throw new Error('durable coordination provider is closed');
+    }
+    const child = this.spawnProvider();
+    this.child = child;
+    this.connected = false;
+    this.failure = undefined;
+    this.stdoutBuffer = '';
+    try {
+      const response = await this.requestCurrent(
+        child,
+        providerHelloRequest(this.requestId('hello')),
+        'hello',
+        this.handshakeTimeoutMs,
+      );
+      if (response.type !== 'hello') throw new Error('durable coordination provider did not complete hello');
+      if (this.closed || this.closing || this.child !== child) {
+        throw new Error('durable coordination provider was terminated');
+      }
+      this.providerName = response.provider;
+      this.connected = true;
+    } catch (error) {
+      this.fail(error instanceof Error ? error : new Error(String(error)), child);
+      throw error;
+    }
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.closed || this.closing) {
+      throw new Error('durable coordination provider is closed');
+    }
+    if (this.connected && this.child && !this.failure) return;
+    if (this.connecting) return await this.connecting;
+    const connecting = this.connectProvider();
+    this.connecting = connecting;
+    try {
+      await connecting;
+    } finally {
+      if (this.connecting === connecting) this.connecting = undefined;
+    }
+  }
+
+  private consumeStdout(child: ChildProcessWithoutNullStreams, chunk: string): void {
+    if (this.closed || this.failure || this.child !== child) return;
     this.stdoutBuffer += chunk;
     if (Buffer.byteLength(this.stdoutBuffer, 'utf8') > MAX_DURABLE_COORDINATION_PROVIDER_LINE_BYTES) {
-      this.fail(new Error('durable coordination provider stdout buffer exceeded the protocol limit'));
+      this.fail(new Error('durable coordination provider stdout buffer exceeded the protocol limit'), child);
       return;
     }
     while (true) {
@@ -171,12 +226,12 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
       try {
         response = parseDurableCoordinationProviderResponse(line);
       } catch (error) {
-        this.fail(error instanceof Error ? error : new Error(String(error)));
+        this.fail(error instanceof Error ? error : new Error(String(error)), child);
         return;
       }
       const pending = this.pending.get(response.requestId);
       if (!pending) {
-        this.fail(new Error('durable coordination provider returned an unknown request id'));
+        this.fail(new Error('durable coordination provider returned an unknown request id'), child);
         return;
       }
       this.pending.delete(response.requestId);
@@ -197,7 +252,8 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
     }
   }
 
-  private request(
+  private requestCurrent(
+    child: ChildProcessWithoutNullStreams,
     request: DurableCoordinationProviderRequest,
     expected: Pending['expected'],
     timeoutMs: number,
@@ -205,6 +261,9 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
   ): Promise<DurableCoordinationProviderResponse> {
     if (this.closed || (this.closing && !allowClosing)) {
       return Promise.reject(new Error('durable coordination provider is closed'));
+    }
+    if (this.child !== child) {
+      return Promise.reject(this.failure ?? new Error('durable coordination provider is disconnected'));
     }
     if (this.failure) return Promise.reject(this.failure);
     const encoded = `${JSON.stringify(request)}\n`;
@@ -216,11 +275,11 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
         this.pending.delete(request.requestId);
         const error = new Error(`durable coordination provider request timed out: ${request.type}`);
         reject(error);
-        this.fail(error);
+        this.fail(error, child);
       }, timeoutMs);
       timer.unref?.();
       this.pending.set(request.requestId, { expected, resolve, reject, timer });
-      this.child.stdin.write(encoded, 'utf8', error => {
+      child.stdin.write(encoded, 'utf8', error => {
         if (!error) return;
         const pending = this.pending.get(request.requestId);
         if (!pending) return;
@@ -232,7 +291,15 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
   }
 
   private async call(method: DurableCoordinationProviderMethod, input: unknown): Promise<DurableJson> {
-    const response = await this.request(
+    // A timed-out request has an unknown outcome and is never replayed here.
+    // A later, distinct caller may reconnect the provider process and submit
+    // its own operation, allowing the runtime to recover without making the
+    // original mutation look successful.
+    await this.ensureConnected();
+    const child = this.child;
+    if (!child) throw new Error('durable coordination provider is disconnected');
+    const response = await this.requestCurrent(
+      child,
       providerCallRequest(this.requestId(method), method, jsonInput(input)),
       'result',
       this.requestTimeoutMs,
@@ -241,27 +308,32 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
     return validateDurableCoordinationProviderResult(method, response.result);
   }
 
-  private fail(error: Error): void {
-    if (this.failure || this.closed) return;
+  private fail(error: Error, child: ChildProcessWithoutNullStreams): void {
+    if (this.failure || this.closed || this.child !== child) return;
     this.failure = error;
+    this.connected = false;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pending.clear();
-    this.child.kill('SIGTERM');
+    this.child = undefined;
+    child.kill('SIGTERM');
   }
 
   terminate(): void {
     if (this.closed) return;
     this.closing = true;
     this.closed = true;
+    this.connected = false;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('durable coordination provider was terminated'));
     }
     this.pending.clear();
-    this.child.kill('SIGTERM');
+    const child = this.child;
+    this.child = undefined;
+    child?.kill('SIGTERM');
   }
 
   async acquireSessionLease(input: AcquireSessionLeaseInput): Promise<SessionLeaseAcquisition> {
@@ -425,9 +497,11 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
   async close(): Promise<void> {
     if (this.closed || this.closing) return;
     this.closing = true;
+    const child = this.child;
     try {
-      if (!this.failure) {
-        const response = await this.request(
+      if (child && this.connected && !this.failure) {
+        const response = await this.requestCurrent(
+          child,
           providerCallRequest(this.requestId('close'), 'close', null),
           'result',
           this.requestTimeoutMs,
@@ -439,8 +513,15 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
       }
     } finally {
       this.closed = true;
-      this.child.stdin.end();
-      this.child.kill('SIGTERM');
+      this.connected = false;
+      for (const pending of this.pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('durable coordination provider was terminated'));
+      }
+      this.pending.clear();
+      if (this.child === child) this.child = undefined;
+      child?.stdin.end();
+      child?.kill('SIGTERM');
     }
   }
 }
