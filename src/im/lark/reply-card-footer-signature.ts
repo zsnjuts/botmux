@@ -9,6 +9,50 @@
 export const REPLY_CARD_FOOTER_ELEMENT_ID = 'botmux_reply_footer';
 export const REPLY_CARD_FOOTER_MARKER = '\u2063\u2063\u2063\u2063';
 
+/** Find the canonical footer only in documented Card 2.0 component slots.
+ * Ordinary reply cards place it at body top level; voice-enabled cards place
+ * it directly in a `column_set` column. Callback values and arbitrary business
+ * JSON are deliberately not traversed. */
+export function findReplyCardFooterComponent(
+  elements: unknown,
+): Record<string, unknown> | undefined {
+  if (!Array.isArray(elements)) return undefined;
+  for (const element of elements) {
+    if (!element || typeof element !== 'object' || Array.isArray(element)) continue;
+    const component = element as Record<string, unknown>;
+    if (component.tag === 'markdown'
+        && component.element_id === REPLY_CARD_FOOTER_ELEMENT_ID) return component;
+    if (component.tag !== 'column_set' || !Array.isArray(component.columns)) continue;
+    for (const column of component.columns) {
+      if (!column || typeof column !== 'object' || Array.isArray(column)) continue;
+      const columnComponent = column as Record<string, unknown>;
+      if (columnComponent.tag !== 'column') continue;
+      const footer = findReplyCardFooterComponent(columnComponent.elements);
+      if (footer) return footer;
+    }
+  }
+  return undefined;
+}
+
+/** Detect a reserved-id collision in the same documented component slots,
+ * including a malformed non-markdown component that cannot serve as footer. */
+export function containsReplyCardFooterElementId(elements: unknown): boolean {
+  if (!Array.isArray(elements)) return false;
+  for (const element of elements) {
+    if (!element || typeof element !== 'object' || Array.isArray(element)) continue;
+    const component = element as Record<string, unknown>;
+    if (component.element_id === REPLY_CARD_FOOTER_ELEMENT_ID) return true;
+    if (component.tag !== 'column_set' || !Array.isArray(component.columns)) continue;
+    for (const column of component.columns) {
+      if (!column || typeof column !== 'object' || Array.isArray(column)) continue;
+      const columnComponent = column as Record<string, unknown>;
+      if (columnComponent.tag === 'column'
+          && containsReplyCardFooterElementId(columnComponent.elements)) return true;
+    }
+  }
+  return false;
+}
+
 /** Promoted H1/H2 heading widgets encode their original ATX level in the
  * element id. Lark strips `text_size` when a message is read back, so the id
  * is the only carrier that survives server normalization (same production

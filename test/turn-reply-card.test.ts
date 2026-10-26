@@ -494,10 +494,18 @@ describe('one reply card per turn', () => {
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000088';
     const proof = deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 3 })!;
     const text = '定时任务长答复。'.repeat(6000);
-    const card = stampScheduledFinalDeliveryProof(
-      JSON.parse(buildCanonicalFinalReplyCard({ markdown: text })),
-      proof,
-    );
+    const card = JSON.parse(buildCanonicalFinalReplyCard({ markdown: text }));
+    const footerIndex = card.body.elements.findIndex((element: any) =>
+      element.element_id === 'botmux_reply_footer');
+    const footer = card.body.elements.splice(footerIndex, 1)[0];
+    card.body.elements.push({
+      tag: 'column_set',
+      columns: [
+        { tag: 'column', elements: [footer] },
+        { tag: 'column', elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'voice' } }] },
+      ],
+    });
+    stampScheduledFinalDeliveryProof(card, proof);
     io.sendOverflow = vi.fn(async () => 'om_scheduled_full_answer');
 
     const final = await store.update(key, {
@@ -508,9 +516,10 @@ describe('one reply card per turn', () => {
     }, io);
     const rendered = JSON.parse(cards.get(final.messageId!)!);
 
-    const footer = rendered.body.elements.find((element: any) =>
-      element.element_id === 'botmux_reply_footer');
-    expect(footer?.content).toContain(`#${proof}`);
+    const voiceRow = rendered.body.elements.find((element: any) => element.tag === 'column_set');
+    const renderedFooter = voiceRow?.columns?.flatMap((column: any) => column.elements ?? [])
+      .find((element: any) => element.element_id === 'botmux_reply_footer');
+    expect(renderedFooter?.content).toContain(`#${proof}`);
     expect(rendered.body.elements.some((element: any) => element.tag === 'hr'
       && element.element_id === proof)).toBe(false);
     expect(cards.get(final.messageId!)!).toContain('Markdown 附件');

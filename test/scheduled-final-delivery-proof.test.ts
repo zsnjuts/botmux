@@ -16,12 +16,16 @@ const proof = deriveScheduledFinalDeliveryProof({
 const proofUrl = `https://github.com/deepcoldy/bot%6Dux#${proof}`;
 const proofLink = `[·](${proofUrl})`;
 
-function verify(card: unknown, expectedProof = proof) {
+function verify(
+  card: unknown,
+  expectedProof = proof,
+  deletion: { deleted?: boolean; omit?: boolean } = {},
+) {
   return verifyScheduledFinalDeliveryReadback({
     detail: { items: [{
       message_id: 'om_provider_receipt',
       chat_id: 'oc_exact',
-      deleted: false,
+      ...(deletion.omit ? {} : { deleted: deletion.deleted ?? false }),
       sender: { id: 'cli_exact', id_type: 'app_id', sender_type: 'app' },
       body: { content: JSON.stringify(card) },
     }] },
@@ -95,6 +99,29 @@ describe('scheduled final delivery proof', () => {
     ]);
   });
 
+  it('reuses the real footer nested in a voice-button column without duplicating its id', () => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'column_set',
+        columns: [
+          { tag: 'column', elements: [{
+            tag: 'markdown',
+            element_id: 'botmux_reply_footer',
+            content: `<font color='grey'>brand ·${REPLY_CARD_FOOTER_MARKER} recipient</font>`,
+          }] },
+          { tag: 'column', elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'voice' } }] },
+        ],
+      }] },
+    };
+
+    stampScheduledFinalDeliveryProof(card, proof);
+
+    expect(JSON.stringify(card).match(/"element_id":"botmux_reply_footer"/g)).toHaveLength(1);
+    expect(JSON.stringify(card)).toContain(proofUrl);
+    expect(verify(markGroupContextCardPurpose(card, 'message'))).toEqual({ ok: true });
+  });
+
   it('replaces an older delivery proof instead of accumulating carriers', () => {
     const oldProof = deriveScheduledFinalDeliveryProof({
       turnId,
@@ -140,6 +167,21 @@ describe('scheduled final delivery proof', () => {
     }, 'message'), proof);
 
     expect(verify(card)).toEqual({ ok: true });
+  });
+
+  it.each([
+    { name: 'deleted', deletion: { deleted: true } },
+    { name: 'unknown deletion state', deletion: { omit: true } },
+  ])('fails closed when provider readback reports $name', ({ deletion }) => {
+    const card = stampScheduledFinalDeliveryProof(markGroupContextCardPurpose({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, 'message'), proof);
+
+    expect(verify(card, proof, deletion)).toEqual({
+      ok: false,
+      error: 'provider_message_deleted',
+    });
   });
 
   it('rejects the exact proof link when it appears only in body text', () => {

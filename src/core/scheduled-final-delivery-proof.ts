@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { projectGroupContextCard } from '../im/lark/group-context-card.js';
 import {
+  containsReplyCardFooterElementId,
+  findReplyCardFooterComponent,
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
 } from '../im/lark/reply-card-footer-signature.js';
@@ -117,12 +119,13 @@ export function stampScheduledFinalDeliveryProof<T extends Record<string, any>>(
   if (!isScheduledFinalDeliveryProof(proof)
       || !Array.isArray(card.body?.elements)) return card;
   const elements = card.body.elements as Array<Record<string, unknown>>;
-  const reserved = elements.find(element => element?.element_id === REPLY_CARD_FOOTER_ELEMENT_ID);
+  const reserved = findReplyCardFooterComponent(elements);
   if (reserved) {
     if (reserved.tag !== 'markdown' || typeof reserved.content !== 'string') return card;
     reserved.content = footerContentWithProof(reserved.content, proof);
     return card;
   }
+  if (containsReplyCardFooterElementId(elements)) return card;
   elements.push({
     tag: 'markdown',
     element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
@@ -160,15 +163,11 @@ function hasProviderFooterProof(value: unknown, proof: string): boolean {
   const root = providerCardRoot(value);
   const body = root?.body;
   if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
-  const elements = (body as Record<string, unknown>).elements;
-  return Array.isArray(elements) && elements.some(element => {
-    if (!element || typeof element !== 'object' || Array.isArray(element)) return false;
-    const component = element as Record<string, unknown>;
-    return component.tag === 'markdown'
-      && component.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
-      && typeof component.content === 'string'
-      && footerHasExactProofLink(component.content, proof);
-  });
+  const footer = findReplyCardFooterComponent((body as Record<string, unknown>).elements);
+  return footer?.tag === 'markdown'
+    && footer.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
+    && typeof footer.content === 'string'
+    && footerHasExactProofLink(footer.content, proof);
 }
 
 export type ScheduledFinalDeliveryReadback =
@@ -191,7 +190,7 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   if (!item || typeof item !== 'object' || item.message_id !== input.messageId) {
     return { ok: false, error: 'provider_message_not_found' };
   }
-  if (item.deleted === true) return { ok: false, error: 'provider_message_deleted' };
+  if (item.deleted !== false) return { ok: false, error: 'provider_message_deleted' };
   if (item.chat_id !== input.chatId) return { ok: false, error: 'provider_chat_mismatch' };
   const sender = item.sender;
   const senderType = sender?.sender_type;
