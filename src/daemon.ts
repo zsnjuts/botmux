@@ -6225,6 +6225,7 @@ function commandDepsForInvocation(input: {
   messageId: string;
   replyRootId?: string;
   ctx?: RoutingContext;
+  trustedCaller?: TrustedCaller;
 }): CommandHandlerDeps {
   const replyTarget = resolveInboundReplyTarget({
     scope: input.scope,
@@ -6238,6 +6239,9 @@ function commandDepsForInvocation(input: {
   return {
     ...commandDeps,
     invocationReplyTarget: replyTarget,
+    ...(input.trustedCaller
+      ? { invocationTrustedCaller: input.trustedCaller }
+      : {}),
     sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
       sessionReply(
         rootId,
@@ -26663,7 +26667,8 @@ async function handleThreadReplyAdmitted(
     ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent,
     routingChatId: ctxChatId, chatType: ctxChatType, chatId: threadChatId,
     senderOpenId: threadSenderOpenId, senderUnionId: threadSenderUnionId, teamTrustUnionId: threadTeamTrustUnionId,
-    isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender,
+    isBotSenderType, isForeignBotSender: isForeignBot, trustedCaller: threadTrustedCaller,
+    substituteTrigger, getThreadSender,
   })) return;
 
   // 自定义回复拦截：该话题有未结的 ask 时，把这条文字当答案，走 submitCustomReply
@@ -28390,6 +28395,8 @@ interface ThreadSlashContext {
   teamTrustUnionId: string | undefined;
   isBotSenderType: boolean;
   isForeignBotSender: boolean;
+  /** Daemon-attested caller for this inbound thread message. */
+  trustedCaller?: TrustedCaller;
   substituteTrigger: RoutingContext['substituteTrigger'];
   getThreadSender: () => Promise<Parameters<typeof setDirectChatDisplayNameFromSender>[2]>;
 }
@@ -28419,7 +28426,7 @@ function isExactDurableCloseCommand(
 }
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
-  const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
+  const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, trustedCaller, substituteTrigger, getThreadSender } = slash;
   // Intercept daemon commands
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
@@ -28546,6 +28553,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       messageId: parsed.messageId,
       replyRootId,
       ctx,
+      trustedCaller,
     });
     const effectiveThreadChatId = existingDs?.chatId ?? chatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, senderOpenId, cmd);

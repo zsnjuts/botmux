@@ -619,6 +619,10 @@ export interface CommandHandlerDeps {
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
+  /** Daemon-attested caller for this exact slash-command invocation. Peer-bot
+   * callers may carry a separately verified botOwner; command code must not
+   * reconstruct and thereby erase that credential-selection proof. */
+  invocationTrustedCaller?: TrustedCaller;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
 }
@@ -3610,17 +3614,31 @@ export async function handleCommand(
           : message.senderType === 'bot' || message.senderType === 'app'
             ? 'bot'
             : undefined;
-        const retryCaller: TrustedCaller | undefined = retrySenderType
-          && message.senderId.startsWith('ou_')
+        const attestedInvocationCaller = deps.invocationTrustedCaller;
+        const invocationCallerMatches = !!attestedInvocationCaller
+          && !!retrySenderType
+          && attestedInvocationCaller.requestLarkAppId === ds.larkAppId
+          && attestedInvocationCaller.requestUserOpenId === message.senderId
+          && attestedInvocationCaller.senderType === retrySenderType
+          && (message.senderUnionId === undefined
+            || attestedInvocationCaller.requestUserUnionId === message.senderUnionId);
+        const retryCaller: TrustedCaller | undefined = invocationCallerMatches
           ? {
-              requestLarkAppId: ds.larkAppId,
-              requestUserOpenId: message.senderId,
-              ...(message.senderUnionId
-                ? { requestUserUnionId: message.senderUnionId }
+              ...attestedInvocationCaller,
+              ...(attestedInvocationCaller.botOwner
+                ? { botOwner: { ...attestedInvocationCaller.botOwner } }
                 : {}),
-              senderType: retrySenderType,
             }
-          : undefined;
+          : retrySenderType && message.senderId.startsWith('ou_')
+            ? {
+                requestLarkAppId: ds.larkAppId,
+                requestUserOpenId: message.senderId,
+                ...(message.senderUnionId
+                  ? { requestUserUnionId: message.senderUnionId }
+                  : {}),
+                senderType: retrySenderType,
+              }
+            : undefined;
         const invocationTarget = deps.invocationReplyTarget;
         const retryReplyRoot = invocationTarget?.mode === 'thread'
           || invocationTarget?.mode === 'quote'
@@ -3634,6 +3652,7 @@ export async function handleCommand(
           currentReplyTarget: ds.currentReplyTarget,
           sessionReplyThreadAliases: ds.session.replyThreadAliases,
           sessionCurrentReplyTarget: ds.session.currentReplyTarget,
+          activeInteractiveTurn: ds.activeInteractiveTurn,
         };
         const rollbackReplyState = (): void => {
           ds.session.replyTargets = priorReplyState.replyTargets;
@@ -3643,6 +3662,7 @@ export async function handleCommand(
           ds.currentReplyTarget = priorReplyState.currentReplyTarget;
           ds.session.replyThreadAliases = priorReplyState.sessionReplyThreadAliases;
           ds.session.currentReplyTarget = priorReplyState.sessionCurrentReplyTarget;
+          ds.activeInteractiveTurn = priorReplyState.activeInteractiveTurn;
           try { sessionStore.updateSession(ds.session); }
           catch (err) {
             logger.warn(
@@ -3676,6 +3696,17 @@ export async function handleCommand(
             inThread: !!message.threadId,
             sourceMessageId: message.messageId,
           });
+          // Identity preparation runs before worker IPC. Publish the exact
+          // daemon-attested caller now so bot-authored retries retain their
+          // separately verified developer; every non-accepted path below
+          // restores the prior active-turn mirror.
+          if (retryCaller) {
+            ds.activeInteractiveTurn = {
+              turnId: retryTurnId,
+              caller: { ...retryCaller },
+              userPrompt: failedTurn.userPrompt,
+            };
+          }
           sessionStore.updateSession(ds.session);
           await deps.prepareTurn?.(ds, retryTurnId);
           if (deps.submitRetryTurn) {
@@ -3717,6 +3748,7 @@ export async function handleCommand(
         if (submission.kind === 'handled') {
           // A durable post-admission rejection notice already owns the only
           // user-visible result for this claim.
+          ds.activeInteractiveTurn = priorReplyState.activeInteractiveTurn;
           break;
         }
         if (submission.kind !== 'accepted') {

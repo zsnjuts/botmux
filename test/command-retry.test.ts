@@ -583,6 +583,7 @@ describe('/retry command', () => {
     expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
     expect(ds.session.replyTargets?.om_msg_001).toBeUndefined();
     expect(ds.session.turnReplyContexts?.om_msg_001).toBeUndefined();
+    expect(ds.activeInteractiveTurn).toBeUndefined();
     expect(deps.sessionReply).toHaveBeenCalledWith(
       ROOT_ID,
       expect.stringContaining('重试提交失败'),
@@ -641,6 +642,85 @@ describe('/retry command', () => {
       { openId: 'ou_peer_bot', isBot: true },
     ]);
     expect(ds.activeInteractiveTurn?.caller.senderType).toBe('bot');
+  });
+
+  it('preserves a daemon-attested bot owner before retry identity preparation', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    const message = makeLarkMessage('/retry');
+    message.senderType = 'app';
+    message.senderId = 'ou_peer_bot';
+    message.senderUnionId = 'on_peer_bot';
+    const attested = {
+      requestLarkAppId: LARK_APP_ID,
+      requestUserOpenId: 'ou_peer_bot',
+      requestUserUnionId: 'on_peer_bot',
+      senderType: 'bot' as const,
+      botOwner: {
+        openId: 'ou_verified_owner',
+        unionId: 'on_verified_owner',
+        email: 'owner@example.com',
+        source: 'bot_config' as const,
+      },
+    };
+    deps.invocationTrustedCaller = attested;
+    deps.prepareTurn = vi.fn(async target => {
+      expect(target.activeInteractiveTurn).toEqual({
+        turnId: 'om_msg_001',
+        caller: attested,
+        userPrompt: 'fix the flaky test',
+      });
+    });
+    deps.submitRetryTurn = vi.fn(async input => {
+      expect(input.trustedCaller).toEqual(attested);
+      expect(input.ds.activeInteractiveTurn?.caller).toEqual(attested);
+      return { kind: 'accepted' as const };
+    });
+
+    await handleCommand('/retry', ROOT_ID, message, deps, LARK_APP_ID);
+
+    expect(deps.prepareTurn).toHaveBeenCalledOnce();
+    expect(deps.submitRetryTurn).toHaveBeenCalledOnce();
+    expect(ds.activeInteractiveTurn?.caller).toEqual(attested);
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
+  });
+
+  it('does not borrow an attested caller from a different slash sender', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const deps = makeDeps(ds);
+    deps.invocationTrustedCaller = {
+      requestLarkAppId: LARK_APP_ID,
+      requestUserOpenId: 'ou_other_bot',
+      requestUserUnionId: 'on_other_bot',
+      senderType: 'bot',
+      botOwner: {
+        openId: 'ou_other_owner',
+        unionId: 'on_other_owner',
+        email: 'other@example.com',
+        source: 'bot_config',
+      },
+    };
+    const message = makeLarkMessage('/retry');
+    message.senderType = 'app';
+    message.senderId = 'ou_peer_bot';
+    message.senderUnionId = 'on_peer_bot';
+
+    await handleCommand('/retry', ROOT_ID, message, deps, LARK_APP_ID);
+
+    expect(sendWorkerInput.mock.calls[0][3]).toMatchObject({
+      trustedCaller: {
+        requestUserOpenId: 'ou_peer_bot',
+        requestUserUnionId: 'on_peer_bot',
+        senderType: 'bot',
+      },
+    });
+    expect(sendWorkerInput.mock.calls[0][3].trustedCaller.botOwner).toBeUndefined();
   });
 
   it('replies cooldown and does not inject while the cooldown is active', async () => {
