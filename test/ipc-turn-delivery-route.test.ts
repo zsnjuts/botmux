@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import {
   setIpcAuthSecret,
   setScheduledSelfCleanupReceiptHandler,
+  setScheduledSelfCleanupReceiptLookupHandler,
   startIpcServer,
   type IpcServerHandle,
 } from '../src/core/dashboard-ipc-server.js';
@@ -52,6 +53,7 @@ afterEach(async () => {
   handle = null;
   setIpcAuthSecret(null);
   setScheduledSelfCleanupReceiptHandler(null);
+  setScheduledSelfCleanupReceiptLookupHandler(null);
   await __testOnly_closeSkillFeedbackStores();
   if (prevDataDir !== null) config.session.dataDir = prevDataDir;
   prevDataDir = null;
@@ -265,7 +267,8 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
 
   it('replays a persisted cleanup receipt after remove revoked the live settlement', async () => {
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000113';
-    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const sessions = { 'sess-a': liveSession('sess-a', CAP_A, turnId) };
+    await setup(sessions);
     const proof = deriveScheduledFinalDeliveryProof({
       turnId,
       workerGeneration: 7,
@@ -301,6 +304,24 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       }
       return JSON.stringify(persisted) === JSON.stringify(value);
     });
+    setScheduledSelfCleanupReceiptLookupHandler(input => {
+      if (!persisted
+          || persisted.appId !== input.appId
+          || persisted.taskId !== input.taskId
+          || persisted.turnId !== input.turnId
+          || persisted.messageId !== input.messageId) return undefined;
+      return {
+        domain: 'botmux.scheduled-final-receipt.v1',
+        trusted: true,
+        messageId: String(persisted.messageId),
+        turnId: String(persisted.turnId),
+        workerGeneration: Number(persisted.workerGeneration),
+        ...(typeof persisted.dispatchAttempt === 'number'
+          ? { dispatchAttempt: persisted.dispatchAttempt }
+          : {}),
+        proof: String(persisted.proof),
+      };
+    });
     const payload = {
       originCapability: CAP_A,
       messageId: 'om_cleanup_final',
@@ -317,8 +338,18 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     expect(first.status).toBe(200);
     await expect(settlement.settled).resolves.toEqual({ messageId: 'om_cleanup_final' });
     expect(revokeScheduledRunSettlements('deadbeef', 'cli_app')).toBe(1);
+    sessions['sess-a'] = liveSession('sess-a', CAP_A, turnId, { workerGeneration: 8 });
+    sessions['sess-a'].workerGeneration = 8;
 
-    const afterLostRemoveResponse = await post('sess-a', payload);
+    const afterLostRemoveResponse = await post('sess-a', {
+      ...payload,
+      receiptWorkerGeneration: 8,
+      receiptProof: deriveScheduledFinalDeliveryProof({
+        turnId,
+        workerGeneration: 8,
+        dispatchAttempt: 2,
+      }),
+    });
     expect(afterLostRemoveResponse.status).toBe(200);
     expect(await afterLostRemoveResponse.json()).toMatchObject({
       ok: true,
@@ -326,6 +357,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       trustedFinalReceipt: {
         messageId: 'om_cleanup_final',
         turnId,
+        workerGeneration: 7,
         proof,
       },
     });

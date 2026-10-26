@@ -335,6 +335,37 @@ describe('managed schedule mutation route', () => {
     },
   );
 
+  it('replays exact revoked cleanup after the original managed origin is gone', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('remove-after-final', 'turn-after-restart', 'a1b2c3d4');
+    h.ds.managedTurnOrigin = undefined;
+    h.ds.activeInteractiveTurn = undefined;
+    h.record.kind = 'direct';
+    h.record.state = 'revoked';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    const proof = deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 7 })!;
+    const trustedFinalReceipt = scheduledFinalReceiptEnvelope({
+      messageId: 'om_cleanup_final', turnId, workerGeneration: 7, proof,
+    });
+    h.scope.readJsonBody = async () => ({
+      sessionId: 's1',
+      action: 'remove-after-final',
+      id: 'a1b2c3d4',
+      trustedFinalReceipt,
+    });
+    h.scheduler.removeTaskAfterVerifiedFinal.mockReturnValue({ replay: true });
+
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true, replay: true } });
+    expect(h.scheduler.removeTaskAfterVerifiedFinal).toHaveBeenCalledWith({
+      appId: 'cli_target',
+      taskId: 'a1b2c3d4',
+      turnId,
+      workerGeneration: 7,
+      proof,
+      messageId: 'om_cleanup_final',
+    });
+  });
+
   it.each([
     ['missing receipt', undefined],
     ['wrong message', { messageId: 'om_wrong' }],

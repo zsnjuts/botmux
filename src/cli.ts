@@ -11491,35 +11491,29 @@ async function cmdSend(rest: string[]): Promise<void> {
     ? deriveScheduledFinalDeliveryProof(scheduledFinalDeliveryIdentity)
     : undefined;
   let daemonOwnedFinalDeliveryReceipt: ScheduledFinalReceiptEnvelope | undefined;
+  let relayedTurnDeliveryReport: Promise<{
+    ok: true;
+    trustedFinalReceipt?: unknown;
+  } | undefined> | undefined;
   let trustedFinalDeliveryReport: Promise<ScheduledFinalReceiptEnvelope | undefined> | undefined;
-  /** Establish a trusted final receipt. A primary daemon-owned Provider write
-   * returns its own settled receipt; every CLI-reported write instead requires
-   * the daemon to read back the exact turn/generation proof from Lark. */
-  const reportTrustedFinalDelivery = async (
+  /** Index any final through the daemon when the short-lived CLI cannot open
+   * the feedback store. Scheduled callers add identity fields and separately
+   * validate the returned trusted envelope. */
+  const reportRelayedTurnDelivery = async (
     messageId: string,
     sentContent: string,
-  ): Promise<ScheduledFinalReceiptEnvelope | undefined> => {
+  ): Promise<{ ok: true; trustedFinalReceipt?: unknown } | undefined> => {
     if (effectiveResponseKind !== 'final'
         || !currentTurnId
         || receiptTargetChatId !== s.chatId) return undefined;
-    if (!scheduledTurn || !scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof) {
-      console.error('botmux send: scheduled trusted final identity is unavailable');
-      return undefined;
-    }
-    if (daemonOwnedFinalDeliveryReceipt?.messageId === messageId) {
-      return daemonOwnedFinalDeliveryReceipt;
-    }
-    trustedFinalDeliveryReport ??= (async () => {
+    relayedTurnDeliveryReport ??= (async () => {
       let discoveredPort: number | undefined;
       try { discoveredPort = findDaemon(appId)?.ipcPort; } catch { /* isolated CLI */ }
       const deliveryIpcPort = resolveDaemonIpcPort(
         discoveredPort,
         process.env.BOTMUX_DAEMON_IPC_PORT,
       );
-      if (!deliveryIpcPort) {
-        console.error('botmux send: trusted final delivery receipt unavailable after delivery: daemon IPC unavailable');
-        return undefined;
-      }
+      if (!deliveryIpcPort) return undefined;
       try {
         const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', {
           messageId,
@@ -11546,6 +11540,49 @@ async function cmdSend(rest: string[]): Promise<void> {
         } | undefined;
         if (!res.ok || detail?.ok !== true) {
           throw new Error(detail?.error ?? `HTTP ${res.status}`);
+        }
+        return { ok: true as const, trustedFinalReceipt: detail.trustedFinalReceipt };
+      } catch (error) {
+        console.error(
+          `botmux send: daemon turn delivery report failed after delivery: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return undefined;
+      }
+    })();
+    return relayedTurnDeliveryReport;
+  };
+  /** Establish a trusted final receipt. A primary daemon-owned Provider write
+   * returns its own settled receipt; every CLI-reported write instead requires
+   * the daemon to read back the exact turn/generation proof from Lark. */
+  const reportTrustedFinalDelivery = async (
+    messageId: string,
+    sentContent: string,
+  ): Promise<ScheduledFinalReceiptEnvelope | undefined> => {
+    if (effectiveResponseKind !== 'final'
+        || !currentTurnId
+        || receiptTargetChatId !== s.chatId) return undefined;
+    if (!scheduledTurn || !scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof) {
+      console.error('botmux send: scheduled trusted final identity is unavailable');
+      return undefined;
+    }
+    const cachedReceipt = turnSendKey
+      ? turnSendLedger.read(turnSendKey)?.final?.trustedFinalReceipt
+      : undefined;
+    if (scheduleRemoveSelfTaskId
+        && cachedReceipt?.messageId === messageId
+        && cachedReceipt.turnId === currentTurnId) {
+      return cachedReceipt;
+    }
+    if (daemonOwnedFinalDeliveryReceipt?.messageId === messageId) {
+      return daemonOwnedFinalDeliveryReceipt;
+    }
+    trustedFinalDeliveryReport ??= (async () => {
+      try {
+        const detail = await reportRelayedTurnDelivery(messageId, sentContent);
+        if (!detail) {
+          console.error('botmux send: trusted final delivery receipt unavailable after delivery: daemon IPC unavailable');
+          return undefined;
         }
         const expected = scheduledFinalReceiptEnvelope({
           messageId,
@@ -11588,6 +11625,27 @@ async function cmdSend(rest: string[]): Promise<void> {
         + `定时任务 ${scheduleRemoveSelfTaskId} 未删除；`
         + '请原样重试同一 botmux send 命令完成验证与自删除',
       );
+      return;
+    }
+    if (!turnSendKey) {
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: false,
+        error: 'turn_send_ledger_unavailable',
+      };
+      return;
+    }
+    try {
+      await turnSendLedger.recordTrustedFinalReceipt(turnSendKey, trustedFinalReceipt);
+    } catch (error) {
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      console.error(`⚠️ 可信回执无法持久化；定时任务 ${scheduleRemoveSelfTaskId} 未删除`);
       return;
     }
     await removeScheduleSelfAfterFinal(trustedFinalReceipt);
@@ -13415,8 +13473,12 @@ async function cmdSend(rest: string[]): Promise<void> {
       } catch (error) {
         indexError = error;
       }
-      if ((indexError !== undefined || scheduledTurn)
-          && !!await reportTrustedFinalDelivery(messageId, text)) indexError = undefined;
+      if (indexError !== undefined || scheduledTurn) {
+        const reported = scheduledTurn
+          ? !!await reportTrustedFinalDelivery(messageId, text)
+          : !!await reportRelayedTurnDelivery(messageId, text);
+        if (reported) indexError = undefined;
+      }
       if (indexError !== undefined) {
         console.error(
           `botmux send: turn delivery indexing failed after delivery: ${indexError instanceof Error ? indexError.message : String(indexError)}`,

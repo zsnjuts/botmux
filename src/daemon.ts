@@ -465,7 +465,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setScheduledSelfCleanupReceiptHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setScheduledSelfCleanupReceiptHandler, setScheduledSelfCleanupReceiptLookupHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -8205,14 +8205,29 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
   }
   const action = body.action;
+  const finalCleanup = action === 'remove-after-final';
+  const claimedFinalReceipt = body.trustedFinalReceipt;
+  const claimedFinalTurnId = claimedFinalReceipt
+    && typeof claimedFinalReceipt === 'object'
+    && !Array.isArray(claimedFinalReceipt)
+    && typeof claimedFinalReceipt.turnId === 'string'
+    ? claimedFinalReceipt.turnId
+    : undefined;
+  const claimedFinalTaskId = claimedFinalTurnId
+    ? parseScheduledTurnId(claimedFinalTurnId)
+    : null;
   const scheduledTaskId = turnId ? parseScheduledTurnId(turnId) : null;
   const requestedId = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
-  const id = requestedId === 'self' && scheduledTaskId ? scheduledTaskId : requestedId;
+  const selfTaskId = finalCleanup ? claimedFinalTaskId : scheduledTaskId;
+  const id = requestedId === 'self' && selfTaskId ? selfTaskId : requestedId;
   if (!verified.ok) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_origin_unproven' });
   }
   if (!id || !['update', 'remove', 'remove-after-final', 'pause', 'resume', 'run'].includes(action)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
+  }
+  if (finalCleanup && !claimedFinalTaskId) {
+    return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_invalid' });
   }
   if (!scheduleAuthorityStore) {
     return jsonRes(res, 503, { ok: false, error: 'schedule_authority_store_unavailable' });
@@ -8252,8 +8267,8 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     }
     providerActorAdmin = true;
   }
-  const finalCleanup = action === 'remove-after-final';
-  const potentialScheduledSelfManager = !!ds && scheduledTaskId === id
+  const potentialScheduledSelfManager = !!ds
+    && (finalCleanup ? claimedFinalTaskId : scheduledTaskId) === id
     && (action === 'pause' || action === 'remove' || finalCleanup);
   if (!hostAdmin && !currentHumanAdmin && !providerActorAdmin && !potentialScheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
@@ -8296,33 +8311,36 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   let finalCleanupReceipt: ScheduleSelfCleanupReceipt | undefined;
   if (finalCleanup) {
-    const value = body.trustedFinalReceipt;
-    const liveTurnId = ds?.managedTurnOrigin?.turnId;
-    const liveGeneration = ds?.workerGeneration;
-    const persistedGeneration = ds?.session.workerGeneration;
-    const liveAttempt = ds?.managedTurnOrigin?.dispatchAttempt;
+    const value = claimedFinalReceipt;
     const messageId = value && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>).messageId
       : undefined;
-    const proof = liveTurnId && typeof liveGeneration === 'number'
-      ? deriveScheduledFinalDeliveryProof({
-          turnId: liveTurnId,
-          workerGeneration: liveGeneration,
-          ...(liveAttempt !== undefined ? { dispatchAttempt: liveAttempt } : {}),
-        })
+    const workerGeneration = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>).workerGeneration
       : undefined;
-    if (!liveTurnId || liveTurnId !== turnId
-        || typeof liveGeneration !== 'number'
-        || liveGeneration !== persistedGeneration
+    const dispatchAttempt = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>).dispatchAttempt
+      : undefined;
+    if (!claimedFinalTurnId || claimedFinalTaskId !== id
         || !isConfirmedLarkMessageId(messageId)
-        || !proof) {
+        || !Number.isSafeInteger(workerGeneration) || Number(workerGeneration) < 1
+        || (dispatchAttempt !== undefined
+          && (!Number.isSafeInteger(dispatchAttempt) || Number(dispatchAttempt) < 1))) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_invalid' });
+    }
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId: claimedFinalTurnId,
+      workerGeneration: Number(workerGeneration),
+      ...(typeof dispatchAttempt === 'number' ? { dispatchAttempt } : {}),
+    });
+    if (!proof) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_invalid' });
     }
     const expected = scheduledFinalReceiptEnvelope({
       messageId,
-      turnId: liveTurnId,
-      workerGeneration: liveGeneration,
-      ...(liveAttempt !== undefined ? { dispatchAttempt: liveAttempt } : {}),
+      turnId: claimedFinalTurnId,
+      workerGeneration: Number(workerGeneration),
+      ...(typeof dispatchAttempt === 'number' ? { dispatchAttempt } : {}),
       proof,
     });
     if (!matchesScheduledFinalReceiptEnvelope(value, expected)) {
@@ -30407,6 +30425,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         receipt,
       );
     });
+    setScheduledSelfCleanupReceiptLookupHandler(input => {
+      const receipt = scheduleAuthorityStore?.getSelfCleanupReceipt(
+        input.appId,
+        input.taskId,
+        input.turnId,
+      );
+      if (!receipt || receipt.messageId !== input.messageId) return undefined;
+      return scheduledFinalReceiptEnvelope(receipt);
+    });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     logger.error(
@@ -30416,6 +30443,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try { scheduleAuthorityStore?.close(); } catch { /* no-op */ }
     scheduleAuthorityStore = null;
     setScheduledSelfCleanupReceiptHandler(null);
+    setScheduledSelfCleanupReceiptLookupHandler(null);
     scheduler.setScheduleAuthorityUnavailable(error);
   }
   void runDurableConfigMutation({
@@ -32307,12 +32335,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         : undefined;
       const trustedFinalTarget = request.responseKind === 'final'
         && scheduledTaskId !== null
-        && request.daemonSession.session.workerGeneration === receiptWorkerGeneration
-        && receiptProof !== undefined
         && sameDurableOutboxTarget(
           request.target,
           durableOutboxTargetForTurn(request.daemonSession, request.turnId),
         );
+      const liveTrustedFinalTarget = trustedFinalTarget
+        && request.daemonSession.session.workerGeneration === receiptWorkerGeneration
+        && receiptProof !== undefined;
       const message = durableLarkOutboxMessage({
         messageId: `out_${request.providerUuid}`,
         sessionKey: canonicalKey,
@@ -32347,9 +32376,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!isConfirmedLarkMessageId(providerMessageId)) {
         return { kind: 'ambiguous', error: 'delivered outbox receipt lacks provider message id' };
       }
-      let trustedFinalDelivery = trustedFinalTarget
-        && observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId);
-      if (trustedFinalTarget && request.scheduleSelfCleanup === true
+      const persistedCleanupReceipt = trustedFinalTarget
+        && request.scheduleSelfCleanup === true && scheduledTaskId
+        ? scheduleAuthorityStore?.getSelfCleanupReceipt(
+            request.daemonSession.larkAppId,
+            scheduledTaskId,
+            request.turnId,
+          )
+        : undefined;
+      let trustedFinalReceipt = persistedCleanupReceipt?.messageId === providerMessageId
+        ? scheduledFinalReceiptEnvelope(persistedCleanupReceipt)
+        : undefined;
+      let trustedFinalDelivery = !!trustedFinalReceipt || (liveTrustedFinalTarget
+        && observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId));
+      if (!trustedFinalReceipt && liveTrustedFinalTarget && request.scheduleSelfCleanup === true
           && scheduledTaskId && receiptProof
           && typeof receiptWorkerGeneration === 'number') {
         const cleanupReceipt: ScheduleSelfCleanupReceipt = {
@@ -32379,7 +32419,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           );
         }
       }
-      const trustedFinalReceipt = trustedFinalDelivery && receiptProof
+      trustedFinalReceipt ??= trustedFinalDelivery && receiptProof
         && typeof receiptWorkerGeneration === 'number'
         ? scheduledFinalReceiptEnvelope({
             messageId: providerMessageId,

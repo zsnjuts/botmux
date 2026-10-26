@@ -446,6 +446,12 @@ export interface ScheduledSelfCleanupReceiptRequest {
 let scheduledSelfCleanupReceiptHandler: ((
   request: ScheduledSelfCleanupReceiptRequest,
 ) => boolean) | null = null;
+let scheduledSelfCleanupReceiptLookupHandler: ((input: {
+  appId: string;
+  taskId: string;
+  turnId: string;
+  messageId: string;
+}) => import('./scheduled-final-delivery-proof.js').ScheduledFinalReceiptEnvelope | undefined) | null = null;
 
 /** Register the daemon-owned durable credential used only to converge a
  * verified scheduled self-delete after its HTTP response was lost. */
@@ -453,6 +459,12 @@ export function setScheduledSelfCleanupReceiptHandler(
   handler: ((request: ScheduledSelfCleanupReceiptRequest) => boolean) | null,
 ): void {
   scheduledSelfCleanupReceiptHandler = handler;
+}
+
+export function setScheduledSelfCleanupReceiptLookupHandler(
+  handler: typeof scheduledSelfCleanupReceiptLookupHandler,
+): void {
+  scheduledSelfCleanupReceiptLookupHandler = handler;
 }
 
 export interface DurableSessionLifecycleRequest {
@@ -2148,6 +2160,7 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   try {
     const liveTurnId = ds?.managedTurnOrigin?.turnId;
     let trustedFinalReceipt: ReturnType<typeof scheduledFinalReceiptEnvelope> | undefined;
+    let persistedCleanupReplay = false;
     const scheduledFinal = body.responseKind === 'final'
       && typeof liveTurnId === 'string'
       && parseScheduledTurnId(liveTurnId) !== null;
@@ -2159,27 +2172,50 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
       return jsonRes(res, 409, { ok: false, error: 'scheduled_cleanup_receipt_unbound' });
     }
     if (scheduledFinal) {
-      const liveWorkerGeneration = ds?.workerGeneration;
-      const persistedWorkerGeneration = ds?.session.workerGeneration;
-      const receiptDispatchAttempt = body.receiptDispatchAttempt;
-      if (body.receiptTurnId !== liveTurnId
-          || typeof body.receiptWorkerGeneration !== 'number'
-          || body.receiptWorkerGeneration !== liveWorkerGeneration
-          || body.receiptWorkerGeneration !== persistedWorkerGeneration
-          || receiptDispatchAttempt !== ds?.managedTurnOrigin?.dispatchAttempt) {
-        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
-      }
-      const expectedProof = deriveScheduledFinalDeliveryProof({
-        turnId: liveTurnId,
-        workerGeneration: body.receiptWorkerGeneration,
-        ...(typeof receiptDispatchAttempt === 'number'
-          ? { dispatchAttempt: receiptDispatchAttempt }
-          : {}),
-      });
-      if (!expectedProof || body.receiptProof !== expectedProof) {
-        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_proof_invalid' });
-      }
       const messageId = typeof body.messageId === 'string' ? body.messageId : '';
+      const taskId = parseScheduledTurnId(liveTurnId)!;
+      const persistedReceipt = selfCleanupReceiptRequested
+        ? scheduledSelfCleanupReceiptLookupHandler?.({
+            appId: ds!.larkAppId,
+            taskId,
+            turnId: liveTurnId,
+            messageId,
+          })
+        : undefined;
+      if (persistedReceipt) {
+        trustedFinalReceipt = persistedReceipt;
+        persistedCleanupReplay = true;
+      } else {
+        const liveWorkerGeneration = ds?.workerGeneration;
+        const persistedWorkerGeneration = ds?.session.workerGeneration;
+        const receiptDispatchAttempt = body.receiptDispatchAttempt;
+        if (body.receiptTurnId !== liveTurnId
+            || typeof body.receiptWorkerGeneration !== 'number'
+            || body.receiptWorkerGeneration !== liveWorkerGeneration
+            || body.receiptWorkerGeneration !== persistedWorkerGeneration
+            || receiptDispatchAttempt !== ds?.managedTurnOrigin?.dispatchAttempt) {
+          return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
+        }
+        const expectedProof = deriveScheduledFinalDeliveryProof({
+          turnId: liveTurnId,
+          workerGeneration: body.receiptWorkerGeneration,
+          ...(typeof receiptDispatchAttempt === 'number'
+            ? { dispatchAttempt: receiptDispatchAttempt }
+            : {}),
+        });
+        if (!expectedProof || body.receiptProof !== expectedProof) {
+          return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_proof_invalid' });
+        }
+        trustedFinalReceipt = scheduledFinalReceiptEnvelope({
+          messageId,
+          turnId: liveTurnId,
+          workerGeneration: body.receiptWorkerGeneration,
+          ...(typeof receiptDispatchAttempt === 'number'
+            ? { dispatchAttempt: receiptDispatchAttempt }
+            : {}),
+          proof: expectedProof,
+        });
+      }
       let detail: unknown;
       try {
         detail = await getMessageDetail(ds!.larkAppId, messageId, {
@@ -2199,18 +2235,9 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
         larkAppId: ds!.larkAppId,
         chatId: ds!.chatId,
         expectedTarget: frozenReplyContextForTurn(ds!, liveTurnId).target,
-        proof: expectedProof,
+        proof: trustedFinalReceipt.proof,
       });
       if (!proof.ok) return jsonRes(res, 409, { ok: false, error: proof.error });
-      trustedFinalReceipt = scheduledFinalReceiptEnvelope({
-        messageId,
-        turnId: liveTurnId,
-        workerGeneration: body.receiptWorkerGeneration,
-        ...(typeof receiptDispatchAttempt === 'number'
-          ? { dispatchAttempt: receiptDispatchAttempt }
-          : {}),
-        proof: expectedProof,
-      });
     }
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
@@ -2224,7 +2251,9 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     });
     if (result.ok && scheduledFinal && liveTurnId) {
       const messageId = body.messageId as string;
-      const observed = observeScheduledRunProviderReadbackDelivery(liveTurnId, messageId);
+      const observed = persistedCleanupReplay
+        ? false
+        : observeScheduledRunProviderReadbackDelivery(liveTurnId, messageId);
       if (selfCleanupReceiptRequested) {
         if (!scheduledSelfCleanupReceiptHandler) {
           return jsonRes(res, 503, { ok: false, error: 'scheduled_cleanup_receipt_unavailable' });
@@ -2241,7 +2270,11 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
           proof: body.receiptProof as string,
           messageId,
         };
-        if (observed) {
+        if (persistedCleanupReplay) {
+          // The immutable envelope was loaded from Host authority storage and
+          // Provider readback re-proved the same message/target. Do not touch
+          // the one-shot scheduler rendezvous in this newer daemon generation.
+        } else if (observed) {
           if (!scheduledSelfCleanupReceiptHandler({ action: 'record', ...request })) {
             return jsonRes(res, 409, { ok: false, error: 'scheduled_cleanup_receipt_not_recorded' });
           }
