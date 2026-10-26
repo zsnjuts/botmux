@@ -38,6 +38,7 @@ import {
   matchesScheduledFinalReceiptEnvelope,
   scheduledFinalReceiptEnvelope,
   stampScheduledFinalDeliveryProof,
+  type ScheduledFinalReceiptEnvelope,
 } from './core/scheduled-final-delivery-proof.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
@@ -10804,7 +10805,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     replay?: boolean;
     error?: string;
   } | undefined;
-  const removeScheduleSelfAfterFinal = async (): Promise<typeof scheduleSelfCleanup> => {
+  const removeScheduleSelfAfterFinal = async (
+    trustedFinalReceipt: ScheduledFinalReceiptEnvelope,
+  ): Promise<typeof scheduleSelfCleanup> => {
     if (!scheduleRemoveSelfTaskId) return undefined;
     if (scheduleSelfCleanup) return scheduleSelfCleanup;
     try {
@@ -10812,7 +10815,11 @@ async function cmdSend(rest: string[]): Promise<void> {
         path: SCHEDULE_MANAGED_MUTATE_ROUTE,
         sessionId: sid,
         larkAppId: s.larkAppId!,
-        body: { action: 'remove', id: scheduleRemoveSelfTaskId },
+        body: {
+          action: 'remove-after-final',
+          id: scheduleRemoveSelfTaskId,
+          trustedFinalReceipt,
+        },
       });
       const body = await response.json().catch(() => ({})) as {
         ok?: boolean;
@@ -11483,23 +11490,25 @@ async function cmdSend(rest: string[]): Promise<void> {
   const scheduledFinalDeliveryProof = scheduledFinalDeliveryIdentity
     ? deriveScheduledFinalDeliveryProof(scheduledFinalDeliveryIdentity)
     : undefined;
-  let daemonOwnedFinalDeliveryMessageId: string | undefined;
-  let trustedFinalDeliveryReport: Promise<boolean> | undefined;
+  let daemonOwnedFinalDeliveryReceipt: ScheduledFinalReceiptEnvelope | undefined;
+  let trustedFinalDeliveryReport: Promise<ScheduledFinalReceiptEnvelope | undefined> | undefined;
   /** Establish a trusted final receipt. A primary daemon-owned Provider write
    * returns its own settled receipt; every CLI-reported write instead requires
    * the daemon to read back the exact turn/generation proof from Lark. */
   const reportTrustedFinalDelivery = async (
     messageId: string,
     sentContent: string,
-  ): Promise<boolean> => {
+  ): Promise<ScheduledFinalReceiptEnvelope | undefined> => {
     if (effectiveResponseKind !== 'final'
         || !currentTurnId
-        || receiptTargetChatId !== s.chatId) return false;
-    if (scheduledTurn && (!scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof)) {
+        || receiptTargetChatId !== s.chatId) return undefined;
+    if (!scheduledTurn || !scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof) {
       console.error('botmux send: scheduled trusted final identity is unavailable');
-      return false;
+      return undefined;
     }
-    if (daemonOwnedFinalDeliveryMessageId === messageId) return true;
+    if (daemonOwnedFinalDeliveryReceipt?.messageId === messageId) {
+      return daemonOwnedFinalDeliveryReceipt;
+    }
     trustedFinalDeliveryReport ??= (async () => {
       let discoveredPort: number | undefined;
       try { discoveredPort = findDaemon(appId)?.ipcPort; } catch { /* isolated CLI */ }
@@ -11509,7 +11518,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       );
       if (!deliveryIpcPort) {
         console.error('botmux send: trusted final delivery receipt unavailable after delivery: daemon IPC unavailable');
-        return false;
+        return undefined;
       }
       try {
         const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', {
@@ -11538,27 +11547,25 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (!res.ok || detail?.ok !== true) {
           throw new Error(detail?.error ?? `HTTP ${res.status}`);
         }
-        if (scheduledFinalDeliveryIdentity && scheduledFinalDeliveryProof) {
-          const expected = scheduledFinalReceiptEnvelope({
-            messageId,
-            turnId: scheduledFinalDeliveryIdentity.turnId,
-            workerGeneration: scheduledFinalDeliveryIdentity.workerGeneration,
-            ...(scheduledFinalDeliveryIdentity.dispatchAttempt !== undefined
-              ? { dispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
-              : {}),
-            proof: scheduledFinalDeliveryProof,
-          });
-          if (!matchesScheduledFinalReceiptEnvelope(detail.trustedFinalReceipt, expected)) {
-            throw new Error('scheduled trusted final receipt envelope mismatch');
-          }
+        const expected = scheduledFinalReceiptEnvelope({
+          messageId,
+          turnId: scheduledFinalDeliveryIdentity.turnId,
+          workerGeneration: scheduledFinalDeliveryIdentity.workerGeneration,
+          ...(scheduledFinalDeliveryIdentity.dispatchAttempt !== undefined
+            ? { dispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
+            : {}),
+          proof: scheduledFinalDeliveryProof,
+        });
+        if (!matchesScheduledFinalReceiptEnvelope(detail.trustedFinalReceipt, expected)) {
+          throw new Error('scheduled trusted final receipt envelope mismatch');
         }
-        return true;
+        return expected;
       } catch (error) {
         console.error(
           `botmux send: trusted final delivery receipt failed after delivery: `
           + `${error instanceof Error ? error.message : String(error)}`,
         );
-        return false;
+        return undefined;
       }
     })();
     return trustedFinalDeliveryReport;
@@ -11568,7 +11575,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     sentContent: string,
   ): Promise<void> => {
     if (!scheduleRemoveSelfTaskId) return;
-    if (!await reportTrustedFinalDelivery(messageId, sentContent)) {
+    const trustedFinalReceipt = await reportTrustedFinalDelivery(messageId, sentContent);
+    if (!trustedFinalReceipt) {
       scheduleSelfCleanup = {
         requested: true,
         taskId: scheduleRemoveSelfTaskId,
@@ -11582,7 +11590,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       );
       return;
     }
-    await removeScheduleSelfAfterFinal();
+    await removeScheduleSelfAfterFinal(trustedFinalReceipt);
   };
   const turnSendKey = currentTurnId
     ? {
@@ -12696,7 +12704,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         hookContext,
       });
       if (delivery.trustedFinalReceipt) {
-        daemonOwnedFinalDeliveryMessageId = delivery.trustedFinalReceipt.messageId;
+        daemonOwnedFinalDeliveryReceipt = delivery.trustedFinalReceipt;
       }
       primaryQuotedId = canonicalOutput.quoteTargetId ?? null;
       return delivery.messageId;
@@ -13408,7 +13416,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         indexError = error;
       }
       if ((indexError !== undefined || scheduledTurn)
-          && await reportTrustedFinalDelivery(messageId, text)) indexError = undefined;
+          && !!await reportTrustedFinalDelivery(messageId, text)) indexError = undefined;
       if (indexError !== undefined) {
         console.error(
           `botmux send: turn delivery indexing failed after delivery: ${indexError instanceof Error ? indexError.message : String(indexError)}`,

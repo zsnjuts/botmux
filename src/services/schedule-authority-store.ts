@@ -401,6 +401,41 @@ export class ScheduleAuthorityStore {
     return { replay: false };
   }
 
+  /** Compare the exact verified final credential and revoke its task under one
+   * SQLite write lock. A revoked row is an idempotent success only for the same
+   * persisted credential; ordinary remove/pause authority never enters here. */
+  revokeWithSelfCleanupReceipt(input: ScheduleSelfCleanupReceipt): {
+    task: ScheduledTask;
+    replay: boolean;
+  } {
+    assertSelfCleanupReceipt(input);
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const persisted = this.getSelfCleanupReceipt(input.appId, input.taskId, input.turnId);
+      if (!persisted || !sameSelfCleanupReceipt(persisted, input)) {
+        throw new Error('schedule_self_cleanup_receipt_mismatch');
+      }
+      const authority = this.getRecord(input.appId, input.taskId);
+      if (!authority) throw new Error('schedule_self_cleanup_authority_unavailable');
+      if (authority.state === 'revoked') {
+        this.db.exec('COMMIT;');
+        return { task: authority.task, replay: true };
+      }
+      const result = this.db.prepare(`
+        UPDATE schedule_authority_tasks SET state = 'revoked', updated_at = ?
+        WHERE app_id = ? AND task_id = ? AND state != 'revoked'
+      `).run(new Date().toISOString(), input.appId, input.taskId);
+      if (Number(result.changes) !== 1) {
+        throw new Error('schedule_self_cleanup_revoke_failed');
+      }
+      this.db.exec('COMMIT;');
+      return { task: authority.task, replay: false };
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
+      throw error;
+    }
+  }
+
   createDirect(task: ScheduledTask): ScheduledTask {
     const appId = task.larkAppId;
     if (typeof appId !== 'string' || !appId) {

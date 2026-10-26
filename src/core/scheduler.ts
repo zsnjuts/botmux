@@ -11,8 +11,12 @@ import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
-import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
-import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
+import type {
+  CommitDelegatedScheduleResult,
+  DelegatedScheduleControl,
+  ScheduleAuthorityStore,
+  ScheduleSelfCleanupReceipt,
+} from '../services/schedule-authority-store.js';
 import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
 import {
   revokeScheduledRunSettlements,
@@ -1268,6 +1272,23 @@ export function removeTask(id: string): boolean {
   if (removed) revokeScheduledRunSettlements(id, appId || undefined);
   if (removed) cleanupRemovedTaskSidecars(task);
   return removed;
+}
+
+/** Versioned final-cleanup mutation. The authority store compares the exact
+ * persisted Provider receipt and revokes the task in one transaction; this is
+ * deliberately separate from ordinary operator/provider `remove`. */
+export function removeTaskAfterVerifiedFinal(
+  receipt: ScheduleSelfCleanupReceipt,
+): { replay: boolean } {
+  assertScheduleAuthorityAvailable();
+  if (!authorityStore || !authorityStore.isInitialized(receipt.appId)) {
+    throw new Error('schedule_authority_store_unavailable');
+  }
+  const result = authorityStore.revokeWithSelfCleanupReceipt(receipt);
+  scheduleStore.removeAuthoritativeTaskProjection(receipt.taskId, receipt.appId);
+  revokeScheduledRunSettlements(receipt.taskId, receipt.appId);
+  cleanupRemovedTaskSidecars(result.task);
+  return { replay: result.replay };
 }
 
 export function enableTask(id: string): boolean {

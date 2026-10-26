@@ -415,6 +415,17 @@ describe('botmux send per-turn final idempotency', () => {
         '/api/schedule/managed-mutate',
       ]);
       expect(daemonRequests[0]?.body?.receiptScheduleSelfCleanup).toBe(true);
+      expect(daemonRequests[1]?.body).toMatchObject({
+        action: 'remove-after-final',
+        id: 'a1b2c3d4',
+        trustedFinalReceipt: {
+          domain: 'botmux.scheduled-final-receipt.v1',
+          trusted: true,
+          messageId: daemonRequests[0]?.body?.messageId,
+          turnId: scheduledTurn,
+          workerGeneration: 7,
+        },
+      });
       expect(JSON.parse(String(sent.result.stdout).split('\n').findLast(line => line.startsWith('{'))!))
         .toMatchObject({
           scheduleSelfCleanup: {

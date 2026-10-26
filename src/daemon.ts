@@ -558,6 +558,7 @@ import { resolveScheduleReferenceTime } from './core/schedule-reference-time.js'
 import { scheduleRequiresReferenceTime } from './core/scheduler.js';
 import {
   deriveScheduledFinalDeliveryProof,
+  matchesScheduledFinalReceiptEnvelope,
   scheduledFinalReceiptEnvelope,
 } from './core/scheduled-final-delivery-proof.js';
 import {
@@ -8210,7 +8211,7 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   if (!verified.ok) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_origin_unproven' });
   }
-  if (!id || !['update', 'remove', 'pause', 'resume', 'run'].includes(action)) {
+  if (!id || !['update', 'remove', 'remove-after-final', 'pause', 'resume', 'run'].includes(action)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
   }
   if (!scheduleAuthorityStore) {
@@ -8251,8 +8252,9 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     }
     providerActorAdmin = true;
   }
+  const finalCleanup = action === 'remove-after-final';
   const potentialScheduledSelfManager = !!ds && scheduledTaskId === id
-    && (action === 'pause' || action === 'remove');
+    && (action === 'pause' || action === 'remove' || finalCleanup);
   if (!hostAdmin && !currentHumanAdmin && !providerActorAdmin && !potentialScheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
   }
@@ -8266,7 +8268,7 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   if (potentialScheduledSelfManager && !scheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_self_manage_denied' });
   }
-  if (scheduledSelfManager) {
+  if (scheduledSelfManager && !(finalCleanup && authority.state === 'revoked')) {
     try {
       await authorizeScheduleSelfManage(authority, {
         selfManageEnabled: readGlobalConfig().scheduleDelegation?.selfManageEnabled === true,
@@ -8291,6 +8293,52 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   if (action === 'update' && authority.task.preconditionRef) {
     return jsonRes(res, 409, { ok: false, error: 'schedule_precondition_dashboard_update_required' });
+  }
+  let finalCleanupReceipt: ScheduleSelfCleanupReceipt | undefined;
+  if (finalCleanup) {
+    const value = body.trustedFinalReceipt;
+    const liveTurnId = ds?.managedTurnOrigin?.turnId;
+    const liveGeneration = ds?.workerGeneration;
+    const persistedGeneration = ds?.session.workerGeneration;
+    const liveAttempt = ds?.managedTurnOrigin?.dispatchAttempt;
+    const messageId = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>).messageId
+      : undefined;
+    const proof = liveTurnId && typeof liveGeneration === 'number'
+      ? deriveScheduledFinalDeliveryProof({
+          turnId: liveTurnId,
+          workerGeneration: liveGeneration,
+          ...(liveAttempt !== undefined ? { dispatchAttempt: liveAttempt } : {}),
+        })
+      : undefined;
+    if (!liveTurnId || liveTurnId !== turnId
+        || typeof liveGeneration !== 'number'
+        || liveGeneration !== persistedGeneration
+        || !isConfirmedLarkMessageId(messageId)
+        || !proof) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_invalid' });
+    }
+    const expected = scheduledFinalReceiptEnvelope({
+      messageId,
+      turnId: liveTurnId,
+      workerGeneration: liveGeneration,
+      ...(liveAttempt !== undefined ? { dispatchAttempt: liveAttempt } : {}),
+      proof,
+    });
+    if (!matchesScheduledFinalReceiptEnvelope(value, expected)) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_mismatch' });
+    }
+    finalCleanupReceipt = {
+      appId,
+      taskId: id,
+      turnId: expected.turnId,
+      workerGeneration: expected.workerGeneration,
+      ...(expected.dispatchAttempt !== undefined
+        ? { dispatchAttempt: expected.dispatchAttempt }
+        : {}),
+      proof: expected.proof,
+      messageId: expected.messageId,
+    };
   }
   let ok = false;
   let error: string | undefined;
@@ -8318,6 +8366,19 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     ok = result.ok;
     error = result.error;
   } else if (action === 'remove') ok = scheduler.removeTask(id);
+  else if (action === 'remove-after-final' && finalCleanupReceipt) {
+    try {
+      const result = scheduler.removeTaskAfterVerifiedFinal(finalCleanupReceipt);
+      return jsonRes(res, 200, { ok: true, ...(result.replay ? { replay: true } : {}) });
+    } catch (cleanupError) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: cleanupError instanceof Error
+          ? cleanupError.message
+          : 'schedule_final_cleanup_failed',
+      });
+    }
+  }
   else if (action === 'pause') ok = scheduler.disableTask(id);
   else if (action === 'resume') ok = scheduler.enableTask(id);
   else if (action === 'run') {

@@ -102,9 +102,18 @@ describe('host-only schedule authority store', () => {
 
     expect(store.recordSelfCleanupReceipt(receipt)).toEqual({ replay: false });
     expect(store.recordSelfCleanupReceipt(receipt)).toEqual({ replay: true });
-    expect(store.revoke(APP, receipt.taskId)).toBe(true);
+    expect(store.revokeWithSelfCleanupReceipt(receipt)).toMatchObject({
+      replay: false,
+      task: { id: receipt.taskId },
+    });
+    expect(store.revokeWithSelfCleanupReceipt(receipt)).toMatchObject({
+      replay: true,
+      task: { id: receipt.taskId },
+    });
     expect(store.getSelfCleanupReceipt(APP, receipt.taskId, receipt.turnId)).toEqual(receipt);
-    expect(() => store.recordSelfCleanupReceipt({ ...receipt, messageId: 'om_other' }))
+    expect(() => store.revokeWithSelfCleanupReceipt({ ...receipt, messageId: 'om_other' }))
+      .toThrow('schedule_self_cleanup_receipt_mismatch');
+    expect(() => store.recordSelfCleanupReceipt(receipt))
       .toThrow('schedule_self_cleanup_authority_unavailable');
 
     store.close();
