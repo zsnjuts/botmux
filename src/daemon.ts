@@ -28462,7 +28462,10 @@ function isExactDurableCloseCommand(
   // neither the mention key nor the cached bot open_id can remove that token.
   // Treat an exact current-app id as the structured addressing proof; do not
   // infer other untyped `cli_` values. Then accept only `/close` plus one native
-  // mention token (either order).
+  // mention token (either order). Newer botmux reply cards place the receiver
+  // in a dedicated signed footer which the trusted REST resolver strips from
+  // commandContent; in that shape the structured mention is the addressing
+  // proof and the remaining body must be exactly `/close`.
   // No mention evidence, any foreign structured mention, a second open-id token
   // or any argument remains outside the durable close path. The caller has
   // already admitted this bot sender through canRunDaemonCommand.
@@ -28480,6 +28483,7 @@ function isExactDurableCloseCommand(
     const selfMentionNames = mentions
       .map((mention: any) => typeof mention?.name === 'string' ? mention.name.trim() : '')
       .filter(Boolean);
+    if (content === '/close') return true;
     return isExactInteractiveCloseContent(content, selfMentionNames);
   }
   if (message?.message_type !== 'text') return false;
