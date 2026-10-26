@@ -6264,6 +6264,21 @@ function commandDepsForInvocation(input: {
       ),
     ...(primaryCtx
       ? {
+          submitQueuedMessage: async (
+            ds: DaemonSession,
+            message: LarkMessage,
+            text: string,
+            queuedReplyTarget?: import('./types.js').FrozenSessionReplyTarget,
+          ) => {
+            const accepted = await submitQueuedMessage(
+              ds,
+              message,
+              text,
+              queuedReplyTarget,
+            );
+            if (accepted) markIngressAdmitted(primaryCtx);
+            return accepted;
+          },
           isRetryTurnCommitted: (ds: DaemonSession, turnId: string) =>
             hasDurablePrimaryInputCommit(ds, turnId),
           submitRetryTurn: (retryInput: {
