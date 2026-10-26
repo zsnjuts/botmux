@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
+import { isConfirmedLarkMessageId } from '../core/scheduled-run-settlement.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
+import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
 export function durablePrimaryFinalProviderUuid(input: {
   larkAppId: string;
@@ -23,7 +25,13 @@ export interface DurableSessionSendInput {
   content: string;
   msgType: string;
   providerUuid: string;
+  responseKind: TurnSendKind;
   hookContext?: Record<string, unknown>;
+}
+
+export interface DurableSessionDelivery {
+  messageId: string;
+  trustedFinalDelivery: boolean;
 }
 
 export interface DurableSessionSendDeps {
@@ -40,6 +48,7 @@ type DurableSessionSendResponse = {
   ok?: boolean;
   kind?: string;
   messageId?: string;
+  trustedFinalDelivery?: boolean;
   error?: string;
 };
 
@@ -57,13 +66,14 @@ function sleep(ms: number): Promise<void> {
 export async function dispatchDurableSessionMessage(
   deps: DurableSessionSendDeps,
   input: DurableSessionSendInput,
-): Promise<string> {
+): Promise<DurableSessionDelivery> {
   const payload = {
     turnId: input.turnId,
     target: input.target,
     content: input.content,
     msgType: input.msgType,
     providerUuid: input.providerUuid,
+    responseKind: input.responseKind,
     ...(input.hookContext ? { hookContext: input.hookContext } : {}),
   };
   let lastError = 'owning daemon did not return a response';
@@ -80,8 +90,11 @@ export async function dispatchDurableSessionMessage(
     }
     const body = await response.json().catch(() => ({})) as DurableSessionSendResponse;
     if (response.ok && body.ok === true && body.kind === 'delivered'
-        && typeof body.messageId === 'string' && body.messageId.startsWith('om_')) {
-      return body.messageId;
+        && isConfirmedLarkMessageId(body.messageId)) {
+      return {
+        messageId: body.messageId,
+        trustedFinalDelivery: body.trustedFinalDelivery === true,
+      };
     }
     const detail = typeof body.error === 'string' && body.error.trim()
       ? body.error.trim()

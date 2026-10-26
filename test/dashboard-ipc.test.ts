@@ -4501,6 +4501,7 @@ describe('POST /api/sessions/:sessionId/durable-send', () => {
         content: '{"schema":"2.0"}',
         msgType: 'interactive',
         providerUuid: 'bts_fixture',
+        responseKind: 'final',
         hookContext: { sessionId: 'session-durable-send' },
       };
       const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
@@ -4548,6 +4549,7 @@ describe('POST /api/sessions/:sessionId/durable-send', () => {
           content: 'hello',
           msgType: 'text',
           providerUuid: 'bts_fixture',
+          responseKind: 'progress',
         }),
       });
 

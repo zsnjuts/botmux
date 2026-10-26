@@ -11481,10 +11481,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   const scheduledFinalDeliveryProof = scheduledFinalDeliveryIdentity
     ? deriveScheduledFinalDeliveryProof(scheduledFinalDeliveryIdentity)
     : undefined;
+  let daemonOwnedFinalDeliveryMessageId: string | undefined;
   let trustedFinalDeliveryReport: Promise<boolean> | undefined;
-  /** Report a provider-confirmed final to the resident daemon. Scheduled turns
-   * are settled only after that daemon independently reads back the exact
-   * turn/generation proof from Lark. */
+  /** Establish a trusted final receipt. A primary daemon-owned Provider write
+   * returns its own settled receipt; every CLI-reported write instead requires
+   * the daemon to read back the exact turn/generation proof from Lark. */
   const reportTrustedFinalDelivery = async (
     messageId: string,
     sentContent: string,
@@ -11492,6 +11493,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (effectiveResponseKind !== 'final'
         || !currentTurnId
         || receiptTargetChatId !== s.chatId) return false;
+    if (daemonOwnedFinalDeliveryMessageId === messageId) return true;
     trustedFinalDeliveryReport ??= (async () => {
       let discoveredPort: number | undefined;
       try { discoveredPort = findDaemon(appId)?.ipcPort; } catch { /* isolated CLI */ }
@@ -12615,7 +12617,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       if (!durableIpcPort) {
         throw new Error('durable primary send requires the owning daemon IPC port');
       }
-      const messageId = await dispatchDurableSessionMessage({
+      const delivery = await dispatchDurableSessionMessage({
         post: (sessionId, route, payload) => postSessionCliIpc(
           durableIpcPort,
           sessionId,
@@ -12628,6 +12630,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         target: durableTarget,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
+        responseKind: effectiveResponseKind,
         providerUuid: effectiveResponseKind === 'final'
           ? durablePrimaryFinalProviderUuid({
               larkAppId: appId,
@@ -12638,8 +12641,11 @@ async function cmdSend(rest: string[]): Promise<void> {
           : uuid ?? `dms_${randomUUID().replace(/-/g, '')}`,
         hookContext,
       });
+      if (delivery.trustedFinalDelivery) {
+        daemonOwnedFinalDeliveryMessageId = delivery.messageId;
+      }
       primaryQuotedId = canonicalOutput.quoteTargetId ?? null;
-      return messageId;
+      return delivery.messageId;
     }
     if (prepared?.outputMismatch) {
       console.error(

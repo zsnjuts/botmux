@@ -556,6 +556,8 @@ import { resolveScheduleReferenceTime } from './core/schedule-reference-time.js'
 import { scheduleRequiresReferenceTime } from './core/scheduler.js';
 import {
   executeScheduledRunAwaitingSettlement,
+  isConfirmedLarkMessageId,
+  observeScheduledRunDaemonProviderDelivery,
 } from './core/scheduled-run-settlement.js';
 import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -32211,13 +32213,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const providerMessageId = receipt && typeof receipt === 'object' && !Array.isArray(receipt)
         ? (receipt as Record<string, unknown>).providerMessageId
         : undefined;
-      if (typeof providerMessageId !== 'string' || !providerMessageId.startsWith('om_')) {
+      if (!isConfirmedLarkMessageId(providerMessageId)) {
         return { kind: 'ambiguous', error: 'delivered outbox receipt lacks provider message id' };
       }
-      return { kind: 'delivered' as const, messageId: providerMessageId };
+      const trustedFinalDelivery = request.responseKind === 'final' && scheduledTaskId !== null;
+      if (trustedFinalDelivery) {
+        observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId);
+      }
+      return {
+        kind: 'delivered' as const,
+        messageId: providerMessageId,
+        ...(trustedFinalDelivery ? { trustedFinalDelivery: true as const } : {}),
+      };
     };
     setDurableBridgeFinalOutputHandler(request => deliverDurablePrimaryMessage({
       ...request,
+      responseKind: 'final',
       hookContext: {
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,

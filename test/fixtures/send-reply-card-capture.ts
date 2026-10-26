@@ -154,6 +154,11 @@ if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK
       ok: true,
       kind: 'delivered',
       messageId: 'om_durable_message',
+      ...(body?.responseKind === 'final'
+        && typeof body?.turnId === 'string'
+        && body.turnId.startsWith('schedule:')
+        ? { trustedFinalDelivery: true }
+        : {}),
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   });
 }

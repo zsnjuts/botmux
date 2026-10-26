@@ -8,6 +8,7 @@ const input = {
   content: '{"schema":"2.0"}',
   msgType: 'interactive',
   providerUuid: 'bts_123',
+  responseKind: 'final' as const,
   hookContext: { sessionId: 'session-1' },
 };
 
@@ -35,13 +36,17 @@ describe('durable Session send client', () => {
       messageId: 'om_delivered',
     }), { status: 200, headers: { 'content-type': 'application/json' } }));
 
-    await expect(dispatchDurableSessionMessage({ post }, input)).resolves.toBe('om_delivered');
+    await expect(dispatchDurableSessionMessage({ post }, input)).resolves.toEqual({
+      messageId: 'om_delivered',
+      trustedFinalDelivery: false,
+    });
     expect(post).toHaveBeenCalledWith('session-1', 'durable-send', {
       turnId: 'om_turn',
       target: input.target,
       content: input.content,
       msgType: 'interactive',
       providerUuid: 'bts_123',
+      responseKind: 'final',
       hookContext: { sessionId: 'session-1' },
     });
   });
@@ -57,7 +62,7 @@ describe('durable Session send client', () => {
     const wait = vi.fn(async () => {});
 
     await expect(dispatchDurableSessionMessage({ post, sleep: wait }, input))
-      .resolves.toBe('om_reconciled');
+      .resolves.toEqual({ messageId: 'om_reconciled', trustedFinalDelivery: false });
     expect(wait).toHaveBeenCalledExactlyOnceWith(1_000);
     expect(post).toHaveBeenCalledTimes(2);
     expect(post.mock.calls[1]).toEqual(post.mock.calls[0]);
@@ -93,6 +98,20 @@ describe('durable Session send client', () => {
     await expect(dispatchDurableSessionMessage({ post }, input))
       .rejects.toThrow('durable Session send is ambiguous: provider outcome unknown');
     expect(post).toHaveBeenCalledOnce();
+  });
+
+  it('returns only an explicit daemon-owned final receipt as trusted', async () => {
+    const post = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      kind: 'delivered',
+      messageId: 'om_scheduled_final',
+      trustedFinalDelivery: true,
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    await expect(dispatchDurableSessionMessage({ post }, input)).resolves.toEqual({
+      messageId: 'om_scheduled_final',
+      trustedFinalDelivery: true,
+    });
   });
 
   it('rejects malformed success responses', async () => {

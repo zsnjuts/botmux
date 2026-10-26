@@ -119,6 +119,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       message_id: 'om_answer_final',
       chat_id: 'oc_sess-a',
       deleted: false,
+      msg_type: 'interactive',
       sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
       body: { content: JSON.stringify(card) },
     }] });

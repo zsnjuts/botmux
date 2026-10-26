@@ -20,12 +20,14 @@ function verify(
   card: unknown,
   expectedProof = proof,
   deletion: { deleted?: boolean; omit?: boolean } = {},
+  msgType = 'interactive',
 ) {
   return verifyScheduledFinalDeliveryReadback({
     detail: { items: [{
       message_id: 'om_provider_receipt',
       chat_id: 'oc_exact',
       ...(deletion.omit ? {} : { deleted: deletion.deleted ?? false }),
+      msg_type: msgType,
       sender: { id: 'cli_exact', id_type: 'app_id', sender_type: 'app' },
       body: { content: JSON.stringify(card) },
     }] },
@@ -182,6 +184,40 @@ describe('scheduled final delivery proof', () => {
       ok: false,
       error: 'provider_message_deleted',
     });
+  });
+
+  it('rejects a non-interactive Provider message even when its JSON mimics a card', () => {
+    const card = stampScheduledFinalDeliveryProof(markGroupContextCardPurpose({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, 'message'), proof);
+
+    expect(verify(card, proof, {}, 'text')).toEqual({
+      ok: false,
+      error: 'provider_message_type_mismatch',
+    });
+  });
+
+  it('rejects body-shaped JSON without a Card 2.0 schema', () => {
+    const card = stampScheduledFinalDeliveryProof(markGroupContextCardPurpose({
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, 'message'), proof);
+
+    expect(verify(card)).toEqual({ ok: false, error: 'provider_turn_proof_missing' });
+  });
+
+  it('rejects duplicate canonical footer ids even when one carries the exact proof', () => {
+    const card = stampScheduledFinalDeliveryProof(markGroupContextCardPurpose({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, 'message'), proof);
+    card.body.elements.push({
+      tag: 'markdown',
+      element_id: 'botmux_reply_footer',
+      content: 'duplicate footer',
+    });
+
+    expect(verify(card)).toEqual({ ok: false, error: 'provider_turn_proof_missing' });
   });
 
   it('rejects the exact proof link when it appears only in body text', () => {

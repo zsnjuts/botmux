@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { projectGroupContextCard } from '../im/lark/group-context-card.js';
 import {
   containsReplyCardFooterElementId,
+  countReplyCardFooterElementIds,
   findReplyCardFooterComponent,
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
@@ -161,9 +162,12 @@ function footerHasExactProofLink(content: string, proof: string): boolean {
  * data, not delivery-proof components. */
 function hasProviderFooterProof(value: unknown, proof: string): boolean {
   const root = providerCardRoot(value);
+  if (root?.schema !== '2.0') return false;
   const body = root?.body;
   if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
-  const footer = findReplyCardFooterComponent((body as Record<string, unknown>).elements);
+  const elements = (body as Record<string, unknown>).elements;
+  if (countReplyCardFooterElementIds(elements) !== 1) return false;
+  const footer = findReplyCardFooterComponent(elements);
   return footer?.tag === 'markdown'
     && footer.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
     && typeof footer.content === 'string'
@@ -192,6 +196,9 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   }
   if (item.deleted !== false) return { ok: false, error: 'provider_message_deleted' };
   if (item.chat_id !== input.chatId) return { ok: false, error: 'provider_chat_mismatch' };
+  if (item.msg_type !== 'interactive') {
+    return { ok: false, error: 'provider_message_type_mismatch' };
+  }
   const sender = item.sender;
   const senderType = sender?.sender_type;
   const senderIdType = sender?.id_type ?? sender?.sender_id_type;

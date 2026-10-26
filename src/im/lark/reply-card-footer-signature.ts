@@ -37,20 +37,28 @@ export function findReplyCardFooterComponent(
 /** Detect a reserved-id collision in the same documented component slots,
  * including a malformed non-markdown component that cannot serve as footer. */
 export function containsReplyCardFooterElementId(elements: unknown): boolean {
-  if (!Array.isArray(elements)) return false;
+  return countReplyCardFooterElementIds(elements) > 0;
+}
+
+/** Count reserved footer ids in the same real component slots. Provider
+ * receipt verification requires exactly one, including malformed collisions. */
+export function countReplyCardFooterElementIds(elements: unknown): number {
+  if (!Array.isArray(elements)) return 0;
+  let count = 0;
   for (const element of elements) {
     if (!element || typeof element !== 'object' || Array.isArray(element)) continue;
     const component = element as Record<string, unknown>;
-    if (component.element_id === REPLY_CARD_FOOTER_ELEMENT_ID) return true;
+    if (component.element_id === REPLY_CARD_FOOTER_ELEMENT_ID) count += 1;
     if (component.tag !== 'column_set' || !Array.isArray(component.columns)) continue;
     for (const column of component.columns) {
       if (!column || typeof column !== 'object' || Array.isArray(column)) continue;
       const columnComponent = column as Record<string, unknown>;
-      if (columnComponent.tag === 'column'
-          && containsReplyCardFooterElementId(columnComponent.elements)) return true;
+      if (columnComponent.tag === 'column') {
+        count += countReplyCardFooterElementIds(columnComponent.elements);
+      }
     }
   }
-  return false;
+  return count;
 }
 
 /** Promoted H1/H2 heading widgets encode their original ATX level in the

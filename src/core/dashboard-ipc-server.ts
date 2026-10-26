@@ -411,11 +411,12 @@ export interface DurableSessionSendRequest {
   content: string;
   msgType: string;
   providerUuid: string;
+  responseKind: 'progress' | 'final' | 'auxiliary';
   hookContext?: Record<string, unknown>;
 }
 
 export type DurableSessionSendResult =
-  | { kind: 'delivered'; messageId: string }
+  | { kind: 'delivered'; messageId: string; trustedFinalDelivery?: true }
   | { kind: 'ambiguous'; error: string };
 
 let durableSessionSendHandler: ((
@@ -1960,6 +1961,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       || typeof body.content !== 'string'
       || typeof body.msgType !== 'string'
       || typeof body.providerUuid !== 'string'
+      || (body.responseKind !== 'progress'
+        && body.responseKind !== 'final'
+        && body.responseKind !== 'auxiliary')
       || !target || typeof target !== 'object' || Array.isArray(target)
       || (hookContext !== undefined
         && (!hookContext || typeof hookContext !== 'object' || Array.isArray(hookContext)))) {
@@ -1973,6 +1977,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       content: body.content,
       msgType: body.msgType,
       providerUuid: body.providerUuid,
+      responseKind: body.responseKind,
       ...(hookContext === undefined ? {} : { hookContext: hookContext as Record<string, unknown> }),
     });
     return result.kind === 'delivered'

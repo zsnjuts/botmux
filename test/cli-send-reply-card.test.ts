@@ -538,6 +538,7 @@ describe('real CLI send into a running reply card', () => {
           turnId: key.turnId,
           target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
           msgType: 'interactive',
+          responseKind: 'final',
           providerUuid: expect.stringMatching(/^dps_/),
         },
       });
@@ -570,6 +571,87 @@ describe('real CLI send into a running reply card', () => {
       expect(String(blocked.stderr)).toContain('durable primary 当前只支持单条文本/卡片消息');
       expect(String(blocked.stdout)).not.toContain('CAPTURE_DURABLE=');
       expect(String(blocked.stdout)).not.toContain('CAPTURE_REPLY=');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
+  it('uses a primary daemon-owned scheduled final receipt for same-turn self cleanup', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-durable-scheduled-'));
+    const dataDir = join(root, 'data');
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId,
+        larkAppSecret: 'test-secret',
+        cliId: 'claude-code',
+        replyCardMode: 'unified',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key,
+        turnId,
+        status: 'active',
+        cliId: 'claude-code',
+        workerGeneration: 7,
+        chatId: 'oc_test',
+        rootMessageId: 'om_root',
+        scope: 'thread',
+        chatType: 'group',
+        workingDir: root,
+        replyTargets: { [turnId]: {
+          updatedAt: new Date().toISOString(),
+          senderOpenId: 'ou_requester',
+          participants: [{ openId: 'ou_requester', isBot: false }],
+        } },
+        turnReplyContexts: { [turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_root' },
+          replyTargetSenderOpenId: 'ou_requester',
+          replyTargetSenderIsBot: false,
+        } },
+      } });
+
+      const result = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--response-kind', 'final', '--schedule-remove-self',
+        'Durable scheduled final',
+      ], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: {
+          PATH: process.env.PATH,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId,
+          BOTMUX_TURN_ID: turnId,
+          BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_COORDINATION_MODE: 'primary',
+          BOTMUX_DAEMON_IPC_PORT: '7951',
+          BOTMUX_TEST_DURABLE_SEND: '1',
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      expect(requests.map(request => request.path)).toEqual([
+        `/api/sessions/${key.sessionId}/durable-send`,
+        '/api/schedule/managed-mutate',
+      ]);
+      expect(requests[0].body).toMatchObject({
+        turnId,
+        responseKind: 'final',
+      });
+      expect(requests[0].body.content).toContain('bmxsfr_');
+      expect(String(result.stdout)).not.toContain('/turn-delivery');
+      expect(JSON.parse(String(result.stdout).split('\n').findLast(line => line.startsWith('{'))!))
+        .toMatchObject({ scheduleSelfCleanup: { removed: true, taskId: 'a1b2c3d4' } });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
