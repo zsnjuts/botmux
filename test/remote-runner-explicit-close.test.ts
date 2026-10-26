@@ -54,6 +54,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  __testOnly_remoteRunnerCloseResultTimeoutMs,
   __testOnly_setRemoteRunnerExplicitCloseWake,
   __testOnly_setupWorkerHandlers,
   __testOnly_wakeRemoteRunnerWorkerForExplicitClose,
@@ -154,6 +155,13 @@ afterEach(() => {
 });
 
 describe('remote runner explicit close', () => {
+  it('keeps the close-result wait above the normalized operation budget', () => {
+    expect(__testOnly_remoteRunnerCloseResultTimeoutMs(undefined)).toBe(35_000);
+    expect(__testOnly_remoteRunnerCloseResultTimeoutMs(900_000)).toBe(905_000);
+    expect(__testOnly_remoteRunnerCloseResultTimeoutMs(1_200_000)).toBe(1_205_000);
+    expect(__testOnly_remoteRunnerCloseResultTimeoutMs(1_200_001)).toBe(35_000);
+  });
+
   it('uses prepare/commit before publishing a live remote session closed', async () => {
     const { ds, worker } = createFixture(true);
 

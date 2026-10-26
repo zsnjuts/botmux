@@ -143,7 +143,10 @@ import {
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
-import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
+import {
+  REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
+  type RemoteRunnerConfig,
+} from '../adapters/backend/remote-runner-config.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
@@ -7110,6 +7113,18 @@ async function abortLiveRemoteWorkerClose(
   return false;
 }
 
+export function __testOnly_remoteRunnerCloseResultTimeoutMs(
+  operationTimeoutMs: number | undefined,
+): number {
+  const normalized = typeof operationTimeoutMs === 'number'
+      && Number.isSafeInteger(operationTimeoutMs)
+      && operationTimeoutMs >= 100
+      && operationTimeoutMs <= REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS
+    ? operationTimeoutMs
+    : 30_000;
+  return normalized + 5_000;
+}
+
 async function prepareLiveRemoteWorkerClose(
   ds: DaemonSession,
   backendType: 'riff' | 'mojo' | 'remote-runner',
@@ -7341,7 +7356,7 @@ async function prepareLiveRemoteWorkerClose(
     const closeResultTimeoutMs = backendType === 'mojo'
       ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS
       : backendType === 'remote-runner'
-        ? Math.min(305_000, Math.max(5_000, remoteRunnerOperationTimeoutMs! + 5_000))
+        ? __testOnly_remoteRunnerCloseResultTimeoutMs(remoteRunnerOperationTimeoutMs)
         : 23_000;
     const timer = setTimeout(
       // A timed-out prepare may still be running remotely; the outcome is unknown.
