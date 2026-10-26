@@ -399,6 +399,320 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ));
   });
 
+  it('queues durable /close when a botmux send card uses an untyped app id and a distinct open_bot_id literal', async () => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_stale_cached_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_durable_bot_card_close';
+    const session = seedThreadSession(anchor, 'durable bot card close');
+    const queuedControl = vi.fn();
+    const rawText = '/close @ou_actual_card_self_bot';
+    const event = makeBotEventData('om_durable_bot_card_close', rawText, anchor);
+    event.message.message_type = 'interactive';
+    event.message.content = JSON.stringify({
+      user_dsl: JSON.stringify({
+        schema: '2.0',
+        body: { elements: [{ tag: 'markdown', content: rawText }] },
+      }),
+    });
+    event.message.mentions = [{
+      key: '@_user_1',
+      name: 'TargetBot',
+      id: APP,
+    }];
+    const ctx = {
+      ...makeCtx(anchor, 'om_durable_bot_card_close'),
+      queuePostAdmissionControl: queuedControl,
+    };
+
+    await handleThreadReply(event, ctx);
+
+    expect(queuedControl).toHaveBeenCalledOnce();
+    expect(queuedControl).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: `lark-command.session-control:${APP}:om_durable_bot_card_close`,
+      lane: 'session-control',
+      payload: expect.objectContaining({
+        type: 'botmux.session.control',
+        action: 'close',
+        sessionId: session.session.sessionId,
+        operatorOpenId: 'ou_proposer_bot',
+      }),
+    }));
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(repliedText()).not.toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
+  it('queues durable /close from the exact live event plus REST-resolved native at-tag shapes', async () => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_event_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_live_shape_bot_card_close';
+    const session = seedThreadSession(anchor, 'live shape durable bot card close');
+    const queuedControl = vi.fn();
+    const messageId = 'om_live_shape_bot_card_close';
+    const cardOpenBotId = 'ou_card_self_bot';
+    const event = makeBotEventData(messageId, '/close', anchor);
+    event.message.message_type = 'interactive';
+    event.message.content = JSON.stringify({
+      title: null,
+      elements: [[
+        { tag: 'img', image_key: 'img_fallback' },
+        { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+      ]],
+      user_dsl: JSON.stringify({
+        schema: '2.0',
+        body: {
+          elements: [{
+            tag: 'markdown',
+            content: `/close <at id=${cardOpenBotId} mention_key=@_user_1></at>`,
+          }],
+        },
+      }),
+    });
+    event.message.mentions = [{
+      key: '@_user_1',
+      name: 'TargetBot',
+      id: {
+        open_id: 'ou_event_self_bot',
+        user_id: '',
+        union_id: 'on_event_self_bot',
+      },
+      mentioned_type: 'bot',
+    }];
+    mocks.getMessageDetail
+      .mockResolvedValueOnce({
+        items: [{
+          msg_type: 'interactive',
+          body: {
+            content: JSON.stringify({
+              title: null,
+              elements: [[
+                { tag: 'img', image_key: 'img_fallback' },
+                { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+              ]],
+            }),
+          },
+        }],
+      })
+      .mockResolvedValueOnce({
+        items: [{
+          msg_type: 'interactive',
+          body: {
+            content: JSON.stringify({
+              schema: '2.0',
+              body: {
+                elements: [{
+                  tag: 'markdown',
+                  content: `/close <at id=${cardOpenBotId}></at>`,
+                }],
+              },
+            }),
+          },
+        }],
+      });
+    const ctx = {
+      ...makeCtx(anchor, messageId),
+      queuePostAdmissionControl: queuedControl,
+    };
+
+    await handleThreadReply(event, ctx);
+
+    expect(queuedControl).toHaveBeenCalledOnce();
+    expect(queuedControl).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: `lark-command.session-control:${APP}:${messageId}`,
+      lane: 'session-control',
+      payload: expect.objectContaining({
+        type: 'botmux.session.control',
+        action: 'close',
+        sessionId: session.session.sessionId,
+        operatorOpenId: 'ou_proposer_bot',
+      }),
+    }));
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(repliedText()).not.toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
+  it('keeps a botmux send card without self mention evidence outside the durable close path', async () => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_stale_cached_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_card_close_without_self_evidence';
+    const session = seedThreadSession(anchor, 'card close without self evidence');
+    const queuedControl = vi.fn();
+    const rawText = '/close @ou_actual_card_self_bot';
+    const event = makeBotEventData('om_card_close_without_self_evidence', rawText, anchor);
+    event.message.message_type = 'interactive';
+    event.message.content = JSON.stringify({
+      user_dsl: JSON.stringify({
+        schema: '2.0',
+        body: { elements: [{ tag: 'markdown', content: rawText }] },
+      }),
+    });
+    const ctx = {
+      ...makeCtx(anchor, 'om_card_close_without_self_evidence'),
+      queuePostAdmissionControl: queuedControl,
+    };
+    const previousMode = process.env.BOTMUX_COORDINATION_MODE;
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      await handleThreadReply(event, ctx);
+    } finally {
+      if (previousMode === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+      else process.env.BOTMUX_COORDINATION_MODE = previousMode;
+    }
+
+    expect(queuedControl).not.toHaveBeenCalled();
+    expect(session.session.status).toBe('active');
+    expect(repliedText()).toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
+  it('keeps a foreign card mention outside the durable close path', async () => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_stale_cached_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_foreign_card_close';
+    const session = seedThreadSession(anchor, 'foreign card close');
+    const queuedControl = vi.fn();
+    const rawText = '/close @ou_other_bot';
+    const event = makeBotEventData('om_foreign_card_close', rawText, anchor);
+    event.message.message_type = 'interactive';
+    event.message.content = JSON.stringify({
+      user_dsl: JSON.stringify({
+        schema: '2.0',
+        body: { elements: [{ tag: 'markdown', content: rawText }] },
+      }),
+    });
+    event.message.mentions = [
+      {
+        key: '@_user_1',
+        name: 'TargetBot',
+        id: APP,
+      },
+      {
+        key: '@_user_2',
+        name: 'PeerBot',
+        id: 'cli_other_bot',
+        id_type: 'app_id',
+      },
+    ];
+    const ctx = {
+      ...makeCtx(anchor, 'om_foreign_card_close'),
+      queuePostAdmissionControl: queuedControl,
+    };
+    const previousMode = process.env.BOTMUX_COORDINATION_MODE;
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      await handleThreadReply(event, ctx);
+    } finally {
+      if (previousMode === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+      else process.env.BOTMUX_COORDINATION_MODE = previousMode;
+    }
+
+    expect(queuedControl).not.toHaveBeenCalled();
+    expect(session.session.status).toBe('active');
+    expect(repliedText()).toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
+  it('keeps a human-origin interactive /close outside the durable close path', async () => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_self_bot';
+    const anchor = 'om_thread_human_card_close';
+    const session = seedThreadSession(anchor, 'human card close');
+    const queuedControl = vi.fn();
+    const rawText = '@_self /close';
+    const event = makeEventData('om_human_card_close', rawText, anchor);
+    event.message.message_type = 'interactive';
+    event.message.content = JSON.stringify({
+      user_dsl: JSON.stringify({
+        schema: '2.0',
+        body: { elements: [{ tag: 'markdown', content: rawText }] },
+      }),
+    });
+    event.message.mentions = [{
+      key: '@_self',
+      name: 'TargetBot',
+      id: { open_id: 'ou_self_bot' },
+      id_type: 'open_id',
+    }];
+    const ctx = {
+      ...makeCtx(anchor, 'om_human_card_close'),
+      queuePostAdmissionControl: queuedControl,
+    };
+    const previousMode = process.env.BOTMUX_COORDINATION_MODE;
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      await handleThreadReply(event, ctx);
+    } finally {
+      if (previousMode === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+      else process.env.BOTMUX_COORDINATION_MODE = previousMode;
+    }
+
+    expect(queuedControl).not.toHaveBeenCalled();
+    expect(session.session.status).toBe('active');
+    expect(repliedText()).toContain(tr(
+      'cmd.close.primary_unsupported',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
+  it('keeps botmux send interactive /close arguments outside the durable close path', async () => {
+    const bot = getBot(APP);
+    bot.botOpenId = 'ou_stale_cached_self_bot';
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_durable_bot_card_close_arg';
+    seedThreadSession(anchor, 'durable bot card close arg');
+    const queuedControl = vi.fn();
+    const rawText = '/close wt @ou_actual_card_self_bot';
+    const event = makeBotEventData('om_durable_bot_card_close_arg', rawText, anchor);
+    event.message.message_type = 'interactive';
+    event.message.content = JSON.stringify({
+      user_dsl: JSON.stringify({
+        schema: '2.0',
+        body: { elements: [{ tag: 'markdown', content: rawText }] },
+      }),
+    });
+    event.message.mentions = [{
+      key: '@_user_1',
+      name: 'TargetBot',
+      id: APP,
+    }];
+    const ctx = {
+      ...makeCtx(anchor, 'om_durable_bot_card_close_arg'),
+      queuePostAdmissionControl: queuedControl,
+    };
+
+    await handleThreadReply(event, ctx);
+
+    expect(queuedControl).not.toHaveBeenCalled();
+    expect(repliedText()).toContain(tr(
+      'cmd.close.worktree_not_linked',
+      undefined,
+      localeForBot(APP),
+    ));
+  });
+
   it('does not create a phantom session when /close is repeated after the route is closed', async () => {
     const bot = getBot(APP);
     bot.botOpenId = 'ou_self_bot';

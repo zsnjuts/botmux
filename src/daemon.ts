@@ -28405,11 +28405,83 @@ interface ThreadSlashContext {
   getThreadSender: () => Promise<Parameters<typeof setDirectChatDisplayNameFromSender>[2]>;
 }
 
+function isExactInteractiveCloseContent(content: string, selfMentionNames: readonly string[]): boolean {
+  const normalized = content.trim().toLowerCase();
+  let mentionToken: string;
+  if (normalized.startsWith('/close ')) {
+    mentionToken = normalized.slice('/close '.length).trim();
+  } else if (normalized.endsWith(' /close')) {
+    mentionToken = normalized.slice(0, -' /close'.length).trim();
+  } else {
+    return false;
+  }
+  if (/^@ou_[a-z0-9_-]+$/.test(mentionToken)) return true;
+  if (selfMentionNames.some(name => mentionToken === `@${name.trim().toLowerCase()}`)) return true;
+
+  // REST-resolved Card 2.0 markdown retains a native `<at>` tag. Accept only
+  // the empty single-target shape emitted by Lark; arbitrary attributes, inner
+  // text, duplicate ids and non-open-id targets remain ordinary card content.
+  const inlineAt = mentionToken.match(/^<at\s+(.+?)(?:\/>|>\s*<\/at>)$/i);
+  if (!inlineAt) return false;
+  let sawId = false;
+  let sawMentionKey = false;
+  for (const attribute of inlineAt[1].trim().split(/\s+/)) {
+    const equals = attribute.indexOf('=');
+    if (equals <= 0 || equals === attribute.length - 1) return false;
+    const key = attribute.slice(0, equals).toLowerCase();
+    let value = attribute.slice(equals + 1);
+    if ((value.startsWith('"') && value.endsWith('"'))
+        || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key === 'id') {
+      if (sawId || !/^ou_[a-z0-9_-]+$/i.test(value)) return false;
+      sawId = true;
+      continue;
+    }
+    if (key === 'mention_key') {
+      if (sawMentionKey || !/^@_user_\d+$/i.test(value)) return false;
+      sawMentionKey = true;
+      continue;
+    }
+    return false;
+  }
+  return sawId;
+}
+
 function isExactDurableCloseCommand(
   data: any,
   larkAppId: string,
+  trustedInteractiveBotContent?: string,
 ): boolean {
   const message = data?.message;
+  // `botmux send` renders structured bot-to-bot messages as an interactive
+  // card. A real card can describe its receiver as an app_id mention (sometimes
+  // omitting `id_type`) while the resolved markdown keeps a different
+  // namespace's inline `<at id=ou_...></at>` (or rendered `@ou_...`) token, so
+  // neither the mention key nor the cached bot open_id can remove that token.
+  // Treat an exact current-app id as the structured addressing proof; do not
+  // infer other untyped `cli_` values. Then accept only `/close` plus one native
+  // mention token (either order).
+  // No mention evidence, any foreign structured mention, a second open-id token
+  // or any argument remains outside the durable close path. The caller has
+  // already admitted this bot sender through canRunDaemonCommand.
+  if (message?.message_type === 'interactive') {
+    const content = trustedInteractiveBotContent?.trim().toLowerCase();
+    if (!content) return false;
+    const botOpenId = getBot(larkAppId).botOpenId;
+    const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+    const isSelfMention = (mention: any): boolean => mentionAppId(mention) === larkAppId
+      || (typeof mention?.id === 'string' && mention.id === larkAppId)
+      || (!!botOpenId && mentionOpenId(mention) === botOpenId);
+    if (!mentions.some(isSelfMention) || mentions.some((mention: any) => !isSelfMention(mention))) {
+      return false;
+    }
+    const selfMentionNames = mentions
+      .map((mention: any) => typeof mention?.name === 'string' ? mention.name.trim() : '')
+      .filter(Boolean);
+    return isExactInteractiveCloseContent(content, selfMentionNames);
+  }
   if (message?.message_type !== 'text') return false;
   let body: unknown;
   try { body = JSON.parse(message.content ?? '{}'); } catch { return false; }
@@ -28720,7 +28792,11 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // 负责，当前副本消失后仍可恢复。`/close wt` 暂时保留原确认流程，等待
       // worktree retirement 接入同一套分布式协议。
       if (cmd === '/close'
-          && isExactDurableCloseCommand(data, larkAppId)
+          && isExactDurableCloseCommand(
+            data,
+            larkAppId,
+            isBotSenderType || isForeignBotSender ? commandContent : undefined,
+          )
           && existingDs
           && senderOpenId
           && ctx.queuePostAdmissionControl) {
