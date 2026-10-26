@@ -151,6 +151,12 @@ if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK
       body,
     }));
     if (target.pathname.endsWith('/turn-delivery')) {
+      if (process.env.BOTMUX_TEST_TURN_DELIVERY_FAIL === '1') {
+        return new Response(JSON.stringify({ ok: false, error: 'receipt unavailable' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       if (process.env.BOTMUX_TEST_LEGACY_TURN_DELIVERY === '1') {
         return new Response(JSON.stringify({ ok: true, deliveryId: 'legacy', duplicate: false }), {
           status: 200,

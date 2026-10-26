@@ -112,7 +112,7 @@ describe('botmux send per-turn final idempotency', () => {
       const original = readFileSync(recordPath, 'utf8');
       const retry = f.run('final', 'answer', [], state);
       expect(retry.result.status, String(retry.result.stderr)).toBe(0);
-      expect(JSON.parse(String(retry.result.stdout).trim())).toMatchObject({
+      expect(JSON.parse(String(retry.result.stdout).split('\n').findLast(line => line.startsWith('{'))!)).toMatchObject({
         messageId: 'om_separate_message', replayed: true,
       });
       expect(retry.requests).toHaveLength(0);
@@ -286,7 +286,16 @@ describe('botmux send per-turn final idempotency', () => {
 
   it('keeps a scheduled turn current when first-final cleanup cannot reach its daemon', () => {
     const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
-    const f = createFixture(undefined, { scope: 'chat' }, scheduledTurn);
+    const f = createFixture(
+      undefined,
+      { scope: 'chat', workerGeneration: 7 },
+      scheduledTurn,
+      {
+        BOTMUX_DAEMON_IPC_PORT: '7951',
+        BOTMUX_TEST_DURABLE_SEND: '1',
+        BOTMUX_TEST_TURN_DELIVERY_FAIL: '1',
+      },
+    );
     try {
       const markerPath = join(f.dataDir, '.botmux-cli-pids', String(process.pid));
       writeFileSync(markerPath, JSON.stringify({
@@ -316,7 +325,16 @@ describe('botmux send per-turn final idempotency', () => {
 
   it('keeps a scheduled turn current when replayed final cleanup cannot reach its daemon', () => {
     const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
-    const f = createFixture(undefined, { scope: 'chat' }, scheduledTurn);
+    const f = createFixture(
+      undefined,
+      { scope: 'chat', workerGeneration: 7 },
+      scheduledTurn,
+      {
+        BOTMUX_DAEMON_IPC_PORT: '7951',
+        BOTMUX_TEST_DURABLE_SEND: '1',
+        BOTMUX_TEST_TURN_DELIVERY_FAIL: '1',
+      },
+    );
     try {
       const first = f.run('final', 'scheduled answer');
       expect(first.result.status, String(first.result.stderr)).toBe(0);
@@ -333,7 +351,7 @@ describe('botmux send per-turn final idempotency', () => {
       expect(retry.result.status, String(retry.result.stderr)).toBe(0);
       expect(retry.requests).toHaveLength(0);
       expect(String(retry.result.stderr)).toContain('当前 turn 已保留');
-      expect(JSON.parse(String(retry.result.stdout).trim())).toMatchObject({
+      expect(JSON.parse(String(retry.result.stdout).split('\n').findLast(line => line.startsWith('{'))!)).toMatchObject({
         replayed: true,
         scheduleSelfCleanup: {
           requested: true,
@@ -434,14 +452,15 @@ describe('botmux send per-turn final idempotency', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
 
-  it('refuses a primary scheduled final before Provider IPC when generation is unavailable', () => {
+  it.each([undefined, 0])(
+    'refuses every scheduled final before Provider IPC when generation is %s',
+    workerGeneration => {
     const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
     const f = createFixture(
       undefined,
-      { scope: 'chat' },
+      { scope: 'chat', ...(workerGeneration === undefined ? {} : { workerGeneration }) },
       scheduledTurn,
       {
-        BOTMUX_COORDINATION_MODE: 'primary',
         BOTMUX_DAEMON_IPC_PORT: '7951',
         BOTMUX_TEST_DURABLE_SEND: '1',
       },
@@ -451,9 +470,11 @@ describe('botmux send per-turn final idempotency', () => {
       expect(sent.result.status).not.toBe(0);
       expect(String(sent.result.stderr)).toContain('trusted receipt identity');
       expect(String(sent.result.stdout)).not.toContain('CAPTURE_DURABLE=');
+      expect(String(sent.result.stdout)).not.toContain('CAPTURE_REPLY=');
       expect(sent.requests).toHaveLength(0);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
-  }, 40_000);
+    }, 40_000,
+  );
 
   it('promotes auxiliary to final and quotes queued turn when active turn has delivered final and successor has not', () => {
     const f = createFixture(undefined, {

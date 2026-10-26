@@ -22,8 +22,9 @@ function visitCardComponents(
   elements: unknown,
   visit: (component: Record<string, unknown>) => boolean | void,
 ): boolean {
-  if (!Array.isArray(elements)) return false;
-  for (const element of elements) {
+  if (elements === undefined || elements === null) return false;
+  const children = Array.isArray(elements) ? elements : [elements];
+  for (const element of children) {
     if (!element || typeof element !== 'object' || Array.isArray(element)) continue;
     const component = element as Record<string, unknown>;
     if (visit(component) === true) return true;
@@ -31,9 +32,13 @@ function visitCardComponents(
       if (visitCardComponents(component.columns, visit)) return true;
     } else if (component.tag === 'action') {
       if (visitCardComponents(component.actions, visit)) return true;
-    } else if (typeof component.tag === 'string'
-        && ELEMENT_CONTAINER_TAGS.has(component.tag)
-        && visitCardComponents(component.elements, visit)) return true;
+    } else {
+      if (component.tag === 'div'
+          && visitCardComponents(component.extra, visit)) return true;
+      if (typeof component.tag === 'string'
+          && ELEMENT_CONTAINER_TAGS.has(component.tag)
+          && visitCardComponents(component.elements, visit)) return true;
+    }
   }
   return false;
 }

@@ -48,6 +48,8 @@ describe('scheduled final delivery proof', () => {
       workerGeneration: 7,
       dispatchAttempt: 3,
     })).not.toBe(proof);
+    expect(deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 0 })).toBeUndefined();
+    expect(deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: Number.NaN })).toBeUndefined();
   });
 
   it('matches only the versioned exact trusted-receipt tuple', () => {
@@ -282,6 +284,21 @@ describe('scheduled final delivery proof', () => {
         element_id: 'botmux_reply_footer',
         content: 'nested duplicate',
       }],
+    });
+
+    expect(verify(card)).toEqual({ ok: false, error: 'provider_turn_proof_missing' });
+  });
+
+  it('rejects a duplicate reserved footer id in a real div.extra component slot', () => {
+    const stamped = stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, proof);
+    const card = markGroupContextCardPurpose(stamped, 'message');
+    card.body.elements.unshift({
+      tag: 'div',
+      text: { tag: 'lark_md', content: 'preview' },
+      extra: { tag: 'img', element_id: 'botmux_reply_footer', img_key: 'img_v3_duplicate' },
     });
 
     expect(verify(card)).toEqual({ ok: false, error: 'provider_turn_proof_missing' });

@@ -11723,6 +11723,11 @@ async function cmdSend(rest: string[]): Promise<void> {
     }));
     return;
   }
+  if (scheduledTurn && effectiveResponseKind === 'final'
+      && (!scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof)) {
+    console.error('botmux send refused: scheduled final requires a trusted receipt identity');
+    process.exit(2);
+  }
   // Register bots so the downstream Lark client works. registerBot is
   // idempotent, so all send paths reuse these same clients.
   // envPinnedRiffBot is re-registered LAST so a remote env credential is never
