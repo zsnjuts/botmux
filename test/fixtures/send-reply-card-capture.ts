@@ -178,14 +178,25 @@ if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK
         }), { status: 200, headers: { 'content-type': 'application/json' } });
       }
     }
+    const scheduledProof = body?.responseKind === 'final'
+      && typeof body?.turnId === 'string'
+      && body.turnId.startsWith('schedule:')
+      && typeof body?.content === 'string'
+      ? body.content.match(/#(bmxsfr_[0-9a-f]{13})/)?.[1]
+      : undefined;
     return new Response(JSON.stringify({
       ok: true,
       kind: 'delivered',
       messageId: 'om_durable_message',
-      ...(body?.responseKind === 'final'
-        && typeof body?.turnId === 'string'
-        && body.turnId.startsWith('schedule:')
-        ? { trustedFinalDelivery: true }
+      ...(scheduledProof
+        ? { trustedFinalReceipt: {
+            domain: 'botmux.scheduled-final-receipt.v1',
+            trusted: true,
+            messageId: 'om_durable_message',
+            turnId: body.turnId,
+            workerGeneration: 7,
+            proof: scheduledProof,
+          } }
         : {}),
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   });

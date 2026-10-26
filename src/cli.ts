@@ -11495,6 +11495,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (effectiveResponseKind !== 'final'
         || !currentTurnId
         || receiptTargetChatId !== s.chatId) return false;
+    if (scheduledTurn && (!scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof)) {
+      console.error('botmux send: scheduled trusted final identity is unavailable');
+      return false;
+    }
     if (daemonOwnedFinalDeliveryMessageId === messageId) return true;
     trustedFinalDeliveryReport ??= (async () => {
       let discoveredPort: number | undefined;
@@ -12643,6 +12647,10 @@ async function cmdSend(rest: string[]): Promise<void> {
       if (!durableIpcPort) {
         throw new Error('durable primary send requires the owning daemon IPC port');
       }
+      if (scheduledTurn && effectiveResponseKind === 'final'
+          && (!scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof)) {
+        throw new Error('durable primary scheduled final requires a trusted receipt identity');
+      }
       const delivery = await dispatchDurableSessionMessage({
         post: (sessionId, route, payload) => postSessionCliIpc(
           durableIpcPort,
@@ -12657,6 +12665,17 @@ async function cmdSend(rest: string[]): Promise<void> {
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
         responseKind: effectiveResponseKind,
+        ...(scheduledTurn && effectiveResponseKind === 'final'
+          && scheduledFinalDeliveryIdentity && scheduledFinalDeliveryProof
+          ? { expectedReceipt: {
+              turnId: scheduledFinalDeliveryIdentity.turnId,
+              workerGeneration: scheduledFinalDeliveryIdentity.workerGeneration,
+              ...(scheduledFinalDeliveryIdentity.dispatchAttempt !== undefined
+                ? { dispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
+                : {}),
+              proof: scheduledFinalDeliveryProof,
+            } }
+          : {}),
         providerUuid: effectiveResponseKind === 'final'
           ? durablePrimaryFinalProviderUuid({
               larkAppId: appId,
@@ -12667,8 +12686,8 @@ async function cmdSend(rest: string[]): Promise<void> {
           : uuid ?? `dms_${randomUUID().replace(/-/g, '')}`,
         hookContext,
       });
-      if (delivery.trustedFinalDelivery) {
-        daemonOwnedFinalDeliveryMessageId = delivery.messageId;
+      if (delivery.trustedFinalReceipt) {
+        daemonOwnedFinalDeliveryMessageId = delivery.trustedFinalReceipt.messageId;
       }
       primaryQuotedId = canonicalOutput.quoteTargetId ?? null;
       return delivery.messageId;

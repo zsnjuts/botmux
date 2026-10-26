@@ -434,6 +434,27 @@ describe('botmux send per-turn final idempotency', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
 
+  it('refuses a primary scheduled final before Provider IPC when generation is unavailable', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const f = createFixture(
+      undefined,
+      { scope: 'chat' },
+      scheduledTurn,
+      {
+        BOTMUX_COORDINATION_MODE: 'primary',
+        BOTMUX_DAEMON_IPC_PORT: '7951',
+        BOTMUX_TEST_DURABLE_SEND: '1',
+      },
+    );
+    try {
+      const sent = f.run('final', 'scheduled answer');
+      expect(sent.result.status).not.toBe(0);
+      expect(String(sent.result.stderr)).toContain('trusted receipt identity');
+      expect(String(sent.result.stdout)).not.toContain('CAPTURE_DURABLE=');
+      expect(sent.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
   it('promotes auxiliary to final and quotes queued turn when active turn has delivered final and successor has not', () => {
     const f = createFixture(undefined, {
       scope: 'chat',

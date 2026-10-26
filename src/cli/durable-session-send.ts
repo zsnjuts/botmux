@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 import { isConfirmedLarkMessageId } from '../core/scheduled-run-settlement.js';
+import {
+  matchesScheduledFinalReceiptEnvelope,
+  scheduledFinalReceiptEnvelope,
+  type ScheduledFinalReceiptEnvelope,
+} from '../core/scheduled-final-delivery-proof.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
 import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
@@ -26,12 +31,18 @@ export interface DurableSessionSendInput {
   msgType: string;
   providerUuid: string;
   responseKind: TurnSendKind;
+  expectedReceipt?: {
+    turnId: string;
+    workerGeneration: number;
+    dispatchAttempt?: number;
+    proof: string;
+  };
   hookContext?: Record<string, unknown>;
 }
 
 export interface DurableSessionDelivery {
   messageId: string;
-  trustedFinalDelivery: boolean;
+  trustedFinalReceipt?: ScheduledFinalReceiptEnvelope;
 }
 
 export interface DurableSessionSendDeps {
@@ -48,7 +59,7 @@ type DurableSessionSendResponse = {
   ok?: boolean;
   kind?: string;
   messageId?: string;
-  trustedFinalDelivery?: boolean;
+  trustedFinalReceipt?: unknown;
   error?: string;
 };
 
@@ -91,10 +102,17 @@ export async function dispatchDurableSessionMessage(
     const body = await response.json().catch(() => ({})) as DurableSessionSendResponse;
     if (response.ok && body.ok === true && body.kind === 'delivered'
         && isConfirmedLarkMessageId(body.messageId)) {
-      return {
-        messageId: body.messageId,
-        trustedFinalDelivery: body.trustedFinalDelivery === true,
-      };
+      const expected = input.expectedReceipt
+        ? scheduledFinalReceiptEnvelope({
+            messageId: body.messageId,
+            ...input.expectedReceipt,
+          })
+        : undefined;
+      const trustedFinalReceipt = expected
+        && matchesScheduledFinalReceiptEnvelope(body.trustedFinalReceipt, expected)
+        ? expected
+        : undefined;
+      return { messageId: body.messageId, ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}) };
     }
     const detail = typeof body.error === 'string' && body.error.trim()
       ? body.error.trim()

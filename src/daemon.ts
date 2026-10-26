@@ -554,6 +554,10 @@ import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/sche
 import { resolveScheduleReferenceTime } from './core/schedule-reference-time.js';
 import { scheduleRequiresReferenceTime } from './core/scheduler.js';
 import {
+  deriveScheduledFinalDeliveryProof,
+  scheduledFinalReceiptEnvelope,
+} from './core/scheduled-final-delivery-proof.js';
+import {
   executeScheduledRunAwaitingSettlement,
   isConfirmedLarkMessageId,
   observeScheduledRunDaemonProviderDelivery,
@@ -32185,8 +32189,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ? scheduleAuthorityStore?.getRecord(request.daemonSession.larkAppId, scheduledTaskId)
           : undefined,
       });
+      const receiptWorkerGeneration = request.daemonSession.workerGeneration;
+      const receiptDispatchAttempt = request.daemonSession.managedTurnOrigin?.dispatchAttempt;
+      const receiptProof = typeof receiptWorkerGeneration === 'number'
+        ? deriveScheduledFinalDeliveryProof({
+            turnId: request.turnId,
+            workerGeneration: receiptWorkerGeneration,
+            ...(receiptDispatchAttempt !== undefined
+              ? { dispatchAttempt: receiptDispatchAttempt }
+              : {}),
+          })
+        : undefined;
       const trustedFinalTarget = request.responseKind === 'final'
         && scheduledTaskId !== null
+        && request.daemonSession.session.workerGeneration === receiptWorkerGeneration
+        && receiptProof !== undefined
         && sameDurableOutboxTarget(
           request.target,
           durableOutboxTargetForTurn(request.daemonSession, request.turnId),
@@ -32227,10 +32244,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
       const trustedFinalDelivery = trustedFinalTarget
         && observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId);
+      const trustedFinalReceipt = trustedFinalDelivery && receiptProof
+        && typeof receiptWorkerGeneration === 'number'
+        ? scheduledFinalReceiptEnvelope({
+            messageId: providerMessageId,
+            turnId: request.turnId,
+            workerGeneration: receiptWorkerGeneration,
+            ...(receiptDispatchAttempt !== undefined
+              ? { dispatchAttempt: receiptDispatchAttempt }
+              : {}),
+            proof: receiptProof,
+          })
+        : undefined;
       return {
         kind: 'delivered' as const,
         messageId: providerMessageId,
-        ...(trustedFinalDelivery ? { trustedFinalDelivery: true as const } : {}),
+        ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}),
       };
     };
     setDurableBridgeFinalOutputHandler(request => deliverDurablePrimaryMessage({

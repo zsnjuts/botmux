@@ -417,7 +417,7 @@ export interface DurableSessionSendRequest {
 }
 
 export type DurableSessionSendResult =
-  | { kind: 'delivered'; messageId: string; trustedFinalDelivery?: true }
+  | { kind: 'delivered'; messageId: string; trustedFinalReceipt?: import('./scheduled-final-delivery-proof.js').ScheduledFinalReceiptEnvelope }
   | { kind: 'ambiguous'; error: string };
 
 let durableSessionSendHandler: ((
