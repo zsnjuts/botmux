@@ -43,7 +43,7 @@ describe('scheduled final delivery proof', () => {
     });
   });
 
-  it('reuses an unkeyed visible element when the card has no separator', () => {
+  it('appends a provider-supported separator when the card has no separator', () => {
     const card = {
       schema: '2.0',
       body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
@@ -51,11 +51,10 @@ describe('scheduled final delivery proof', () => {
 
     stampScheduledFinalDeliveryProof(card, elementId);
 
-    expect(card.body.elements).toEqual([{
-      tag: 'markdown',
-      content: 'final answer',
-      element_id: elementId,
-    }]);
+    expect(card.body.elements).toEqual([
+      { tag: 'markdown', content: 'final answer' },
+      { tag: 'hr', element_id: elementId },
+    ]);
   });
 
   it('does not overwrite caller-owned ids and falls back to a provider-durable separator', () => {
@@ -120,6 +119,33 @@ describe('scheduled final delivery proof', () => {
         body: { content: JSON.stringify(card) },
       }] },
       messageId: 'om_callback_forgery',
+      larkAppId: 'cli_exact',
+      chatId: 'oc_exact',
+      elementId,
+    })).toEqual({ ok: false, error: 'provider_turn_proof_missing' });
+  });
+
+  it('does not accept an arbitrary top-level business object carrying the proof id', () => {
+    const card = markGroupContextCardPurpose({
+      schema: '2.0',
+      body: {
+        elements: [{
+          kind: 'business_metadata',
+          element_id: elementId,
+          payload: { source: 'model' },
+        }],
+      },
+    }, 'message');
+
+    expect(verifyScheduledFinalDeliveryReadback({
+      detail: { items: [{
+        message_id: 'om_business_forgery',
+        chat_id: 'oc_exact',
+        deleted: false,
+        sender: { id: 'cli_exact', id_type: 'app_id', sender_type: 'app' },
+        body: { content: JSON.stringify(card) },
+      }] },
+      messageId: 'om_business_forgery',
       larkAppId: 'cli_exact',
       chatId: 'oc_exact',
       elementId,

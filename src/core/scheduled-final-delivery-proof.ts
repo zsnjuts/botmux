@@ -7,6 +7,7 @@ import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 // Keep 52 digest bits after the stable seven-character namespace.
 const ELEMENT_PREFIX = 'bmxsfr_';
 const ELEMENT_ID_MAX_LENGTH = 20;
+const ELEMENT_ID_PATTERN = /^bmxsfr_[0-9a-f]{13}$/;
 
 export interface ScheduledFinalDeliveryIdentity {
   turnId: string;
@@ -36,6 +37,10 @@ export function scheduledFinalDeliveryElementId(
   return `${ELEMENT_PREFIX}${digest}`;
 }
 
+export function isScheduledFinalDeliveryElementId(value: unknown): value is string {
+  return typeof value === 'string' && ELEMENT_ID_PATTERN.test(value);
+}
+
 /** Bind the turn-specific proof to a real card element that Lark preserves in
  * structured readback.  The old carrier combined an overlong element id with a
  * standalone markdown body containing only an invisible Unicode separator;
@@ -43,11 +48,9 @@ export function scheduledFinalDeliveryElementId(
  * local renderer tests.
  *
  * Prefer the footer separator because changing only its `element_id` leaves the
- * user-visible rendering equivalent.  If a card has no
- * separator, reuse another unkeyed, non-interactive top-level element.  A
- * caller-owned element id is never overwritten; the final fallback appends an
- * ordinary separator, which Lark keeps and which remains harmless for custom
- * cards whose every element is already keyed.
+ * user-visible rendering equivalent. If no unkeyed separator exists, append
+ * one. The fixed `hr` shape lets readback distinguish a real Card 2.0
+ * component from callback payloads or arbitrary business JSON.
  *
  * The provider readback still has to match this exact proof.  A client-reported
  * message id alone proves none of the scheduled turn/generation identity. */
@@ -55,15 +58,11 @@ export function stampScheduledFinalDeliveryProof<T extends Record<string, any>>(
   card: T,
   elementId: string,
 ): T {
-  if (!elementId.startsWith(ELEMENT_PREFIX)
+  if (!isScheduledFinalDeliveryElementId(elementId)
       || !Array.isArray(card.body?.elements)) return card;
   const elements = card.body.elements as Array<Record<string, unknown>>;
   const reusable = [...elements].reverse().find(element =>
-    element?.tag === 'hr' && element.element_id === undefined)
-    ?? elements.find(element =>
-      element?.element_id === undefined
-      && typeof element?.tag === 'string'
-      && !['action', 'button', 'form', 'select_person', 'select_static', 'input'].includes(element.tag));
+    element?.tag === 'hr' && element.element_id === undefined);
   if (reusable) reusable.element_id = elementId;
   else elements.push({ tag: 'hr', element_id: elementId });
   return card;
@@ -96,6 +95,8 @@ function hasProviderComponentElementId(value: unknown, elementId: string): boole
     !!element
     && typeof element === 'object'
     && !Array.isArray(element)
+    && (element as Record<string, unknown>).tag === 'hr'
+    && isScheduledFinalDeliveryElementId((element as Record<string, unknown>).element_id)
     && (element as Record<string, unknown>).element_id === elementId);
 }
 

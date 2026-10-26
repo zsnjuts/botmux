@@ -12,6 +12,10 @@ import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { extractCotEntries } from '../src/services/claude-transcript.js';
+import {
+  scheduledFinalDeliveryElementId,
+  stampScheduledFinalDeliveryProof,
+} from '../src/core/scheduled-final-delivery-proof.js';
 
 const key = { larkAppId: 'app_test', sessionId: 'session', turnId: 'om_turn' };
 const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' };
@@ -484,6 +488,29 @@ describe('one reply card per turn', () => {
     expect(card).toContain('完整答复较长');
     expect(card).toContain('已截断');
     expect(store.read(key)?.finalText).toBe(text);
+  });
+
+  it('preserves the scheduled final proof carrier when a long final becomes an attachment', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000088';
+    const proof = scheduledFinalDeliveryElementId({ turnId, workerGeneration: 3 })!;
+    const text = '定时任务长答复。'.repeat(6000);
+    const card = stampScheduledFinalDeliveryProof(
+      JSON.parse(buildCanonicalFinalReplyCard({ markdown: text })),
+      proof,
+    );
+    io.sendOverflow = vi.fn(async () => 'om_scheduled_full_answer');
+
+    const final = await store.update(key, {
+      kind: 'final',
+      text,
+      card: JSON.stringify(card),
+      source: 'explicit',
+    }, io);
+    const rendered = JSON.parse(cards.get(final.messageId!)!);
+
+    expect(rendered.body.elements).toContainEqual({ tag: 'hr', element_id: proof });
+    expect(cards.get(final.messageId!)!).toContain('Markdown 附件');
+    expect(io.sendOverflow).toHaveBeenCalledWith(text, expect.any(String));
   });
 
   it('checks current authority again before a provider effect', async () => {
