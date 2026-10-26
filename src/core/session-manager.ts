@@ -4442,6 +4442,7 @@ export async function executeScheduledTask(
     target: DaemonSession,
     input: string | CliTurnPayload,
     resumeOrTurnId: Parameters<typeof forkWorker>[2],
+    onAsynchronousRejected?: () => void,
   ): void => {
     let synchronousAdmission: import('./worker-pool.js').WorkerForkAdmission | undefined;
     let inForkCall = true;
@@ -4455,6 +4456,7 @@ export async function executeScheduledTask(
           status: 'failed',
           errorCode: 'worker_admission_rejected',
         });
+        if (!inForkCall) onAsynchronousRejected?.();
       },
     });
     inForkCall = false;
@@ -5054,7 +5056,28 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      forkScheduledWorker(ds, prompt, scheduledTurnId);
+      forkScheduledWorker(ds, prompt, scheduledTurnId, () => {
+        // Deferred admission can reject after executeScheduledTask returned.
+        // Remove only this fire's exact fresh owner, and only while it still
+        // has no worker or protected activation/dispatch ownership. Existing
+        // continuations never install this callback.
+        if (activeSessions.get(key) !== ds
+            || ds.session.status !== 'active'
+            || (ds.worker && !ds.worker.killed)
+            || hasProtectedSessionMutationOwnership(ds)) return;
+        activeSessions.delete(key);
+        if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+        ds.initialStartPending = false;
+        ds.pendingPrompt = undefined;
+        ds.lastUserPrompt = undefined;
+        ds.lastCliInput = undefined;
+        ds.lastCodexAppInput = undefined;
+        ds.session.lastUserPrompt = undefined;
+        ds.session.lastCliInput = undefined;
+        ds.session.lastCodexAppInput = undefined;
+        sessionStore.updateSession(ds.session);
+        sessionStore.closeSession(session.sessionId);
+      });
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
       // A fresh candidate is registered immediately before fork so no rival
@@ -5066,6 +5089,13 @@ export async function executeScheduledTask(
       if (activeSessions.get(key) === ds) activeSessions.delete(key);
       ds.initialStartPending = false;
       ds.pendingPrompt = undefined;
+      ds.lastUserPrompt = undefined;
+      ds.lastCliInput = undefined;
+      ds.lastCodexAppInput = undefined;
+      ds.session.lastUserPrompt = undefined;
+      ds.session.lastCliInput = undefined;
+      ds.session.lastCodexAppInput = undefined;
+      sessionStore.updateSession(ds.session);
       sessionStore.closeSession(session.sessionId);
       throw err;
     }
