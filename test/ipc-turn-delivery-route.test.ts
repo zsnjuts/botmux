@@ -392,6 +392,72 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     expect(readback).not.toHaveBeenCalled();
   });
 
+  it('rejects a scheduled receipt when the worker is replaced during Provider readback', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000014';
+    const sessions = { 'sess-a': liveSession('sess-a', CAP_A, turnId) };
+    await setup(sessions);
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'replacement fence final' }] },
+    }, proof), 'message');
+    let resolveReadback: ((value: unknown) => void) | undefined;
+    const readback = vi.spyOn(larkClient, 'getMessageDetail').mockImplementation(() =>
+      new Promise(resolve => { resolveReadback = resolve; }) as any);
+    const receiptHandler = vi.fn(() => true);
+    setScheduledSelfCleanupReceiptHandler(receiptHandler);
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      larkAppId: 'cli_app',
+      requireFinalDelivery: true,
+    });
+
+    const response = post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_replaced_during_readback',
+      content: 'replacement fence final',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+      receiptScheduleSelfCleanup: true,
+    });
+    await vi.waitFor(() => expect(readback).toHaveBeenCalledTimes(1));
+    const replacement = liveSession('sess-a', CAP_A, turnId, { workerGeneration: 8 });
+    replacement.workerGeneration = 8;
+    sessions['sess-a'] = replacement;
+    resolveReadback?.({ items: [{
+      message_id: 'om_replaced_during_readback',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+
+    const res = await response;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'scheduled_delivery_origin_changed',
+    });
+    expect(receiptHandler).not.toHaveBeenCalled();
+    expect(await rowFor('om_replaced_during_readback')).toBeUndefined();
+    let settled = false;
+    void settlement.settled.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+  });
+
   it('records the row from the live session, ignoring body-supplied correlation fields', async () => {
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
     const res = await post('sess-a', {

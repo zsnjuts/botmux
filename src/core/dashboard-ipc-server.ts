@@ -154,7 +154,7 @@ import {
   verifyScheduledFinalDeliveryReadback,
 } from './scheduled-final-delivery-proof.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
-import { frozenReplyContextForTurn } from './reply-target.js';
+import { frozenReplyContextForTurn, replyTargetKey } from './reply-target.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -2196,6 +2196,36 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     let trustedFinalReceipt: ReturnType<typeof scheduledFinalReceiptEnvelope> | undefined;
     let providerDetail: unknown;
     let persistedCleanupReplay = false;
+    let scheduledDeliveryFence: {
+      ds: DaemonSession;
+      turnId: string;
+      dispatchAttempt: number | undefined;
+      workerGeneration: number | undefined;
+      sessionWorkerGeneration: number | undefined;
+      target: import('../types.js').FrozenSessionReplyTarget;
+      targetKey: string;
+      larkAppId: string;
+      chatId: string;
+    } | undefined;
+    const scheduledDeliveryFenceIsCurrent = (): boolean => {
+      const fence = scheduledDeliveryFence;
+      if (!fence) return true;
+      const current = findActiveBySessionId(params.sessionId);
+      if (current !== fence.ds
+          || current.session.status !== 'active'
+          || current.larkAppId !== fence.larkAppId
+          || current.chatId !== fence.chatId
+          || current.workerGeneration !== fence.workerGeneration
+          || current.session.workerGeneration !== fence.sessionWorkerGeneration
+          || current.managedTurnOrigin?.turnId !== fence.turnId
+          || current.managedTurnOrigin?.dispatchAttempt !== fence.dispatchAttempt) return false;
+      try {
+        return replyTargetKey(frozenReplyContextForTurn(current, fence.turnId).target)
+          === fence.targetKey;
+      } catch {
+        return false;
+      }
+    };
     const scheduledFinal = body.responseKind === 'final'
       && typeof liveTurnId === 'string'
       && parseScheduledTurnId(liveTurnId) !== null;
@@ -2209,6 +2239,20 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     if (scheduledFinal) {
       const messageId = typeof body.messageId === 'string' ? body.messageId : '';
       const taskId = parseScheduledTurnId(liveTurnId)!;
+      const expectedTarget = {
+        ...frozenReplyContextForTurn(ds!, liveTurnId).target,
+      } as import('../types.js').FrozenSessionReplyTarget;
+      scheduledDeliveryFence = {
+        ds: ds!,
+        turnId: liveTurnId,
+        dispatchAttempt: ds!.managedTurnOrigin?.dispatchAttempt,
+        workerGeneration: ds!.workerGeneration,
+        sessionWorkerGeneration: ds!.session.workerGeneration,
+        target: expectedTarget,
+        targetKey: replyTargetKey(expectedTarget),
+        larkAppId: ds!.larkAppId,
+        chatId: ds!.chatId,
+      };
       const persistedReceipt = selfCleanupReceiptRequested
         ? scheduledSelfCleanupReceiptLookupHandler?.({
             appId: ds!.larkAppId,
@@ -2263,17 +2307,21 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
           detail: error instanceof Error ? error.message : String(error),
         });
       }
+      if (!scheduledDeliveryFenceIsCurrent()) {
+        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
+      }
       const proof = verifyScheduledFinalDeliveryReadback({
         detail: providerDetail,
         messageId,
-        larkAppId: ds!.larkAppId,
-        chatId: ds!.chatId,
-        expectedTarget: frozenReplyContextForTurn(ds!, liveTurnId).target,
+        larkAppId: scheduledDeliveryFence.larkAppId,
+        chatId: scheduledDeliveryFence.chatId,
+        expectedTarget: scheduledDeliveryFence.target,
         proof: trustedFinalReceipt.proof,
       });
       if (!proof.ok) return jsonRes(res, 409, { ok: false, error: proof.error });
     }
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
+    const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
     let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
     try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
     let trustedPresentation: Parameters<typeof recordRelayedTurnDelivery>[0]['trustedPresentation'];
@@ -2327,10 +2375,13 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
           : {}),
       };
     }
+    if (scheduledFinal && !scheduledDeliveryFenceIsCurrent()) {
+      return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
+    }
     const result = recordRelayedTurnDelivery({
       ds,
       body,
-      store: await getSkillFeedbackStore(config.session.dataDir),
+      store: feedbackStore,
       webhookDestinations,
       teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
       ...(trustedPresentation ? { trustedPresentation } : {}),
