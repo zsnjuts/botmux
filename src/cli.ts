@@ -34,7 +34,7 @@ import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
 import {
-  scheduledFinalDeliveryElementId,
+  deriveScheduledFinalDeliveryProof,
   stampScheduledFinalDeliveryProof,
 } from './core/scheduled-final-delivery-proof.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
@@ -11479,7 +11479,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     : undefined;
   const scheduledFinalDeliveryProof = scheduledFinalDeliveryIdentity
-    ? scheduledFinalDeliveryElementId(scheduledFinalDeliveryIdentity)
+    ? deriveScheduledFinalDeliveryProof(scheduledFinalDeliveryIdentity)
     : undefined;
   let trustedFinalDeliveryReport: Promise<boolean> | undefined;
   /** Report a provider-confirmed final to the resident daemon. Scheduled turns

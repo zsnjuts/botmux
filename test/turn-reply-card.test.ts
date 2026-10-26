@@ -13,7 +13,7 @@ import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.j
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { extractCotEntries } from '../src/services/claude-transcript.js';
 import {
-  scheduledFinalDeliveryElementId,
+  deriveScheduledFinalDeliveryProof,
   stampScheduledFinalDeliveryProof,
 } from '../src/core/scheduled-final-delivery-proof.js';
 
@@ -492,7 +492,7 @@ describe('one reply card per turn', () => {
 
   it('preserves the scheduled final proof carrier when a long final becomes an attachment', async () => {
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000088';
-    const proof = scheduledFinalDeliveryElementId({ turnId, workerGeneration: 3 })!;
+    const proof = deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 3 })!;
     const text = '定时任务长答复。'.repeat(6000);
     const card = stampScheduledFinalDeliveryProof(
       JSON.parse(buildCanonicalFinalReplyCard({ markdown: text })),
@@ -508,7 +508,11 @@ describe('one reply card per turn', () => {
     }, io);
     const rendered = JSON.parse(cards.get(final.messageId!)!);
 
-    expect(rendered.body.elements).toContainEqual({ tag: 'hr', element_id: proof });
+    const footer = rendered.body.elements.find((element: any) =>
+      element.element_id === 'botmux_reply_footer');
+    expect(footer?.content).toContain(`#${proof}`);
+    expect(rendered.body.elements.some((element: any) => element.tag === 'hr'
+      && element.element_id === proof)).toBe(false);
     expect(cards.get(final.messageId!)!).toContain('Markdown 附件');
     expect(io.sendOverflow).toHaveBeenCalledWith(text, expect.any(String));
   });

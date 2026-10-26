@@ -30,7 +30,7 @@ import {
   beginScheduledRunSettlement,
 } from '../src/core/scheduled-run-settlement.js';
 import {
-  scheduledFinalDeliveryElementId,
+  deriveScheduledFinalDeliveryProof,
   stampScheduledFinalDeliveryProof,
 } from '../src/core/scheduled-final-delivery-proof.js';
 import { markGroupContextCardPurpose } from '../src/im/lark/group-context-card.js';
@@ -106,7 +106,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
   it('settles the exact scheduled turn only from an authenticated final receipt', async () => {
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000011';
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
-    const elementId = scheduledFinalDeliveryElementId({
+    const proof = deriveScheduledFinalDeliveryProof({
       turnId,
       workerGeneration: 7,
       dispatchAttempt: 2,
@@ -114,7 +114,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     const card = stampScheduledFinalDeliveryProof(markGroupContextCardPurpose({
       schema: '2.0',
       body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
-    }, 'message'), elementId);
+    }, 'message'), proof);
     vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
       message_id: 'om_answer_final',
       chat_id: 'oc_sess-a',
@@ -136,7 +136,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       receiptTurnId: turnId,
       receiptWorkerGeneration: 7,
       receiptDispatchAttempt: 2,
-      receiptProof: elementId,
+      receiptProof: proof,
     });
     expect(res.status).toBe(200);
     await expect(settlement.settled).resolves.toEqual({ messageId: 'om_answer_final' });
@@ -145,7 +145,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
   it('does not settle a client-reported id that provider readback cannot prove', async () => {
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000012';
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
-    const elementId = scheduledFinalDeliveryElementId({
+    const proof = deriveScheduledFinalDeliveryProof({
       turnId,
       workerGeneration: 7,
       dispatchAttempt: 2,
@@ -165,7 +165,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       receiptTurnId: turnId,
       receiptWorkerGeneration: 7,
       receiptDispatchAttempt: 2,
-      receiptProof: elementId,
+      receiptProof: proof,
     });
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'provider_message_not_found' });
@@ -178,7 +178,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
   it('rejects a receipt from a stale worker generation before provider readback', async () => {
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000013';
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
-    const staleProof = scheduledFinalDeliveryElementId({
+    const staleProof = deriveScheduledFinalDeliveryProof({
       turnId,
       workerGeneration: 6,
       dispatchAttempt: 2,

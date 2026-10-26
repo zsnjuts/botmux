@@ -15,7 +15,7 @@ import { bindGroupContextDelivery, confirmGroupContextDelivery, getDeliveredGrou
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import { DEFAULT_BRAND_LABEL } from '../src/im/lark/md-card.js';
 import MarkdownIt from 'markdown-it';
-import { scheduledFinalDeliveryElementId } from '../src/core/scheduled-final-delivery-proof.js';
+import { deriveScheduledFinalDeliveryProof } from '../src/core/scheduled-final-delivery-proof.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' };
@@ -448,7 +448,7 @@ describe('real CLI send into a running reply card', () => {
         .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
       const receiptPosts = daemonPosts.filter(request =>
         request.method === 'POST' && request.path.endsWith('/turn-delivery'));
-      const receiptProof = scheduledFinalDeliveryElementId({ turnId, workerGeneration: 7 })!;
+      const receiptProof = deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 7 })!;
       expect(JSON.parse(providerReply!.slice('CAPTURE_REPLY='.length)).body.content)
         .toContain(receiptProof);
       expect(receiptPosts).toHaveLength(1);

@@ -1,13 +1,16 @@
 import { createHash } from 'node:crypto';
 import { projectGroupContextCard } from '../im/lark/group-context-card.js';
+import {
+  REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER,
+} from '../im/lark/reply-card-footer-signature.js';
 import { isConfirmedLarkMessageId } from './scheduled-run-settlement.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 
-// Lark Card 2.0 element_id must begin with a letter and be at most 20 chars.
-// Keep 52 digest bits after the stable seven-character namespace.
-const ELEMENT_PREFIX = 'bmxsfr_';
-const ELEMENT_ID_MAX_LENGTH = 20;
-const ELEMENT_ID_PATTERN = /^bmxsfr_[0-9a-f]{13}$/;
+const PROOF_PREFIX = 'bmxsfr_';
+const PROOF_PATTERN = /^bmxsfr_[0-9a-f]{13}$/;
+const PROOF_LINK_BASE = 'https://github.com/deepcoldy/bot%6Dux#';
+const MARKDOWN_LINK_PATTERN = /\[([^\]]*)\]\(([^)\s]+)\)/gu;
 
 export interface ScheduledFinalDeliveryIdentity {
   turnId: string;
@@ -15,7 +18,7 @@ export interface ScheduledFinalDeliveryIdentity {
   dispatchAttempt?: number;
 }
 
-export function scheduledFinalDeliveryElementId(
+export function deriveScheduledFinalDeliveryProof(
   input: ScheduledFinalDeliveryIdentity,
 ): string | undefined {
   if (parseScheduledTurnId(input.turnId) === null
@@ -33,38 +36,99 @@ export function scheduledFinalDeliveryElementId(
     .update('\0', 'utf8')
     .update(input.dispatchAttempt === undefined ? '-' : String(input.dispatchAttempt), 'utf8')
     .digest('hex')
-    .slice(0, ELEMENT_ID_MAX_LENGTH - ELEMENT_PREFIX.length);
-  return `${ELEMENT_PREFIX}${digest}`;
+    .slice(0, 13);
+  return `${PROOF_PREFIX}${digest}`;
 }
 
-export function isScheduledFinalDeliveryElementId(value: unknown): value is string {
-  return typeof value === 'string' && ELEMENT_ID_PATTERN.test(value);
+export function isScheduledFinalDeliveryProof(value: unknown): value is string {
+  return typeof value === 'string' && PROOF_PATTERN.test(value);
 }
 
-/** Bind the turn-specific proof to a real card element that Lark preserves in
- * structured readback.  The old carrier combined an overlong element id with a
- * standalone markdown body containing only an invisible Unicode separator;
- * neither is a provider-durable Card 2.0 contract even though both survive
- * local renderer tests.
+function proofUrl(proof: string): string {
+  return `${PROOF_LINK_BASE}${proof}`;
+}
+
+function isProofUrl(value: unknown, expectedProof?: string): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    const proof = url.hash.slice(1);
+    return url.protocol === 'https:'
+      && url.hostname === 'github.com'
+      && url.port === ''
+      && url.username === ''
+      && url.password === ''
+      && url.search === ''
+      && decodeURIComponent(url.pathname) === '/deepcoldy/botmux'
+      && isScheduledFinalDeliveryProof(proof)
+      && (expectedProof === undefined || proof === expectedProof);
+  } catch {
+    return false;
+  }
+}
+
+function footerContentWithProof(content: string, proof: string): string {
+  // The historical visible-dot marker is known to survive Lark readback. Put
+  // the proof in that dot's target, keeping the rendered separator unchanged.
+  const carrier = `[·](${proofUrl(proof)})`;
+  let replaced = false;
+  let stamped = content.replace(MARKDOWN_LINK_PATTERN, (link, text, href) => {
+    if ((text === '·' || text === REPLY_CARD_FOOTER_MARKER) && isProofUrl(href)) {
+      if (replaced) return '';
+      replaced = true;
+      return carrier;
+    }
+    return link;
+  });
+  if (!replaced) {
+    const separator = `·${REPLY_CARD_FOOTER_MARKER}`;
+    if (stamped.includes(separator)) {
+      stamped = stamped.replace(separator, `${carrier}${REPLY_CARD_FOOTER_MARKER}`);
+    } else if (/<\/font>\s*$/i.test(stamped.trimEnd())) {
+      stamped = stamped.trimEnd().replace(/<\/font>\s*$/i, ` ${carrier}${REPLY_CARD_FOOTER_MARKER}</font>`);
+    } else {
+      stamped = stamped.trimEnd();
+      stamped = stamped ? `${stamped} ${carrier}${REPLY_CARD_FOOTER_MARKER}`
+        : `<font color='grey'>${carrier}${REPLY_CARD_FOOTER_MARKER}</font>`;
+    }
+  }
+  if (!stamped.includes(REPLY_CARD_FOOTER_MARKER)) {
+    stamped = stamped.replace(carrier, `${carrier}${REPLY_CARD_FOOTER_MARKER}`);
+  }
+  return stamped;
+}
+
+/** Bind the turn-specific proof to the canonical top-level reply footer.
  *
- * Prefer the footer separator because changing only its `element_id` leaves the
- * user-visible rendering equivalent. If no unkeyed separator exists, append
- * one. The fixed `hr` shape lets readback distinguish a real Card 2.0
- * component from callback payloads or arbitrary business JSON.
+ * Lark rewrites caller-supplied `hr.element_id` values, while preserving the
+ * canonical `botmux_reply_footer` markdown component and its link target. The
+ * proof therefore lives in the target fragment of a footer separator link:
+ * visible answer content is unchanged, long-answer overflow already retains
+ * the footer, and provider readback can validate a real component instead of
+ * scanning arbitrary callback or business JSON.
  *
- * The provider readback still has to match this exact proof.  A client-reported
- * message id alone proves none of the scheduled turn/generation identity. */
+ * If footer chrome is disabled, append a minimal receipt-only footer. A
+ * malformed caller-owned footer collision is left untouched so delivery fails
+ * closed instead of creating duplicate Card 2.0 element ids. */
 export function stampScheduledFinalDeliveryProof<T extends Record<string, any>>(
   card: T,
-  elementId: string,
+  proof: string,
 ): T {
-  if (!isScheduledFinalDeliveryElementId(elementId)
+  if (!isScheduledFinalDeliveryProof(proof)
       || !Array.isArray(card.body?.elements)) return card;
   const elements = card.body.elements as Array<Record<string, unknown>>;
-  const reusable = [...elements].reverse().find(element =>
-    element?.tag === 'hr' && element.element_id === undefined);
-  if (reusable) reusable.element_id = elementId;
-  else elements.push({ tag: 'hr', element_id: elementId });
+  const reserved = elements.find(element => element?.element_id === REPLY_CARD_FOOTER_ELEMENT_ID);
+  if (reserved) {
+    if (reserved.tag !== 'markdown' || typeof reserved.content !== 'string') return card;
+    reserved.content = footerContentWithProof(reserved.content, proof);
+    return card;
+  }
+  elements.push({
+    tag: 'markdown',
+    element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
+    text_size: 'notation',
+    content: footerContentWithProof('', proof),
+  });
   return card;
 }
 
@@ -82,22 +146,29 @@ function providerCardRoot(value: unknown): Record<string, unknown> | undefined {
   }
 }
 
-/** The proof writer stamps only a top-level Card 2.0 body component.  Match
- * that exact provider-preserved structure rather than recursively scanning
- * arbitrary JSON: callback `behaviors[].value`, URLs, chart data and other
- * model-authored payloads are data, not delivery-proof components. */
-function hasProviderComponentElementId(value: unknown, elementId: string): boolean {
+function footerHasExactProofLink(content: string, proof: string): boolean {
+  for (const match of content.matchAll(MARKDOWN_LINK_PATTERN)) {
+    if (match[1] === '·' && isProofUrl(match[2], proof)) return true;
+  }
+  return false;
+}
+
+/** Match only the canonical top-level footer markdown and its exact proof link.
+ * Body text, nested callback values, URLs and arbitrary business objects are
+ * data, not delivery-proof components. */
+function hasProviderFooterProof(value: unknown, proof: string): boolean {
   const root = providerCardRoot(value);
   const body = root?.body;
   if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
   const elements = (body as Record<string, unknown>).elements;
-  return Array.isArray(elements) && elements.some(element =>
-    !!element
-    && typeof element === 'object'
-    && !Array.isArray(element)
-    && (element as Record<string, unknown>).tag === 'hr'
-    && isScheduledFinalDeliveryElementId((element as Record<string, unknown>).element_id)
-    && (element as Record<string, unknown>).element_id === elementId);
+  return Array.isArray(elements) && elements.some(element => {
+    if (!element || typeof element !== 'object' || Array.isArray(element)) return false;
+    const component = element as Record<string, unknown>;
+    return component.tag === 'markdown'
+      && component.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
+      && typeof component.content === 'string'
+      && footerHasExactProofLink(component.content, proof);
+  });
 }
 
 export type ScheduledFinalDeliveryReadback =
@@ -110,7 +181,7 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   messageId: string;
   larkAppId: string;
   chatId: string;
-  elementId: string;
+  proof: string;
 }): ScheduledFinalDeliveryReadback {
   if (!isConfirmedLarkMessageId(input.messageId)) {
     return { ok: false, error: 'invalid_message_id' };
@@ -136,7 +207,7 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   if (typeof content !== 'string') return { ok: false, error: 'provider_content_missing' };
   let card: unknown;
   try { card = JSON.parse(content); } catch { return { ok: false, error: 'provider_content_invalid' }; }
-  if (!hasProviderComponentElementId(card, input.elementId)) {
+  if (!hasProviderFooterProof(card, input.proof)) {
     return { ok: false, error: 'provider_turn_proof_missing' };
   }
   const projection = projectGroupContextCard(content, { botmuxSender: true });

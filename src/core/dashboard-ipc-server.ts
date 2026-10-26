@@ -147,7 +147,7 @@ import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../servic
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
 import { observeScheduledRunProviderReadbackDelivery } from './scheduled-run-settlement.js';
 import {
-  scheduledFinalDeliveryElementId,
+  deriveScheduledFinalDeliveryProof,
   verifyScheduledFinalDeliveryReadback,
 } from './scheduled-final-delivery-proof.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
@@ -2126,7 +2126,7 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
           || receiptDispatchAttempt !== ds?.managedTurnOrigin?.dispatchAttempt) {
         return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
       }
-      const expectedProof = scheduledFinalDeliveryElementId({
+      const expectedProof = deriveScheduledFinalDeliveryProof({
         turnId: liveTurnId,
         workerGeneration: body.receiptWorkerGeneration,
         ...(typeof receiptDispatchAttempt === 'number'
@@ -2155,7 +2155,7 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
         messageId,
         larkAppId: ds!.larkAppId,
         chatId: ds!.chatId,
-        elementId: expectedProof,
+        proof: expectedProof,
       });
       if (!proof.ok) return jsonRes(res, 409, { ok: false, error: proof.error });
     }

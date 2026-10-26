@@ -8,7 +8,6 @@ import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask
 import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
-import { isScheduledFinalDeliveryElementId } from '../../core/scheduled-final-delivery-proof.js';
 
 export interface TurnReplyCardPresentation {
   locale?: 'zh' | 'en';
@@ -175,8 +174,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // is in the native attachment; a visible notice always accompanies it.
     card.body.elements = card.body.elements.filter(element =>
       element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_feedback'
-      || element.element_id === 'botmux_oncall_group'
-      || element.tag === 'hr' && isScheduledFinalDeliveryElementId(element.element_id));
+      || element.element_id === 'botmux_oncall_group');
     card.body.elements.unshift({ tag: 'markdown', content: en
       ? 'The full answer is included in this turn’s **Markdown attachment**.'
       : '完整答复较长，已作为本轮的 **Markdown 附件**发送，请查看附件。' });
