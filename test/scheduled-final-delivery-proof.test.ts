@@ -3,6 +3,7 @@ import {
   deriveScheduledFinalDeliveryProof,
   matchesScheduledFinalReceiptEnvelope,
   parseScheduledFinalReceiptEnvelope,
+  scheduledFinalCardHasExactProof,
   scheduledFinalReceiptEnvelope,
   stampScheduledFinalDeliveryProof,
   verifyScheduledFinalDeliveryReadback,
@@ -205,6 +206,26 @@ describe('scheduled final delivery proof', () => {
     const card = markGroupContextCardPurpose(stamped, 'message');
 
     expect(verify(card)).toEqual({ ok: true });
+  });
+
+  it('accepts only a conversation Card 2.0 carrying the exact proof and final purpose', () => {
+    const exactCard = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, proof), 'message');
+    const wrongPurpose = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'working' }] },
+    }, proof), 'status');
+
+    expect(scheduledFinalCardHasExactProof(exactCard, proof)).toBe(true);
+    expect(scheduledFinalCardHasExactProof(JSON.stringify(exactCard), proof)).toBe(true);
+    expect(scheduledFinalCardHasExactProof(exactCard, 'bmxsfr_0000000000000')).toBe(false);
+    expect(scheduledFinalCardHasExactProof(wrongPurpose, proof)).toBe(false);
+    expect(scheduledFinalCardHasExactProof({
+      body: exactCard.body,
+    }, proof)).toBe(false);
+    expect(scheduledFinalCardHasExactProof('{invalid', proof)).toBe(false);
   });
 
   it('binds provider readback to the daemon-frozen visible target', () => {

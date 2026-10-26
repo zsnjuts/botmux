@@ -559,6 +559,7 @@ import { scheduleRequiresReferenceTime } from './core/scheduler.js';
 import {
   deriveScheduledFinalDeliveryProof,
   matchesScheduledFinalReceiptEnvelope,
+  scheduledFinalCardHasExactProof,
   scheduledFinalReceiptEnvelope,
 } from './core/scheduled-final-delivery-proof.js';
 import {
@@ -32333,6 +32334,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               : {}),
           })
         : undefined;
+      const persistedCleanupReceipt = request.scheduleSelfCleanup === true && scheduledTaskId
+        ? scheduleAuthorityStore?.getSelfCleanupReceipt(
+            request.daemonSession.larkAppId,
+            scheduledTaskId,
+            request.turnId,
+          )
+        : undefined;
       const trustedFinalTarget = request.responseKind === 'final'
         && scheduledTaskId !== null
         && sameDurableOutboxTarget(
@@ -32341,7 +32349,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
       const liveTrustedFinalTarget = trustedFinalTarget
         && request.daemonSession.session.workerGeneration === receiptWorkerGeneration
-        && receiptProof !== undefined;
+        && receiptProof !== undefined
+        && scheduledFinalCardHasExactProof(request.content, receiptProof);
+      const persistedTrustedFinalTarget = trustedFinalTarget
+        && !!persistedCleanupReceipt
+        && scheduledFinalCardHasExactProof(request.content, persistedCleanupReceipt.proof);
+      if (request.responseKind === 'final' && scheduledTaskId
+          && !liveTrustedFinalTarget && !persistedTrustedFinalTarget) {
+        throw new Error('durable scheduled final lacks an exact Card 2.0 proof');
+      }
       const message = durableLarkOutboxMessage({
         messageId: `out_${request.providerUuid}`,
         sessionKey: canonicalKey,
@@ -32376,20 +32392,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!isConfirmedLarkMessageId(providerMessageId)) {
         return { kind: 'ambiguous', error: 'delivered outbox receipt lacks provider message id' };
       }
-      const persistedCleanupReceipt = trustedFinalTarget
-        && request.scheduleSelfCleanup === true && scheduledTaskId
-        ? scheduleAuthorityStore?.getSelfCleanupReceipt(
-            request.daemonSession.larkAppId,
-            scheduledTaskId,
-            request.turnId,
-          )
+      const authorityAfterDelivery = scheduledTaskId
+        ? scheduleAuthorityStore?.getRecord(request.daemonSession.larkAppId, scheduledTaskId)
         : undefined;
-      let trustedFinalReceipt = persistedCleanupReceipt?.messageId === providerMessageId
+      let targetStillCurrent = false;
+      try {
+        targetStillCurrent = sameDurableOutboxTarget(
+          request.target,
+          durableOutboxTargetForTurn(request.daemonSession, request.turnId),
+        );
+      } catch { /* frozen target disappeared: fail closed below */ }
+      const liveIdentityStillCurrent = liveTrustedFinalTarget
+        && request.daemonSession.workerGeneration === receiptWorkerGeneration
+        && request.daemonSession.session.workerGeneration === receiptWorkerGeneration
+        && request.daemonSession.managedTurnOrigin?.turnId === request.turnId
+        && request.daemonSession.managedTurnOrigin.dispatchAttempt === receiptDispatchAttempt
+        && targetStillCurrent
+        && authorityAfterDelivery?.state === 'active'
+        && authorityAfterDelivery.task.lastStatus === 'running';
+      let trustedFinalReceipt = persistedTrustedFinalTarget
+        && persistedCleanupReceipt?.messageId === providerMessageId
         ? scheduledFinalReceiptEnvelope(persistedCleanupReceipt)
         : undefined;
-      let trustedFinalDelivery = !!trustedFinalReceipt || (liveTrustedFinalTarget
+      let trustedFinalDelivery = !!trustedFinalReceipt || (liveIdentityStillCurrent
         && observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId));
-      if (!trustedFinalReceipt && liveTrustedFinalTarget && request.scheduleSelfCleanup === true
+      if (!trustedFinalReceipt && liveIdentityStillCurrent && request.scheduleSelfCleanup === true
           && scheduledTaskId && receiptProof
           && typeof receiptWorkerGeneration === 'number') {
         const cleanupReceipt: ScheduleSelfCleanupReceipt = {

@@ -263,6 +263,22 @@ function hasProviderFooterProof(value: unknown, proof: string): boolean {
     && footerHasExactProofLink(footer.content, proof);
 }
 
+export function scheduledFinalCardHasExactProof(
+  value: unknown,
+  proof: string,
+): boolean {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value) as unknown; }
+    catch { return false; }
+  }
+  if (!hasProviderFooterProof(parsed, proof)) return false;
+  const root = providerCardRoot(parsed);
+  const purpose = root ? canonicalReplyCardFooterPurpose(root) : undefined;
+  if (purpose !== 'message' && purpose !== 'turn-message') return false;
+  return projectGroupContextCard(JSON.stringify(parsed), { botmuxSender: true })?.kind === 'conversation';
+}
+
 export type ScheduledFinalDeliveryReadback =
   | { ok: true }
   | { ok: false; error: string };

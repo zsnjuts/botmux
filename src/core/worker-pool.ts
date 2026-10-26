@@ -58,7 +58,7 @@ import {
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, getMessageDetail, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
@@ -771,9 +771,15 @@ import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cl
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
 import {
-  observeScheduledRunDaemonProviderDelivery,
+  observeScheduledRunProviderReadbackDelivery,
   observeScheduledRunTerminal,
 } from './scheduled-run-settlement.js';
+import {
+  deriveScheduledFinalDeliveryProof,
+  scheduledFinalCardHasExactProof,
+  stampScheduledFinalDeliveryProof,
+  verifyScheduledFinalDeliveryReadback,
+} from './scheduled-final-delivery-proof.js';
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
@@ -20659,6 +20665,29 @@ function deliverFinalOutput(
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
       }
+      const scheduledTaskId = !msg.turnFailed ? parseScheduledTurnId(msg.turnId) : null;
+      const scheduledWorkerGeneration = ds.workerGeneration;
+      const scheduledProof = scheduledTaskId && typeof scheduledWorkerGeneration === 'number'
+        && ds.session.workerGeneration === scheduledWorkerGeneration
+        ? deriveScheduledFinalDeliveryProof({
+            turnId: msg.turnId,
+            workerGeneration: scheduledWorkerGeneration,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          })
+        : undefined;
+      if (scheduledTaskId) {
+        if (!scheduledProof) {
+          throw new Error('scheduled daemon final identity is unavailable');
+        }
+        const scheduledCard = JSON.parse(cardJson) as Record<string, any>;
+        stampScheduledFinalDeliveryProof(scheduledCard, scheduledProof);
+        cardJson = JSON.stringify(scheduledCard);
+        if (!scheduledFinalCardHasExactProof(cardJson, scheduledProof)) {
+          throw new Error('scheduled daemon final card proof is unavailable');
+        }
+      }
       const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
@@ -20746,6 +20775,45 @@ function deliverFinalOutput(
           );
         }
       };
+      const confirmScheduledProviderDelivery = async (messageId: string): Promise<boolean> => {
+        if (!scheduledTaskId) return true;
+        const expectedTarget = frozenReplyTarget
+          ?? resolveSessionReplyTarget(ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId));
+        const ownsExactGeneration = (): boolean => isStillOwned()
+          && ds.session.status === 'active'
+          && ds.workerGeneration === scheduledWorkerGeneration
+          && ds.session.workerGeneration === scheduledWorkerGeneration
+          && ds.managedTurnOrigin?.turnId === msg.turnId
+          && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt;
+        if (!scheduledProof || !ownsExactGeneration()) return false;
+        let detail: unknown;
+        try {
+          detail = await getMessageDetail(ds.larkAppId, messageId, {
+            userCardContent: true,
+            timeoutMs: 10_000,
+          });
+        } catch (error) {
+          logger.error(
+            `[${t}] Scheduled daemon final readback failed: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          return false;
+        }
+        if (!ownsExactGeneration()) return false;
+        const verified = verifyScheduledFinalDeliveryReadback({
+          detail,
+          messageId,
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          expectedTarget,
+          proof: scheduledProof,
+        });
+        if (!verified.ok || !ownsExactGeneration()) {
+          logger.error(`[${t}] Scheduled daemon final receipt rejected: ${verified.ok ? 'owner_changed' : verified.error}`);
+          return false;
+        }
+        return observeScheduledRunProviderReadbackDelivery(msg.turnId, messageId);
+      };
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
         // Managed VC receivers are accounted in their own delivery store and
@@ -20760,7 +20828,7 @@ function deliverFinalOutput(
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
         confirmLinkRefDraft();
-        observeScheduledRunDaemonProviderDelivery(msg.turnId, preparedListenerReply.messageId);
+        await confirmScheduledProviderDelivery(preparedListenerReply.messageId);
         onComplete?.(true, preparedListenerReply.messageId);
         return;
       }
@@ -20858,12 +20926,10 @@ function deliverFinalOutput(
       const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await (managedReceiver
         ? sendFinal(canonicalOutput.content)
         : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
-      // A turn-failure notice is user-visible, but it is not the scheduled
-      // task's successful final answer.  Keep the settlement pending so the
-      // ordered failed terminal below rejects it after this delivery drains.
-      if (!msg.turnFailed) {
-        observeScheduledRunDaemonProviderDelivery(msg.turnId, messageId);
-      }
+      // A scheduled fallback settles only after exact Provider readback. This
+      // covers direct sends, unified-card replay and the durable outbox with
+      // the same proof/target/worker-generation gate.
+      if (!msg.turnFailed) await confirmScheduledProviderDelivery(messageId);
       if (!isStillOwned()) {
         // The provider already returned its stable message id. Ownership loss
         // only suppresses later local bookkeeping; it cannot make that external
