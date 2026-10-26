@@ -414,6 +414,7 @@ export interface DurableSessionSendRequest {
   msgType: string;
   providerUuid: string;
   responseKind: 'progress' | 'final' | 'auxiliary';
+  scheduleSelfCleanup?: boolean;
   hookContext?: Record<string, unknown>;
 }
 
@@ -429,6 +430,29 @@ export function setDurableSessionSendHandler(
   handler: ((request: DurableSessionSendRequest) => Promise<DurableSessionSendResult>) | null,
 ): void {
   durableSessionSendHandler = handler;
+}
+
+export interface ScheduledSelfCleanupReceiptRequest {
+  action: 'record' | 'lookup';
+  appId: string;
+  taskId: string;
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+  proof: string;
+  messageId: string;
+}
+
+let scheduledSelfCleanupReceiptHandler: ((
+  request: ScheduledSelfCleanupReceiptRequest,
+) => boolean) | null = null;
+
+/** Register the daemon-owned durable credential used only to converge a
+ * verified scheduled self-delete after its HTTP response was lost. */
+export function setScheduledSelfCleanupReceiptHandler(
+  handler: ((request: ScheduledSelfCleanupReceiptRequest) => boolean) | null,
+): void {
+  scheduledSelfCleanupReceiptHandler = handler;
 }
 
 export interface DurableSessionLifecycleRequest {
@@ -1966,6 +1990,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       || (body.responseKind !== 'progress'
         && body.responseKind !== 'final'
         && body.responseKind !== 'auxiliary')
+      || (body.scheduleSelfCleanup !== undefined
+        && body.scheduleSelfCleanup !== true)
+      || (body.scheduleSelfCleanup === true && body.responseKind !== 'final')
       || !target || typeof target !== 'object' || Array.isArray(target)
       || (hookContext !== undefined
         && (!hookContext || typeof hookContext !== 'object' || Array.isArray(hookContext)))) {
@@ -1980,6 +2007,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       msgType: body.msgType,
       providerUuid: body.providerUuid,
       responseKind: body.responseKind,
+      ...(body.scheduleSelfCleanup === true ? { scheduleSelfCleanup: true } : {}),
       ...(hookContext === undefined ? {} : { hookContext: hookContext as Record<string, unknown> }),
     });
     return result.kind === 'delivered'
@@ -2123,6 +2151,13 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     const scheduledFinal = body.responseKind === 'final'
       && typeof liveTurnId === 'string'
       && parseScheduledTurnId(liveTurnId) !== null;
+    const selfCleanupReceiptRequested = body.receiptScheduleSelfCleanup === true;
+    if (body.receiptScheduleSelfCleanup !== undefined && !selfCleanupReceiptRequested) {
+      return jsonRes(res, 400, { ok: false, error: 'scheduled_cleanup_receipt_invalid' });
+    }
+    if (selfCleanupReceiptRequested && !scheduledFinal) {
+      return jsonRes(res, 409, { ok: false, error: 'scheduled_cleanup_receipt_unbound' });
+    }
     if (scheduledFinal) {
       const liveWorkerGeneration = ds?.workerGeneration;
       const persistedWorkerGeneration = ds?.session.workerGeneration;
@@ -2187,9 +2222,35 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
       webhookDestinations,
       teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
     });
-    if (result.ok && scheduledFinal && liveTurnId
-        && !observeScheduledRunProviderReadbackDelivery(liveTurnId, body.messageId as string)) {
-      return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_authority_changed' });
+    if (result.ok && scheduledFinal && liveTurnId) {
+      const messageId = body.messageId as string;
+      const observed = observeScheduledRunProviderReadbackDelivery(liveTurnId, messageId);
+      if (selfCleanupReceiptRequested) {
+        if (!scheduledSelfCleanupReceiptHandler) {
+          return jsonRes(res, 503, { ok: false, error: 'scheduled_cleanup_receipt_unavailable' });
+        }
+        const taskId = parseScheduledTurnId(liveTurnId)!;
+        const request = {
+          appId: ds!.larkAppId,
+          taskId,
+          turnId: liveTurnId,
+          workerGeneration: body.receiptWorkerGeneration as number,
+          ...(typeof body.receiptDispatchAttempt === 'number'
+            ? { dispatchAttempt: body.receiptDispatchAttempt }
+            : {}),
+          proof: body.receiptProof as string,
+          messageId,
+        };
+        if (observed) {
+          if (!scheduledSelfCleanupReceiptHandler({ action: 'record', ...request })) {
+            return jsonRes(res, 409, { ok: false, error: 'scheduled_cleanup_receipt_not_recorded' });
+          }
+        } else if (!scheduledSelfCleanupReceiptHandler({ action: 'lookup', ...request })) {
+          return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_authority_changed' });
+        }
+      } else if (!observed) {
+        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_authority_changed' });
+      }
     }
     return result.ok
       ? jsonRes(res, 200, {

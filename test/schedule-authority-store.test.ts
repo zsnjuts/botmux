@@ -87,6 +87,31 @@ describe('host-only schedule authority store', () => {
       .toThrow('schedule_authority_app_required');
   });
 
+  it('persists an exact self-cleanup receipt across task revocation and restart', () => {
+    store.initializeApp(APP, []);
+    store.createDirect(task());
+    const receipt = {
+      appId: APP,
+      taskId: 'a1b2c3d4',
+      turnId: 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc',
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+      proof: 'bmxsfr_123456789abcd',
+      messageId: 'om_cleanup_receipt',
+    };
+
+    expect(store.recordSelfCleanupReceipt(receipt)).toEqual({ replay: false });
+    expect(store.recordSelfCleanupReceipt(receipt)).toEqual({ replay: true });
+    expect(store.revoke(APP, receipt.taskId)).toBe(true);
+    expect(store.getSelfCleanupReceipt(APP, receipt.taskId, receipt.turnId)).toEqual(receipt);
+    expect(() => store.recordSelfCleanupReceipt({ ...receipt, messageId: 'om_other' }))
+      .toThrow('schedule_self_cleanup_authority_unavailable');
+
+    store.close();
+    store = ScheduleAuthorityStore.open(dataDir);
+    expect(store.getSelfCleanupReceipt(APP, receipt.taskId, receipt.turnId)).toEqual(receipt);
+  });
+
   it('atomically commits one grant and returns the same receipt after response loss', () => {
     store.initializeApp(APP, []);
     const input = {

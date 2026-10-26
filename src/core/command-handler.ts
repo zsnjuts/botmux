@@ -128,6 +128,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { beginReplyTargetTurn, rehomeReplyTargetState } from './reply-target.js';
+import { normalizeScheduleSourceMessageCreateTime } from './schedule-reference-time.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
@@ -1049,12 +1050,12 @@ async function handleScheduleCommand(
   }
 
   // Natural language: /schedule 每日17:50给我"帮我看看AI新闻"
-  const sourceMessageTimeMs = Number(sourceMessageCreateTime);
+  const sourceMessageTimeMs = normalizeScheduleSourceMessageCreateTime(
+    sourceMessageCreateTime,
+  );
   const parsed = scheduler.parseNaturalSchedule(
     trimmed,
-    Number.isFinite(sourceMessageTimeMs) && sourceMessageTimeMs > 0
-      ? sourceMessageTimeMs
-      : undefined,
+    sourceMessageTimeMs,
     { requireTrustedReferenceTime: true },
   );
   if (parsed) {

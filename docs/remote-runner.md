@@ -147,7 +147,7 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 }
 ```
 
-结果为 `delivered|rejected|unknown`。请求 scheduled self-cleanup 时，`delivered` 还会携带 `scheduleSelfCleanup`；只有 `removed=true` 才证明当前任务已经删除，`removed=false` 时调用方可原样重试同一 final，宿主 turn-send ledger 会复用已投递消息并只补做删除。Host 从受信 `schedule:<taskId>:<uuid>` turn ID 解析 expected task ID，并用它校验 CLI 回执；final 消息已取得确定 message ID、但 cleanup 回执缺失、非法或 task ID 不匹配时仍保留 `delivered` 以抑制 transcript 重复投递，同时返回该 expected task ID 与 `removed=false`，不能把 cleanup 失败降格成会重发 final 的消息 unknown。`unknown` 表示消息平台是否接受本身无法证明，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
+结果为 `delivered|rejected|unknown`。请求 scheduled self-cleanup 时，`delivered` 还会携带 `scheduleSelfCleanup`；只有 `removed=true` 才证明当前任务已经删除，`removed=false` 时调用方可原样重试同一 final，宿主 turn-send ledger 会复用已投递消息并只补做删除。Host 从受信 `schedule:<taskId>:<uuid>` turn ID 解析 expected task ID，并用它校验 CLI 回执；在首次删除前还会持久化 exact turn、generation、attempt、proof 与 Provider message ID 组成的 cleanup 凭据，因此删除已经成功但 HTTP 响应丢失时，重试只能回读同一 revoked task 的幂等结果，不会重新结算或复活 scheduler authority。final 消息已取得确定 message ID、但 cleanup 回执缺失、非法或 task ID 不匹配时仍保留 `delivered` 以抑制 transcript 重复投递，同时返回该 expected task ID 与 `removed=false`，不能把 cleanup 失败降格成会重发 final 的消息 unknown。`unknown` 表示消息平台是否接受本身无法证明，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
 
 `progress|auxiliary` 写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`；协商后的 `final` 写入终态发送标记，用于抑制同一 turn 随后的 transcript 重复回复。上述 capability 都不属于默认必需集合，只有显式配置它们的部署才会在握手时要求 provider 支持。
 成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 和 `session_tool_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。

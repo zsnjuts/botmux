@@ -11524,6 +11524,9 @@ async function cmdSend(rest: string[]): Promise<void> {
                   ? { receiptDispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
                   : {}),
                 receiptProof: scheduledFinalDeliveryProof,
+                ...(scheduleRemoveSelfTaskId
+                  ? { receiptScheduleSelfCleanup: true }
+                  : {}),
               }
             : {}),
         });
@@ -12681,6 +12684,7 @@ async function cmdSend(rest: string[]): Promise<void> {
               proof: scheduledFinalDeliveryProof,
             } }
           : {}),
+        ...(scheduleRemoveSelfTaskId ? { scheduleSelfCleanup: true } : {}),
         providerUuid: effectiveResponseKind === 'final'
           ? durablePrimaryFinalProviderUuid({
               larkAppId: appId,

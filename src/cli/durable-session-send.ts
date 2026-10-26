@@ -37,6 +37,7 @@ export interface DurableSessionSendInput {
     dispatchAttempt?: number;
     proof: string;
   };
+  scheduleSelfCleanup?: boolean;
   hookContext?: Record<string, unknown>;
 }
 
@@ -85,6 +86,7 @@ export async function dispatchDurableSessionMessage(
     msgType: input.msgType,
     providerUuid: input.providerUuid,
     responseKind: input.responseKind,
+    ...(input.scheduleSelfCleanup === true ? { scheduleSelfCleanup: true } : {}),
     ...(input.hookContext ? { hookContext: input.hookContext } : {}),
   };
   let lastError = 'owning daemon did not return a response';

@@ -414,6 +414,7 @@ describe('botmux send per-turn final idempotency', () => {
         `/api/sessions/${f.sessionId}/turn-delivery`,
         '/api/schedule/managed-mutate',
       ]);
+      expect(daemonRequests[0]?.body?.receiptScheduleSelfCleanup).toBe(true);
       expect(JSON.parse(String(sent.result.stdout).split('\n').findLast(line => line.startsWith('{'))!))
         .toMatchObject({
           scheduleSelfCleanup: {

@@ -465,7 +465,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setScheduledSelfCleanupReceiptHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -542,7 +542,10 @@ import {
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
-import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
+import {
+  ScheduleAuthorityStore,
+  type ScheduleSelfCleanupReceipt,
+} from './services/schedule-authority-store.js';
 import {
   appendDurablePrimaryInputCommit,
   durablePrimaryExistingTurnDisposition,
@@ -23553,6 +23556,20 @@ function sameDurableOutboxTarget(
     && actual.messageId === expected.messageId;
 }
 
+function sameScheduleSelfCleanupReceipt(
+  left: ScheduleSelfCleanupReceipt | undefined,
+  right: ScheduleSelfCleanupReceipt,
+): boolean {
+  return !!left
+    && left.appId === right.appId
+    && left.taskId === right.taskId
+    && left.turnId === right.turnId
+    && left.workerGeneration === right.workerGeneration
+    && left.dispatchAttempt === right.dispatchAttempt
+    && left.proof === right.proof
+    && left.messageId === right.messageId;
+}
+
 /**
  * Bind a worker-admission decision to the durable-primary handler that owns
  * this inbound event. Hard rejection queues synchronously. Marginal memory
@@ -30303,6 +30320,32 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const authoritativeTasks = scheduleAuthorityStore.listTasks(cfg.larkAppId);
     scheduleStore.replaceAuthoritativeProjection(authoritativeTasks, cfg.larkAppId);
     scheduler.setScheduleAuthorityStore(scheduleAuthorityStore);
+    setScheduledSelfCleanupReceiptHandler(request => {
+      if (!scheduleAuthorityStore) return false;
+      const receipt: ScheduleSelfCleanupReceipt = {
+        appId: request.appId,
+        taskId: request.taskId,
+        turnId: request.turnId,
+        workerGeneration: request.workerGeneration,
+        ...(request.dispatchAttempt !== undefined
+          ? { dispatchAttempt: request.dispatchAttempt }
+          : {}),
+        proof: request.proof,
+        messageId: request.messageId,
+      };
+      if (request.action === 'record') {
+        scheduleAuthorityStore.recordSelfCleanupReceipt(receipt);
+        return true;
+      }
+      return sameScheduleSelfCleanupReceipt(
+        scheduleAuthorityStore.getSelfCleanupReceipt(
+          receipt.appId,
+          receipt.taskId,
+          receipt.turnId,
+        ),
+        receipt,
+      );
+    });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     logger.error(
@@ -30311,6 +30354,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     );
     try { scheduleAuthorityStore?.close(); } catch { /* no-op */ }
     scheduleAuthorityStore = null;
+    setScheduledSelfCleanupReceiptHandler(null);
     scheduler.setScheduleAuthorityUnavailable(error);
   }
   void runDurableConfigMutation({
@@ -32242,8 +32286,38 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!isConfirmedLarkMessageId(providerMessageId)) {
         return { kind: 'ambiguous', error: 'delivered outbox receipt lacks provider message id' };
       }
-      const trustedFinalDelivery = trustedFinalTarget
+      let trustedFinalDelivery = trustedFinalTarget
         && observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId);
+      if (trustedFinalTarget && request.scheduleSelfCleanup === true
+          && scheduledTaskId && receiptProof
+          && typeof receiptWorkerGeneration === 'number') {
+        const cleanupReceipt: ScheduleSelfCleanupReceipt = {
+          appId: request.daemonSession.larkAppId,
+          taskId: scheduledTaskId,
+          turnId: request.turnId,
+          workerGeneration: receiptWorkerGeneration,
+          ...(receiptDispatchAttempt !== undefined
+            ? { dispatchAttempt: receiptDispatchAttempt }
+            : {}),
+          proof: receiptProof,
+          messageId: providerMessageId,
+        };
+        if (trustedFinalDelivery) {
+          if (!scheduleAuthorityStore) {
+            throw new Error('schedule self-cleanup receipt store is unavailable');
+          }
+          scheduleAuthorityStore.recordSelfCleanupReceipt(cleanupReceipt);
+        } else {
+          trustedFinalDelivery = sameScheduleSelfCleanupReceipt(
+            scheduleAuthorityStore?.getSelfCleanupReceipt(
+              cleanupReceipt.appId,
+              cleanupReceipt.taskId,
+              cleanupReceipt.turnId,
+            ),
+            cleanupReceipt,
+          );
+        }
+      }
       const trustedFinalReceipt = trustedFinalDelivery && receiptProof
         && typeof receiptWorkerGeneration === 'number'
         ? scheduledFinalReceiptEnvelope({

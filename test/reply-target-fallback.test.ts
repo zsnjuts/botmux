@@ -149,6 +149,18 @@ describe('rehomeReplyTargetState', () => {
     expect(ds.session.turnReplyContexts?.om_zero_time?.sourceMessageCreateTime).toBeUndefined();
   });
 
+  it.each(['0x10', '1e13', '123.5', ' 1792907862000 '])(
+    'does not persist malformed platform create_time %s', sourceMessageCreateTime => {
+      const ds = makeDs();
+      beginReplyTargetTurn(ds as DaemonSession, 'om_source', 'om_bad_time', NOW, {
+        sourceMessageId: 'om_source',
+        sourceMessageCreateTime,
+      });
+
+      expect(ds.session.turnReplyContexts?.om_bad_time?.sourceMessageCreateTime).toBeUndefined();
+    },
+  );
+
   it('removes source-topic routing authority while preserving buffered-turn attribution', () => {
     const ds = makeDs({
       scope: 'thread',

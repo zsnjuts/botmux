@@ -6318,6 +6318,28 @@ describe('handleCommand', () => {
       );
     });
 
+    it.each(['0x10', '1e13', '123.5', ' 1792907862000 '])(
+      'does not normalize malformed platform create_time %s', async createTime => {
+        vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
+        const ds = makeDaemonSession();
+        const deps = makeDeps(ds);
+
+        await handleCommand(
+          '/schedule',
+          ROOT_ID,
+          makeLarkMessage('/schedule 30分钟后 提醒我', { createTime }),
+          deps,
+          LARK_APP_ID,
+        );
+
+        expect(scheduler.parseNaturalSchedule).toHaveBeenCalledWith(
+          '30分钟后 提醒我',
+          undefined,
+          { requireTrustedReferenceTime: true },
+        );
+      },
+    );
+
     it('should list tasks when called with no args (empty list)', async () => {
       vi.mocked(scheduleStore.listTasks).mockReturnValue([]);
 

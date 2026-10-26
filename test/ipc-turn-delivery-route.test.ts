@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   setIpcAuthSecret,
+  setScheduledSelfCleanupReceiptHandler,
   startIpcServer,
   type IpcServerHandle,
 } from '../src/core/dashboard-ipc-server.js';
@@ -28,6 +29,7 @@ import { RELAYED_TURN_DELIVERY_MAX_BYTES } from '../src/core/relayed-turn-delive
 import {
   __testOnlyResetScheduledRunSettlements,
   beginScheduledRunSettlement,
+  revokeScheduledRunSettlements,
 } from '../src/core/scheduled-run-settlement.js';
 import {
   deriveScheduledFinalDeliveryProof,
@@ -49,6 +51,7 @@ afterEach(async () => {
   if (handle) await handle.close();
   handle = null;
   setIpcAuthSecret(null);
+  setScheduledSelfCleanupReceiptHandler(null);
   await __testOnly_closeSkillFeedbackStores();
   if (prevDataDir !== null) config.session.dataDir = prevDataDir;
   prevDataDir = null;
@@ -258,6 +261,74 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     void settlement.settled.then(() => { settled = true; }, () => { settled = true; });
     await Promise.resolve();
     expect(settled).toBe(false);
+  });
+
+  it('replays a persisted cleanup receipt after remove revoked the live settlement', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000113';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'cleanup final' }] },
+    }, proof), 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_cleanup_final',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      larkAppId: 'cli_app',
+      requireFinalDelivery: true,
+    });
+    let persisted: Record<string, unknown> | undefined;
+    setScheduledSelfCleanupReceiptHandler(request => {
+      const { action, ...value } = request;
+      if (action === 'record') {
+        persisted = value;
+        return true;
+      }
+      return JSON.stringify(persisted) === JSON.stringify(value);
+    });
+    const payload = {
+      originCapability: CAP_A,
+      messageId: 'om_cleanup_final',
+      content: 'cleanup final',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+      receiptScheduleSelfCleanup: true,
+    };
+
+    const first = await post('sess-a', payload);
+    expect(first.status).toBe(200);
+    await expect(settlement.settled).resolves.toEqual({ messageId: 'om_cleanup_final' });
+    expect(revokeScheduledRunSettlements('deadbeef', 'cli_app')).toBe(1);
+
+    const afterLostRemoveResponse = await post('sess-a', payload);
+    expect(afterLostRemoveResponse.status).toBe(200);
+    expect(await afterLostRemoveResponse.json()).toMatchObject({
+      ok: true,
+      duplicate: true,
+      trustedFinalReceipt: {
+        messageId: 'om_cleanup_final',
+        turnId,
+        proof,
+      },
+    });
   });
 
   it('rejects a receipt from a stale worker generation before provider readback', async () => {

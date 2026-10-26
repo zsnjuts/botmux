@@ -50,6 +50,22 @@ describe('durable Session send client', () => {
     });
   });
 
+  it('carries only the presence-only scheduled self-cleanup intent', async () => {
+    const post = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      kind: 'delivered',
+      messageId: 'om_delivered',
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    await dispatchDurableSessionMessage({ post }, {
+      ...input,
+      scheduleSelfCleanup: true,
+    });
+    expect(post).toHaveBeenCalledWith('session-1', 'durable-send', expect.objectContaining({
+      scheduleSelfCleanup: true,
+    }));
+  });
+
   it('retries a lost daemon response with the same turn and provider identity', async () => {
     const post = vi.fn()
       .mockRejectedValueOnce(new Error('socket closed during daemon restart'))

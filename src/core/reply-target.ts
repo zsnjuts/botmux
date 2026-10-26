@@ -1,5 +1,6 @@
 import type { DaemonSession } from './types.js';
 import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import { normalizeScheduleSourceMessageCreateTime } from './schedule-reference-time.js';
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -403,14 +404,16 @@ export function beginReplyTargetTurn(
     quoteOnly: opts?.quoteOnly,
   });
   const exactContexts = { ...(ds.session.turnReplyContexts ?? {}) };
-  const sourceMessageCreateTime = Number(opts?.sourceMessageCreateTime);
+  const sourceMessageCreateTime = normalizeScheduleSourceMessageCreateTime(
+    opts?.sourceMessageCreateTime,
+  );
   // Re-insertion keeps the newest turn at the end for deterministic bounding.
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
     ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
       ? { sourceMessageId: opts.sourceMessageId } : {}),
-    ...(Number.isFinite(sourceMessageCreateTime) && sourceMessageCreateTime > 0
+    ...(sourceMessageCreateTime !== undefined
       ? { sourceMessageCreateTime }
       : {}),
     ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
