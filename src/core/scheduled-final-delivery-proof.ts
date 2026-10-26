@@ -3,7 +3,10 @@ import { projectGroupContextCard } from '../im/lark/group-context-card.js';
 import { isConfirmedLarkMessageId } from './scheduled-run-settlement.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 
-const ELEMENT_PREFIX = 'botmux_scheduled_final_receipt_';
+// Lark Card 2.0 element_id must begin with a letter and be at most 20 chars.
+// Keep 52 digest bits after the stable seven-character namespace.
+const ELEMENT_PREFIX = 'bmxsfr_';
+const ELEMENT_ID_MAX_LENGTH = 20;
 
 export interface ScheduledFinalDeliveryIdentity {
   turnId: string;
@@ -29,26 +32,40 @@ export function scheduledFinalDeliveryElementId(
     .update('\0', 'utf8')
     .update(input.dispatchAttempt === undefined ? '-' : String(input.dispatchAttempt), 'utf8')
     .digest('hex')
-    .slice(0, 32);
+    .slice(0, ELEMENT_ID_MAX_LENGTH - ELEMENT_PREFIX.length);
   return `${ELEMENT_PREFIX}${digest}`;
 }
 
-/** Add an invisible, turn-specific carrier that Lark preserves in structured
- * card readback. It proves the provider message was built for this exact
- * scheduled turn/generation; a client-reported message id alone proves none of
- * that. */
+/** Bind the turn-specific proof to a real card element that Lark preserves in
+ * structured readback.  The old carrier combined an overlong element id with a
+ * standalone markdown body containing only an invisible Unicode separator;
+ * neither is a provider-durable Card 2.0 contract even though both survive
+ * local renderer tests.
+ *
+ * Prefer the footer separator because changing only its `element_id` leaves the
+ * user-visible rendering equivalent.  If a card has no
+ * separator, reuse another unkeyed, non-interactive top-level element.  A
+ * caller-owned element id is never overwritten; the final fallback appends an
+ * ordinary separator, which Lark keeps and which remains harmless for custom
+ * cards whose every element is already keyed.
+ *
+ * The provider readback still has to match this exact proof.  A client-reported
+ * message id alone proves none of the scheduled turn/generation identity. */
 export function stampScheduledFinalDeliveryProof<T extends Record<string, any>>(
   card: T,
   elementId: string,
 ): T {
   if (!elementId.startsWith(ELEMENT_PREFIX)
       || !Array.isArray(card.body?.elements)) return card;
-  card.body.elements.push({
-    tag: 'markdown',
-    content: '\u2063',
-    text_size: 'notation',
-    element_id: elementId,
-  });
+  const elements = card.body.elements as Array<Record<string, unknown>>;
+  const reusable = [...elements].reverse().find(element =>
+    element?.tag === 'hr' && element.element_id === undefined)
+    ?? elements.find(element =>
+      element?.element_id === undefined
+      && typeof element?.tag === 'string'
+      && !['action', 'button', 'form', 'select_person', 'select_static', 'input'].includes(element.tag));
+  if (reusable) reusable.element_id = elementId;
+  else elements.push({ tag: 'hr', element_id: elementId });
   return card;
 }
 
