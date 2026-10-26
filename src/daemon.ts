@@ -4144,9 +4144,13 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   if (!reply) return undefined;
   const active = ds.activeInteractiveTurn;
+  const preparing = ds.preparingInteractiveTurn;
   const recoveryCaller = ds.session.failedTurnRecovery?.turnId === turnId
     ? ds.session.failedTurnRecovery.caller : undefined;
-  const caller = recoveryCaller ?? (active?.turnId === turnId ? active.caller : dispatchCallerFromReply(ds.larkAppId, reply));
+  const caller = recoveryCaller
+    ?? (preparing?.turnId === turnId ? preparing.caller
+      : active?.turnId === turnId ? active.caller
+        : dispatchCallerFromReply(ds.larkAppId, reply));
   // A positively identified human already has a platform identity. Their turn
   // does not depend on the unrelated delegation store being readable.
   if (caller?.senderType === 'user' && !caller.source

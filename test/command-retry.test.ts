@@ -584,6 +584,7 @@ describe('/retry command', () => {
     expect(ds.session.replyTargets?.om_msg_001).toBeUndefined();
     expect(ds.session.turnReplyContexts?.om_msg_001).toBeUndefined();
     expect(ds.activeInteractiveTurn).toBeUndefined();
+    expect(ds.preparingInteractiveTurn).toBeUndefined();
     expect(deps.sessionReply).toHaveBeenCalledWith(
       ROOT_ID,
       expect.stringContaining('重试提交失败'),
@@ -668,7 +669,8 @@ describe('/retry command', () => {
     };
     deps.invocationTrustedCaller = attested;
     deps.prepareTurn = vi.fn(async target => {
-      expect(target.activeInteractiveTurn).toEqual({
+      expect(target.activeInteractiveTurn).toBeUndefined();
+      expect(target.preparingInteractiveTurn).toEqual({
         turnId: 'om_msg_001',
         caller: attested,
         userPrompt: 'fix the flaky test',
@@ -676,7 +678,8 @@ describe('/retry command', () => {
     });
     deps.submitRetryTurn = vi.fn(async input => {
       expect(input.trustedCaller).toEqual(attested);
-      expect(input.ds.activeInteractiveTurn?.caller).toEqual(attested);
+      expect(input.ds.preparingInteractiveTurn).toBeUndefined();
+      expect(input.ds.activeInteractiveTurn).toBeUndefined();
       return { kind: 'accepted' as const };
     });
 
@@ -684,6 +687,7 @@ describe('/retry command', () => {
 
     expect(deps.prepareTurn).toHaveBeenCalledOnce();
     expect(deps.submitRetryTurn).toHaveBeenCalledOnce();
+    expect(ds.preparingInteractiveTurn).toBeUndefined();
     expect(ds.activeInteractiveTurn?.caller).toEqual(attested);
     expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
   });

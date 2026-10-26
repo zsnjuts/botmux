@@ -3653,6 +3653,7 @@ export async function handleCommand(
           sessionReplyThreadAliases: ds.session.replyThreadAliases,
           sessionCurrentReplyTarget: ds.session.currentReplyTarget,
           activeInteractiveTurn: ds.activeInteractiveTurn,
+          preparingInteractiveTurn: ds.preparingInteractiveTurn,
         };
         const rollbackReplyState = (): void => {
           ds.session.replyTargets = priorReplyState.replyTargets;
@@ -3663,6 +3664,7 @@ export async function handleCommand(
           ds.session.replyThreadAliases = priorReplyState.sessionReplyThreadAliases;
           ds.session.currentReplyTarget = priorReplyState.sessionCurrentReplyTarget;
           ds.activeInteractiveTurn = priorReplyState.activeInteractiveTurn;
+          ds.preparingInteractiveTurn = priorReplyState.preparingInteractiveTurn;
           try { sessionStore.updateSession(ds.session); }
           catch (err) {
             logger.warn(
@@ -3697,18 +3699,22 @@ export async function handleCommand(
             sourceMessageId: message.messageId,
           });
           // Identity preparation runs before worker IPC. Publish the exact
-          // daemon-attested caller now so bot-authored retries retain their
-          // separately verified developer; every non-accepted path below
-          // restores the prior active-turn mirror.
+          // daemon-attested caller through a preparation-only mirror: treating
+          // it as an active turn would make the durable admission check reject
+          // its own retry forever. Every exit restores the prior mirror.
           if (retryCaller) {
-            ds.activeInteractiveTurn = {
+            ds.preparingInteractiveTurn = {
               turnId: retryTurnId,
               caller: { ...retryCaller },
               userPrompt: failedTurn.userPrompt,
             };
           }
           sessionStore.updateSession(ds.session);
-          await deps.prepareTurn?.(ds, retryTurnId);
+          try {
+            await deps.prepareTurn?.(ds, retryTurnId);
+          } finally {
+            ds.preparingInteractiveTurn = priorReplyState.preparingInteractiveTurn;
+          }
           if (deps.submitRetryTurn) {
             submission = await deps.submitRetryTurn({
               ds,
