@@ -19,6 +19,7 @@ import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
 import { handleOncallServiceSecret } from './dashboard/oncall-service-secret.js';
+import { installBotsJsonSnapshotStore } from './setup/bots-store.js';
 import {
   deleteTeamRoleFile,
   readTeamRoleInjectMode,
@@ -26,7 +27,6 @@ import {
   writeTeamRoleFile,
   writeTeamRoleInjectMode,
 } from './core/role-resolver.js';
-import { readBotsJsonOrEmpty } from './setup/bots-store.js';
 import { listenWithProbe, LISTEN_RELEASE_WEDGED_CODE, type VerifyBoundResult } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
@@ -178,7 +178,7 @@ import {
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { globalConfigPath, installGlobalConfigReadSnapshot, invalidateGlobalConfigCache, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type VcMeetingSharedConsumerCatalog, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -314,7 +314,7 @@ import {
   enrichPacksForDashboard,
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
-import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { adoptBotConfigSnapshotSource, effectiveDefaultWorkingDir, getBot, installBotConfigReadSnapshot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import {
   findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
@@ -347,8 +347,8 @@ import {
 import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
 import { resolvePairedSpawnBackendType } from './core/persistent-backend.js';
 import {
-  readVcMeetingSharedConsumerCatalogSnapshot,
-  updateVcMeetingSharedConsumerCatalog,
+  updateVcMeetingSharedConsumerCatalogWithStorage,
+  vcMeetingSharedConsumerCatalogSnapshotFromRaw,
 } from './services/vc-meeting-shared-consumer-catalog-store.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
@@ -399,6 +399,7 @@ import {
 } from './dashboard/autostart-api.js';
 import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
 import { resolveDashboardSelfNonce } from './core/dashboard-startup-readiness.js';
+import { DashboardConfigSnapshotStore } from './dashboard/config-snapshot.js';
 
 // The dashboard is an independent long-lived PM2 app and can be resurrected
 // from a stale dump.pm2 without passing through cli.ts pm2Env(). Its start/stop
@@ -420,13 +421,45 @@ const dashboardAutostart = createDashboardAutostartController({
 /** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
-const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
+const BOTS_JSON_PATH = process.env.BOTS_CONFIG?.trim()
+  ? resolve(process.env.BOTS_CONFIG.trim())
+  : join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
 // botmux instance on this host). The actually-bound port is persisted here so
 // the `botmux dashboard` CLI can reach /__cli/current, /__cli/ensure, and
 // /__cli/rotate without guessing.
 const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
+
+// Dashboard 是控制面的 HTTP 进程，请求/event-loop 线程绝不能同步 open config.json
+// 或 bots.json：托管部署经常把它们放在 hard NFS 上，一次 open(2) 就可能无限等待，
+// 此时 TCP 端口却仍保持监听。两份文档均走有界后台读取，请求只消费 last-known-good 投影。
+//
+// Core-only 比较特殊：bot-registry 从 env 合成唯一 apiOnly 身份，并刻意忽略环境中的
+// 所有 bots.json；因此先生成初始快照，再安装进程级 provider，同时关闭文件刷新。
+const coreOnlyBotConfigs = process.env.BOTMUX_CORE_ONLY === '1' ? loadBotConfigs() : [];
+const dashboardConfigSnapshots = new DashboardConfigSnapshotStore({
+  botsPath: BOTS_JSON_PATH,
+  globalPath: globalConfigPath(),
+  initialBots: coreOnlyBotConfigs,
+  botsFileEnabled: process.env.BOTMUX_CORE_ONLY !== '1',
+  onBotsSnapshotReady: adoptBotConfigSnapshotSource,
+  log: logger,
+});
+installBotConfigReadSnapshot(dashboardConfigSnapshots.readBots);
+installBotsJsonSnapshotStore({
+  read: dashboardConfigSnapshots.readRawBots,
+  write: dashboardConfigSnapshots.writeRawBots,
+});
+installGlobalConfigReadSnapshot({
+  read: dashboardConfigSnapshots.readGlobal,
+  refresh: () => { void dashboardConfigSnapshots.refreshGlobal(); },
+});
+const initialConfigRefresh = await dashboardConfigSnapshots.prime();
+if (initialConfigRefresh.bots === 'timed_out' || initialConfigRefresh.global === 'timed_out') {
+  logger.warn('[dashboard-config] 初始配置加载超过时限，Dashboard 将使用安全默认值或最近一次有效投影启动');
+}
+dashboardConfigSnapshots.start();
 
 function loadOrCreateSecret(): string {
   let existing: string | null;
@@ -1425,12 +1458,32 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
   // live registry only knows online bots; bots-info.json is written when a bot
   // is probed and survives across restarts. Built once per deps construction.
   const persistedBotNames = readPersistedBotNames();
+  const rawCatalog = (): unknown => {
+    const raw = dashboardConfigSnapshots.readRawGlobal();
+    const vcMeetingAgent = raw.vcMeetingAgent && typeof raw.vcMeetingAgent === 'object' && !Array.isArray(raw.vcMeetingAgent)
+      ? raw.vcMeetingAgent as Record<string, unknown>
+      : {};
+    return vcMeetingAgent.consumerCatalog;
+  };
+  const writeCatalog = (catalog: VcMeetingSharedConsumerCatalog): void => {
+    const raw = dashboardConfigSnapshots.readRawGlobal();
+    const vcMeetingAgent = raw.vcMeetingAgent && typeof raw.vcMeetingAgent === 'object' && !Array.isArray(raw.vcMeetingAgent)
+      ? { ...raw.vcMeetingAgent as Record<string, unknown> }
+      : {};
+    vcMeetingAgent.consumerCatalog = catalog;
+    dashboardConfigSnapshots.mergeGlobalConfig({ vcMeetingAgent });
+  };
   return {
-    readCatalog: readVcMeetingSharedConsumerCatalogSnapshot,
+    readCatalog: () => vcMeetingSharedConsumerCatalogSnapshotFromRaw(rawCatalog()),
     updateCatalog: input => runDurableConfigMutation({
       scope: 'global',
       path: globalConfigPath(),
-      mutation: async () => updateVcMeetingSharedConsumerCatalog(input),
+      mutation: () => dashboardConfigSnapshots.runGlobalMutation(async () => (
+        updateVcMeetingSharedConsumerCatalogWithStorage(input, {
+          readRawCatalog: rawCatalog,
+          writeCatalog,
+        })
+      )),
     }),
     loadBotConfigs,
     effectiveDefaultWorkingDir,
@@ -1897,7 +1950,7 @@ const botOnboarding = new BotOnboardingManager({
   runBotsMutation: mutation => runDurableConfigMutation({
     scope: 'bots',
     path: BOTS_JSON_PATH,
-    mutation: async () => mutation(),
+    mutation: () => dashboardConfigSnapshots.runBotsMutation(mutation),
   }),
 });
 
@@ -1918,15 +1971,19 @@ const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(
   reloadLocaleOnAllDaemons,
   disableCrossPrincipalInterruptionOnAllDaemons,
 );
+settingsWriteApplierDeps.readGlobalConfig = dashboardConfigSnapshots.readGlobal;
+settingsWriteApplierDeps.mergeDashboardConfig = dashboardConfigSnapshots.mergeDashboardConfig;
+settingsWriteApplierDeps.mergeGlobalConfig = dashboardConfigSnapshots.mergeGlobalConfig;
+settingsWriteApplierDeps.writeCodexNotifierConfig = dashboardConfigSnapshots.writeCodexNotifierConfig;
+settingsWriteApplierDeps.writeHostOverloadAlertConfig = dashboardConfigSnapshots.writeHostOverloadAlertConfig;
+settingsWriteApplierDeps.mergeMaintenanceConfig = dashboardConfigSnapshots.mergeMaintenanceConfig;
+settingsWriteApplierDeps.setGlobalLocale = dashboardConfigSnapshots.setGlobalLocale;
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
 settingsWriteApplierDeps.runConfigMutation = mutation => runDurableConfigMutation({
   scope: 'global',
   path: globalConfigPath(),
-  mutation: async () => {
-    invalidateGlobalConfigCache();
-    return mutation();
-  },
+  mutation: () => dashboardConfigSnapshots.runGlobalMutation(mutation),
 });
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
@@ -2348,34 +2405,10 @@ void runCodexNotifierWorkerSupervisor({
   },
 });
 
-// bots.json for the monitor's daemon seeds, re-parsed only when the file changes.
-// loadBotConfigs() parses and validates the whole registry on every call — a
-// couple of MB on a large fleet — and the sampler asked for it every 10s, on the
-// event loop. Keyed on mtime+size so a hot edit still shows up on the next tick;
-// a read failure keeps the last good snapshot rather than throwing out of the
-// sampler's timer (which would be an uncaught exception in this process).
-let monitorBotConfigsMemo: { key: string; configs: BotConfig[] } | null = null;
-function monitorBotConfigsKey(): string | null {
-  try {
-    // getLoadedConfigPath() honours BOTS_CONFIG once the registry has been
-    // loaded at least once (it has, long before the sampler's first tick).
-    const st = statSync(getLoadedConfigPath() ?? BOTS_JSON_PATH);
-    return `${st.mtimeMs}:${st.size}`;
-  } catch {
-    return null;
-  }
-}
+// 中央快照负责 bots.json 新鲜度；采样器只读它的内存 generation，即使大规模 fleet
+// 每 10 秒采样一次，也不得在 event loop 上 stat/open 共享存储。
 function monitorBotConfigs(): BotConfig[] {
-  const key = monitorBotConfigsKey();
-  if (key !== null && monitorBotConfigsMemo?.key === key) return monitorBotConfigsMemo.configs;
-  try {
-    const configs = loadBotConfigs();
-    const loadedKey = monitorBotConfigsKey();
-    monitorBotConfigsMemo = loadedKey === null ? null : { key: loadedKey, configs };
-    return configs;
-  } catch {
-    return monitorBotConfigsMemo?.configs ?? [];
-  }
+  return loadBotConfigs();
 }
 
 const resourceMonitor = createResourceMonitorService({
@@ -2692,12 +2725,11 @@ async function writeDashboardPluginPin(pluginId: string, pinned: boolean): Promi
   await runDurableConfigMutation({
     scope: 'global',
     path: globalConfigPath(),
-    mutation: async () => {
-      invalidateGlobalConfigCache();
+    mutation: () => dashboardConfigSnapshots.runGlobalMutation(async () => {
       const current = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
       const next = pinned ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
-      mergeDashboardConfig({ pinnedPlugins: next });
-    },
+      dashboardConfigSnapshots.mergeDashboardConfig({ pinnedPlugins: next });
+    }),
   });
 }
 
@@ -2802,14 +2834,13 @@ async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Pro
   await runDurableConfigMutation({
     scope: 'global',
     path: globalConfigPath(),
-    mutation: async () => {
-      invalidateGlobalConfigCache();
+    mutation: () => dashboardConfigSnapshots.runGlobalMutation(async () => {
       const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
       assertPluginBindingTransition(pluginId, enabled, current);
       if (enabled) materializePlugin(pluginId);
       const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
-      mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
-    },
+      dashboardConfigSnapshots.mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+    }),
   });
 }
 
@@ -3934,7 +3965,7 @@ const companionApi = (() => {
   if (!secretFile && !appId) return null;
   if (!secretFile || !appId) throw new Error('companion_configuration_incomplete');
   const requireBoundBot = () => {
-    const matches = readBotsJsonOrEmpty(BOTS_JSON_PATH).filter((entry) => entry?.larkAppId === appId);
+    const matches = loadBotConfigs().filter((entry) => entry?.larkAppId === appId);
     const bot = matches.length === 1 ? matches[0] : undefined;
     // Companion binding REQUIRES a credential-isolating oncall sandbox (the
     // companion's whole premise is running with the bot's masked transport
@@ -5548,11 +5579,10 @@ const server = createServer(async (req, res) => {
       await runDurableConfigMutation({
         scope: 'global',
         path: globalConfigPath(),
-        mutation: async () => {
-          invalidateGlobalConfigCache();
+        mutation: () => dashboardConfigSnapshots.runGlobalMutation(async () => {
           const currentSkills = readGlobalConfig().skills ?? {};
-          mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
-        },
+          dashboardConfigSnapshots.mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
+        }),
       });
       return jsonRes(res, 200, { ok: true, ...dashboardSkillsPayload() });
     }
@@ -8218,6 +8248,7 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
 // Graceful shutdown
 function shutdown(): void {
   codexNotifierAbort.abort();
+  dashboardConfigSnapshots.stop();
   stopAutoCleanup();
   for (const sub of subs.values()) sub.off();
   subs.clear();

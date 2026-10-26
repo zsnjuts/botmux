@@ -1,3 +1,4 @@
+import { existsSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import {
   DURABLE_COORDINATION_PROVIDER_PROTOCOL,
@@ -6,7 +7,13 @@ import {
 import { DURABLE_COORDINATION_CONTRACT_VERSION } from '../../src/services/durable-coordination.js';
 
 const badContract = process.argv.includes('--bad-contract');
-const provider = process.argv.includes('--slow') ? 'fixture-slow' : 'fixture';
+const slowOnceMarkerIndex = process.argv.indexOf('--slow-once-file');
+const slowOnceMarker = slowOnceMarkerIndex >= 0 ? process.argv[slowOnceMarkerIndex + 1] : undefined;
+const provider = process.argv.includes('--slow')
+  ? 'fixture-slow'
+  : slowOnceMarker
+    ? 'fixture-slow-once'
+    : 'fixture';
 
 function controlRecord(
   state: 'pending' | 'attempting' | 'ambiguous' | 'completed',
@@ -49,6 +56,10 @@ lines.on('line', line => {
     return;
   }
   if (process.argv.includes('--slow')) return;
+  if (slowOnceMarker && !existsSync(slowOnceMarker)) {
+    writeFileSync(slowOnceMarker, `${request.method}:${String(request.input)}\n`, { flag: 'wx' });
+    return;
+  }
   if (request.type !== 'call') {
     send({ ...base, type: 'error', code: 'invalid_request', message: 'invalid request', retryable: false });
     return;

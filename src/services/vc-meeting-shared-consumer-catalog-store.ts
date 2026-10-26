@@ -211,7 +211,9 @@ export function validateVcMeetingSharedConsumerCatalog(
   return { ok: true, profiles: normalized.map(stripAgentAppId) };
 }
 
-function snapshotFromRaw(rawCatalog: unknown): VcMeetingSharedConsumerCatalogSnapshot {
+export function vcMeetingSharedConsumerCatalogSnapshotFromRaw(
+  rawCatalog: unknown,
+): VcMeetingSharedConsumerCatalogSnapshot {
   const state = catalogStateFromRaw(rawCatalog);
   // 没配置过就落到内置默认目录（daemon 侧绑定层用同一个常量），显式清空则保持空。
   const entry = (state === 'uninitialized'
@@ -239,24 +241,26 @@ function snapshotFromRaw(rawCatalog: unknown): VcMeetingSharedConsumerCatalogSna
 }
 
 export function readVcMeetingSharedConsumerCatalogSnapshot(): VcMeetingSharedConsumerCatalogSnapshot {
-  return snapshotFromRaw(rawGlobalVcMeetingSharedConsumerCatalog());
+  return vcMeetingSharedConsumerCatalogSnapshotFromRaw(rawGlobalVcMeetingSharedConsumerCatalog());
 }
 
-/**
- * 乐观并发替换共享目录。
- *
- * revision 校验与写入之间没有 `await`，所以同进程内不存在竞态；跨进程用的是
- * `mergeGlobalConfig` 的 tmp+rename 原子写（与其它全局设置一致）。
- */
-export function updateVcMeetingSharedConsumerCatalog(
+export interface VcMeetingSharedConsumerCatalogStorage {
+  readRawCatalog(): unknown;
+  writeCatalog(catalog: VcMeetingSharedConsumerCatalog): void;
+}
+
+/** Dashboard 异步配置事务复用的、与存储后端无关的 CAS 主体。 */
+export function updateVcMeetingSharedConsumerCatalogWithStorage(
   input: UpdateVcMeetingSharedConsumerCatalogInput,
+  storage: VcMeetingSharedConsumerCatalogStorage,
 ): UpdateVcMeetingSharedConsumerCatalogResult {
-  let current: VcMeetingSharedConsumerCatalogSnapshot;
+  let rawCatalog: unknown;
   try {
-    current = readVcMeetingSharedConsumerCatalogSnapshot();
+    rawCatalog = storage.readRawCatalog();
   } catch (err) {
     return { ok: false, reason: 'config_unavailable', error: err instanceof Error ? err.message : String(err) };
   }
+  const current = vcMeetingSharedConsumerCatalogSnapshotFromRaw(rawCatalog);
   if (current.revision !== input.expectedRevision) return { ok: false, reason: 'config_conflict' };
 
   const validated = validateVcMeetingSharedConsumerCatalog(input);
@@ -268,13 +272,26 @@ export function updateVcMeetingSharedConsumerCatalog(
     defaultConsumerIds: [...input.defaultConsumerIds],
   };
   try {
-    // mergeGlobalConfig 写完会清掉 readCache 与 vcMeetingAgentLiveCache，所以
-    // 下面的回读一定看到新目录，本进程无需另行失效缓存。
-    writeGlobalVcMeetingSharedConsumerCatalog(catalog);
+    storage.writeCatalog(catalog);
   } catch (err) {
     return { ok: false, reason: 'config_unavailable', error: err instanceof Error ? err.message : String(err) };
   }
-  return { ok: true, snapshot: readVcMeetingSharedConsumerCatalogSnapshot() };
+  return { ok: true, snapshot: vcMeetingSharedConsumerCatalogSnapshotFromRaw(catalog) };
+}
+
+/**
+ * 乐观并发替换共享目录。
+ *
+ * revision 校验与写入之间没有 `await`，所以同进程内不存在竞态；跨进程用的是
+ * `mergeGlobalConfig` 的 tmp+rename 原子写（与其它全局设置一致）。
+ */
+export function updateVcMeetingSharedConsumerCatalog(
+  input: UpdateVcMeetingSharedConsumerCatalogInput,
+): UpdateVcMeetingSharedConsumerCatalogResult {
+  return updateVcMeetingSharedConsumerCatalogWithStorage(input, {
+    readRawCatalog: rawGlobalVcMeetingSharedConsumerCatalog,
+    writeCatalog: writeGlobalVcMeetingSharedConsumerCatalog,
+  });
 }
 
 /** 便于测试/诊断：当前生效的配置文件路径。 */

@@ -11,8 +11,34 @@ import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
 import { assertChangedBotConfigInvariants } from '../services/bot-config-invariants.js';
 import { assertDurableConfigMutationAllowed } from '../services/durable-config-mutation.js';
 
+let processSnapshotStore: {
+  read(path: string): any[];
+  write(path: string, bots: any[]): void;
+} | null = null;
+
+/**
+ * 安装进程级 bots.json 投影/写事务适配器。
+ *
+ * Dashboard 借此让 BotOnboardingManager 的旧同步接口只操作内存事务，真实共享存储
+ * I/O 由外层 CAS mutation 异步完成；其他进程仍使用下面的直接原子文件实现。
+ */
+export function installBotsJsonSnapshotStore(provider: {
+  read(path: string): any[];
+  write(path: string, bots: any[]): void;
+}): () => void {
+  const previous = processSnapshotStore;
+  processSnapshotStore = provider;
+  return () => {
+    if (processSnapshotStore === provider) processSnapshotStore = previous;
+  };
+}
+
 export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
   assertDurableConfigMutationAllowed('bots');
+  if (processSnapshotStore) {
+    processSnapshotStore.write(botsJsonPath, bots);
+    return;
+  }
   // PM2 start surfaces hold this same generation lock from snapshot through
   // post-start verification/rollback, so the ecosystem and its expected names
   // can never be built from different bots.json generations.
@@ -30,6 +56,7 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
 }
 
 export function readBotsJsonOrEmpty(botsJsonPath: string): any[] {
+  if (processSnapshotStore) return processSnapshotStore.read(botsJsonPath);
   if (!existsSync(botsJsonPath)) return [];
   try {
     return JSON.parse(readFileSync(botsJsonPath, 'utf-8'));

@@ -1,4 +1,6 @@
-import { resolve } from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   type DurableCoordinationProviderMethod,
@@ -183,6 +185,30 @@ describe('external durable coordination provider', () => {
     });
     await expect(store.readSession('missing')).rejects.toThrow(/timed out/);
     store.terminate();
+  });
+
+  it('reconnects for a later call without replaying the timed-out request', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'botmux-provider-reconnect-'));
+    const marker = join(root, 'slow-once');
+    let store: ExternalDurableCoordinationStore | undefined;
+    try {
+      store = await ExternalDurableCoordinationStore.connect({
+        ...providerCommand(['--slow-once-file', marker]),
+        requestTimeoutMs: 100,
+      });
+      await expect(store.readSession('first-timeout')).rejects.toThrow(/timed out/);
+      expect(await readFile(marker, 'utf8')).toBe('readSession:first-timeout\n');
+
+      await expect(Promise.all(
+        Array.from({ length: 8 }, () => store!.readSession('missing')),
+      )).resolves.toEqual(Array.from({ length: 8 }, () => undefined));
+      expect(store.provider).toBe('fixture-slow-once');
+      expect(await readFile(marker, 'utf8')).toBe('readSession:first-timeout\n');
+      await store.close();
+    } finally {
+      store?.terminate();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
