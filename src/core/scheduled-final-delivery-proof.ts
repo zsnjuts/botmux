@@ -69,17 +69,34 @@ export function stampScheduledFinalDeliveryProof<T extends Record<string, any>>(
   return card;
 }
 
-function hasElementId(value: unknown, elementId: string): boolean {
-  if (!value || typeof value !== 'object') return false;
-  if (Array.isArray(value)) return value.some(item => hasElementId(item, elementId));
-  const record = value as Record<string, unknown>;
-  if (record.element_id === elementId) return true;
-  if (typeof record.user_dsl === 'string') {
-    try {
-      if (hasElementId(JSON.parse(record.user_dsl), elementId)) return true;
-    } catch { /* malformed optional wrapper */ }
+function providerCardRoot(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const root = value as Record<string, unknown>;
+  if (typeof root.user_dsl !== 'string') return root;
+  try {
+    const inner = JSON.parse(root.user_dsl) as unknown;
+    return inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? inner as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
   }
-  return Object.values(record).some(item => hasElementId(item, elementId));
+}
+
+/** The proof writer stamps only a top-level Card 2.0 body component.  Match
+ * that exact provider-preserved structure rather than recursively scanning
+ * arbitrary JSON: callback `behaviors[].value`, URLs, chart data and other
+ * model-authored payloads are data, not delivery-proof components. */
+function hasProviderComponentElementId(value: unknown, elementId: string): boolean {
+  const root = providerCardRoot(value);
+  const body = root?.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const elements = (body as Record<string, unknown>).elements;
+  return Array.isArray(elements) && elements.some(element =>
+    !!element
+    && typeof element === 'object'
+    && !Array.isArray(element)
+    && (element as Record<string, unknown>).element_id === elementId);
 }
 
 export type ScheduledFinalDeliveryReadback =
@@ -118,7 +135,7 @@ export function verifyScheduledFinalDeliveryReadback(input: {
   if (typeof content !== 'string') return { ok: false, error: 'provider_content_missing' };
   let card: unknown;
   try { card = JSON.parse(content); } catch { return { ok: false, error: 'provider_content_invalid' }; }
-  if (!hasElementId(card, input.elementId)) {
+  if (!hasProviderComponentElementId(card, input.elementId)) {
     return { ok: false, error: 'provider_turn_proof_missing' };
   }
   const projection = projectGroupContextCard(content, { botmuxSender: true });

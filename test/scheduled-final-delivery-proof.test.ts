@@ -98,4 +98,31 @@ describe('scheduled final delivery proof', () => {
       elementId,
     })).toEqual({ ok: true });
   });
+
+  it('does not accept a proof string hidden in callback payload data', () => {
+    const card = markGroupContextCardPurpose({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'Run' },
+          behaviors: [{ type: 'callback', value: { element_id: elementId } }],
+        }],
+      },
+    }, 'message');
+
+    expect(verifyScheduledFinalDeliveryReadback({
+      detail: { items: [{
+        message_id: 'om_callback_forgery',
+        chat_id: 'oc_exact',
+        deleted: false,
+        sender: { id: 'cli_exact', id_type: 'app_id', sender_type: 'app' },
+        body: { content: JSON.stringify(card) },
+      }] },
+      messageId: 'om_callback_forgery',
+      larkAppId: 'cli_exact',
+      chatId: 'oc_exact',
+      elementId,
+    })).toEqual({ ok: false, error: 'provider_turn_proof_missing' });
+  });
 });
