@@ -23546,6 +23546,22 @@ function durableOutboxTargetForTurn(ds: DaemonSession, turnId: string): DurableL
       };
 }
 
+function sameDurableOutboxTarget(
+  actual: DurableLarkOutboxTarget,
+  expected: DurableLarkOutboxTarget,
+): boolean {
+  if (actual.kind !== expected.kind) return false;
+  if (actual.kind === 'send' && expected.kind === 'send') {
+    return actual.chatId === expected.chatId;
+  }
+  if (actual.kind === 'reply' && expected.kind === 'reply') {
+    return actual.messageId === expected.messageId
+      && actual.replyInThread === expected.replyInThread;
+  }
+  return actual.kind === 'update' && expected.kind === 'update'
+    && actual.messageId === expected.messageId;
+}
+
 /**
  * Bind a worker-admission decision to the durable-primary handler that owns
  * this inbound event. Hard rejection queues synchronously. Marginal memory
@@ -32182,6 +32198,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ? scheduleAuthorityStore?.getRecord(request.daemonSession.larkAppId, scheduledTaskId)
           : undefined,
       });
+      const trustedFinalDelivery = request.responseKind === 'final'
+        && scheduledTaskId !== null
+        && sameDurableOutboxTarget(
+          request.target,
+          durableOutboxTargetForTurn(request.daemonSession, request.turnId),
+        );
       const message = durableLarkOutboxMessage({
         messageId: `out_${request.providerUuid}`,
         sessionKey: canonicalKey,
@@ -32216,7 +32238,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!isConfirmedLarkMessageId(providerMessageId)) {
         return { kind: 'ambiguous', error: 'delivered outbox receipt lacks provider message id' };
       }
-      const trustedFinalDelivery = request.responseKind === 'final' && scheduledTaskId !== null;
       if (trustedFinalDelivery) {
         observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId);
       }
