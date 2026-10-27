@@ -543,6 +543,7 @@ import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-c
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import {
+  recordScheduleSelfCleanupReceiptAfterDelivery,
   ScheduleAuthorityStore,
   type ScheduleSelfCleanupReceipt,
 } from './services/schedule-authority-store.js';
@@ -32414,6 +32415,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         && persistedCleanupReceipt?.messageId === providerMessageId
         ? scheduledFinalReceiptEnvelope(persistedCleanupReceipt)
         : undefined;
+      let cleanupReceiptAuthorityConfirmed = request.scheduleSelfCleanup !== true
+        || trustedFinalReceipt !== undefined;
       let trustedFinalDelivery = !!trustedFinalReceipt || (liveIdentityStillCurrent
         && observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId));
       if (!trustedFinalReceipt && liveIdentityStillCurrent && request.scheduleSelfCleanup === true
@@ -32431,12 +32434,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           messageId: providerMessageId,
         };
         if (trustedFinalDelivery) {
-          if (!scheduleAuthorityStore) {
-            throw new Error('schedule self-cleanup receipt store is unavailable');
+          const persistence = recordScheduleSelfCleanupReceiptAfterDelivery(
+            scheduleAuthorityStore ?? undefined,
+            cleanupReceipt,
+          );
+          cleanupReceiptAuthorityConfirmed = persistence.recorded;
+          if (!persistence.recorded) {
+            logger.warn(
+              `[schedule] Provider final delivered but self-cleanup receipt was not persisted: ${persistence.error}`,
+            );
           }
-          scheduleAuthorityStore.recordSelfCleanupReceipt(cleanupReceipt);
         } else {
-          trustedFinalDelivery = sameScheduleSelfCleanupReceipt(
+          cleanupReceiptAuthorityConfirmed = sameScheduleSelfCleanupReceipt(
             scheduleAuthorityStore?.getSelfCleanupReceipt(
               cleanupReceipt.appId,
               cleanupReceipt.taskId,
@@ -32444,9 +32453,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ),
             cleanupReceipt,
           );
+          trustedFinalDelivery = cleanupReceiptAuthorityConfirmed;
         }
       }
-      trustedFinalReceipt ??= trustedFinalDelivery && receiptProof
+      trustedFinalReceipt ??= trustedFinalDelivery && cleanupReceiptAuthorityConfirmed && receiptProof
         && typeof receiptWorkerGeneration === 'number'
         ? scheduledFinalReceiptEnvelope({
             messageId: providerMessageId,

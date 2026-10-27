@@ -583,3 +583,26 @@ export class ScheduleAuthorityStore {
     return Number(result.changes) > 0;
   }
 }
+
+export type ScheduleSelfCleanupReceiptPersistence =
+  | { recorded: true }
+  | { recorded: false; error: string };
+
+/** Provider delivery is already authoritative when this helper runs. Convert
+ * receipt-store failures into data so callers can preserve the delivered
+ * message while withholding the credential that would authorize deletion. */
+export function recordScheduleSelfCleanupReceiptAfterDelivery(
+  store: Pick<ScheduleAuthorityStore, 'recordSelfCleanupReceipt'> | undefined,
+  receipt: ScheduleSelfCleanupReceipt,
+): ScheduleSelfCleanupReceiptPersistence {
+  try {
+    if (!store) return { recorded: false, error: 'schedule self-cleanup receipt store is unavailable' };
+    store.recordSelfCleanupReceipt(receipt);
+    return { recorded: true };
+  } catch (error) {
+    return {
+      recorded: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}

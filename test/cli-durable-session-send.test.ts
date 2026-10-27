@@ -67,6 +67,32 @@ describe('durable Session send client', () => {
     }));
   });
 
+  it('preserves a confirmed delivery when the daemon withholds an unpersisted cleanup receipt', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000012';
+    const expectedReceipt = {
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+      proof: deriveScheduledFinalDeliveryProof({
+        turnId,
+        workerGeneration: 7,
+        dispatchAttempt: 2,
+      })!,
+    };
+    const post = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      kind: 'delivered',
+      messageId: 'om_delivered_without_cleanup_receipt',
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    await expect(dispatchDurableSessionMessage({ post }, {
+      ...input,
+      turnId,
+      scheduleSelfCleanup: true,
+      expectedReceipt,
+    })).resolves.toEqual({ messageId: 'om_delivered_without_cleanup_receipt' });
+  });
+
   it('retries a lost daemon response with the same turn and provider identity', async () => {
     const post = vi.fn()
       .mockRejectedValueOnce(new Error('socket closed during daemon restart'))
