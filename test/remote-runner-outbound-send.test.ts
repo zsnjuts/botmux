@@ -34,6 +34,9 @@ fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify({
   dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT,
   adminMode: process.env.BOTMUX_LINK_REFS_MODE ?? null,
   turnMode: process.env.BOTMUX_LINK_REF_TURN_MODE ?? null,
+  larkAppId: process.env.BOTMUX_LARK_APP_ID ?? null,
+  larkAppSecret: process.env.BOTMUX_LARK_APP_SECRET ?? null,
+  chatId: process.env.BOTMUX_CHAT_ID ?? null,
 }));
 process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbound' }) + '\\n');
 `);
@@ -61,6 +64,9 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbo
         PATH: process.env.PATH,
         BOTMUX_LINK_REFS_MODE: 'disabled',
         BOTMUX_LINK_REF_TURN_MODE: 'observe',
+        BOTMUX_LARK_APP_ID: 'cli_remote_runner',
+        BOTMUX_LARK_APP_SECRET: 'remote-pane-secret',
+        BOTMUX_CHAT_ID: 'oc_remote_runner',
       },
     })).resolves.toEqual({ outcome: 'delivered', messageId: 'om_remote_outbound' });
 
@@ -85,6 +91,9 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbo
       dispatchAttempt: '3',
       adminMode: null,
       turnMode: 'enabled',
+      larkAppId: 'cli_remote_runner',
+      larkAppSecret: null,
+      chatId: 'oc_remote_runner',
     });
   });
 

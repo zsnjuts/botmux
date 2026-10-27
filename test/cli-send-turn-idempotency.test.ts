@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
+import { buildRelayHostEnv } from '../src/adapters/backend/sandbox.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
@@ -434,6 +435,48 @@ describe('botmux send per-turn final idempotency', () => {
             removed: true,
           },
         });
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it('uses the persisted generation for a scheduled Host relay despite stale Riff identity env', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const hostRelayEnv = buildRelayHostEnv({
+      BOTMUX_LARK_APP_ID: 'cli_test',
+      BOTMUX_LARK_APP_SECRET: 'stale-remote-pane-secret',
+      BOTMUX_SESSION_ID: 'sid_turn_idempotency',
+      BOTMUX_CHAT_ID: 'oc_stale_remote_snapshot',
+      BOTMUX_ROOT_MESSAGE_ID: 'om_stale_remote_snapshot',
+      BOTMUX_SESSION_SCOPE: 'thread',
+    });
+    const f = createFixture(
+      undefined,
+      { scope: 'chat', workerGeneration: 7 },
+      scheduledTurn,
+      {
+        ...hostRelayEnv,
+        BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+        BOTMUX_DAEMON_IPC_PORT: '7951',
+        BOTMUX_TEST_DURABLE_SEND: '1',
+      },
+    );
+    try {
+      const sent = f.run('final', 'scheduled answer', ['--schedule-remove-self']);
+      expect(sent.result.status, String(sent.result.stderr)).toBe(0);
+      expect(String(sent.result.stderr)).not.toContain('trusted receipt identity');
+      const daemonRequests = String(sent.result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      expect(daemonRequests[0]?.body).toMatchObject({
+        receiptTurnId: scheduledTurn,
+        receiptWorkerGeneration: 7,
+      });
+      expect(daemonRequests[1]?.body).toMatchObject({
+        action: 'remove-after-final',
+        trustedFinalReceipt: {
+          turnId: scheduledTurn,
+          workerGeneration: 7,
+        },
+      });
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
 
