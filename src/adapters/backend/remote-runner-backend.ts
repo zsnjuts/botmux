@@ -475,7 +475,18 @@ export class RemoteRunnerBackend implements SessionBackend {
 
   commitDestroySession(): void { this.kill(); }
 
-  async prepareShutdownDetach(drainTimeoutMs?: number): Promise<SessionShutdownDetachResult> {
+  private shutdownOperationTimeoutMs(override: number | undefined): number {
+    if (override === undefined) return this.operationTimeoutMs;
+    if (!Number.isSafeInteger(override) || override < 100) {
+      throw new Error('remote runner shutdown operation timeout is invalid');
+    }
+    return Math.min(this.operationTimeoutMs, override);
+  }
+
+  async prepareShutdownDetach(
+    drainTimeoutMs?: number,
+    operationTimeoutMs?: number,
+  ): Promise<SessionShutdownDetachResult> {
     this.shutdownDetaching = true;
     try {
       if (!this.startupPromise) throw new Error('remote runner has not spawned');
@@ -501,7 +512,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       const event = await this.request(
         remoteRunnerCommand('detach', { requestId: this.requestId('detach') }),
         candidate => candidate.type === 'status' && candidate.status === 'detached',
-        this.operationTimeoutMs,
+        this.shutdownOperationTimeoutMs(operationTimeoutMs),
       );
       if (event.type !== 'status' || event.status !== 'detached') throw new Error('provider did not confirm detach');
       if (event.state) this.applyState(event.state);
@@ -518,7 +529,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
   }
 
-  async abortShutdownDetach(): Promise<SessionShutdownDetachResult> {
+  async abortShutdownDetach(operationTimeoutMs?: number): Promise<SessionShutdownDetachResult> {
     if (!this.child || this.killed) {
       return { ok: false, taskId: null, error: 'provider process is unavailable' };
     }
@@ -530,7 +541,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       const event = await this.request(
         remoteRunnerCommand('reattach', { requestId: this.requestId('reattach') }),
         candidate => candidate.type === 'status' && candidate.status === 'ready',
-        this.operationTimeoutMs,
+        this.shutdownOperationTimeoutMs(operationTimeoutMs),
       );
       if (event.type !== 'status' || event.status !== 'ready') {
         throw new Error('provider did not confirm reattach');

@@ -1915,11 +1915,11 @@ type DaemonToWorkerBase =
   | { type: 'close_commit'; requestId: string }
   | { type: 'close_abort'; requestId: string }
   /** Fence new remote writes, drain accepted writes, and report exact lineage. */
-  | { type: 'remote_shutdown_prepare'; requestId: string; drainTimeoutMs?: number }
+  | { type: 'remote_shutdown_prepare'; requestId: string; drainTimeoutMs?: number; operationTimeoutMs?: number }
   /** Final lineage is durable; detach the worker generation. */
   | { type: 'remote_shutdown_commit'; requestId: string }
   /** Shutdown could not commit; restore remote write admission. */
-  | { type: 'remote_shutdown_abort'; requestId: string }
+  | { type: 'remote_shutdown_abort'; requestId: string; operationTimeoutMs?: number }
   /** Retire only this worker/observer during a routing transfer. Persistent
    * backends and Riff keep their owned CLI/task alive for the replacement
   * worker to reattach; PTY keeps its historical cold-resume behavior. */

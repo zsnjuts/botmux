@@ -7,6 +7,7 @@ import { config } from '../src/config.js';
 import type { DaemonSession } from '../src/core/types.js';
 import {
   __testOnly_remoteRunnerShutdownOperationTimeoutMs,
+  __testOnly_remoteRunnerShutdownProviderTimeoutMs,
   abortRemoteShutdownFleet,
   abortPreparedRemoteShutdown,
   canAbortVerifiedExitedRemotePreparation,
@@ -56,6 +57,8 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
   });
 
   it('budgets detach and reattach independently from active-turn drain', () => {
+    expect(__testOnly_remoteRunnerShutdownProviderTimeoutMs(undefined)).toBe(30_000);
+    expect(__testOnly_remoteRunnerShutdownProviderTimeoutMs(900_000)).toBe(900_000);
     expect(__testOnly_remoteRunnerShutdownOperationTimeoutMs(undefined)).toBe(35_000);
     expect(__testOnly_remoteRunnerShutdownOperationTimeoutMs(900_000)).toBe(905_000);
     expect(__testOnly_remoteRunnerShutdownOperationTimeoutMs(1_200_000)).toBe(1_205_000);
@@ -242,6 +245,7 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
     expect(f.messages[0]).toMatchObject({
       type: 'remote_shutdown_prepare',
       drainTimeoutMs: 12_000,
+      operationTimeoutMs: 900_000,
     });
   });
 

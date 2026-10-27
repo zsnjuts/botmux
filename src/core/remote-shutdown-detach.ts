@@ -16,7 +16,7 @@ import {
   REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
-  REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
+  REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS,
 } from './shutdown-budgets.js';
 
 type ShutdownPhase = 'prepare' | 'abort';
@@ -155,6 +155,12 @@ function label(ds: DaemonSession): string {
 export function __testOnly_remoteRunnerShutdownOperationTimeoutMs(
   operationTimeoutMs: number | undefined,
 ): number {
+  return __testOnly_remoteRunnerShutdownProviderTimeoutMs(operationTimeoutMs) + 5_000;
+}
+
+export function __testOnly_remoteRunnerShutdownProviderTimeoutMs(
+  operationTimeoutMs: number | undefined,
+): number {
   const normalized = typeof operationTimeoutMs === 'number'
       && Number.isSafeInteger(operationTimeoutMs)
       && operationTimeoutMs >= 100
@@ -162,17 +168,22 @@ export function __testOnly_remoteRunnerShutdownOperationTimeoutMs(
     ? operationTimeoutMs
     : 30_000;
   return Math.min(
-    REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
-    normalized + 5_000,
+    REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS,
+    normalized,
+  );
+}
+
+function shutdownProviderOperationTimeoutMs(ds: DaemonSession): number | undefined {
+  const backend = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (backend !== 'remote-runner') return undefined;
+  return __testOnly_remoteRunnerShutdownProviderTimeoutMs(
+    (ds.initConfig?.backendConfig as RemoteRunnerConfig | undefined)?.operationTimeoutMs,
   );
 }
 
 function shutdownOperationTimeoutMs(ds: DaemonSession): number {
-  const backend = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (backend !== 'remote-runner') return 0;
-  return __testOnly_remoteRunnerShutdownOperationTimeoutMs(
-    (ds.initConfig?.backendConfig as RemoteRunnerConfig | undefined)?.operationTimeoutMs,
-  );
+  const providerTimeoutMs = shutdownProviderOperationTimeoutMs(ds);
+  return providerTimeoutMs === undefined ? 0 : providerTimeoutMs + 5_000;
 }
 
 function admissionRestoreTimeoutMs(ds: DaemonSession): number {
@@ -202,6 +213,7 @@ function requestPhase(
   phase: ShutdownPhase,
   timeoutMs: number,
   prepareDrainTimeoutMs = timeoutMs,
+  backendOperationTimeoutMs?: number,
 ): Promise<ShutdownPhaseResult> {
   return new Promise(resolve => {
     let settled = false;
@@ -242,8 +254,17 @@ function requestPhase(
     worker.on('message', onMessage);
     worker.once('exit', onExit);
     const message: DaemonToWorker = phase === 'prepare'
-      ? { type: 'remote_shutdown_prepare', requestId, drainTimeoutMs: prepareDrainTimeoutMs }
-      : { type: 'remote_shutdown_abort', requestId };
+      ? {
+          type: 'remote_shutdown_prepare',
+          requestId,
+          drainTimeoutMs: prepareDrainTimeoutMs,
+          ...(backendOperationTimeoutMs !== undefined ? { operationTimeoutMs: backendOperationTimeoutMs } : {}),
+        }
+      : {
+          type: 'remote_shutdown_abort',
+          requestId,
+          ...(backendOperationTimeoutMs !== undefined ? { operationTimeoutMs: backendOperationTimeoutMs } : {}),
+        };
     if (!send(worker, message)) {
       finish({ ok: false, taskId: null, error: `remote_shutdown_${phase}_send_failed` });
     }
@@ -327,7 +348,15 @@ async function abortWorkerPreparation(
       error: 'new_worker_generation',
     };
   }
-  const result = await requestPhase(ds, worker, requestId, 'abort', timeoutMs);
+  const result = await requestPhase(
+    ds,
+    worker,
+    requestId,
+    'abort',
+    timeoutMs,
+    timeoutMs,
+    shutdownProviderOperationTimeoutMs(ds),
+  );
   if (result.ok && exactTask && result.taskId !== exactTask.taskId) {
     return {
       ok: false,
@@ -415,6 +444,7 @@ export async function prepareRemoteSessionForShutdown(
 
   const now = options.now ?? Date.now;
   const operationTimeoutMs = shutdownOperationTimeoutMs(ds);
+  const providerOperationTimeoutMs = shutdownProviderOperationTimeoutMs(ds);
   const abortReserveMs = options.abortTimeoutMs ?? admissionRestoreTimeoutMs(ds);
   let drainTimeoutMs = options.drainTimeoutMs ?? REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS;
   if (options.deadlineMs !== undefined) {
@@ -465,6 +495,7 @@ export async function prepareRemoteSessionForShutdown(
     'prepare',
     drainTimeoutMs + operationTimeoutMs,
     drainTimeoutMs,
+    providerOperationTimeoutMs,
   );
   if (!prepared.ok) {
     // This exact response proves the worker refused before installing a backend

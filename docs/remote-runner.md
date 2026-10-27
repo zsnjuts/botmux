@@ -30,7 +30,7 @@
 
 未配置 `cliPathOverride` 时，BotMux 从 `PATH` 查找 `botmux-remote-runner`。`remoteRunner` 只保存协议预期，不应包含 token、cookie 或账号凭据；provider 凭据应通过受限权限文件或部署环境注入。
 
-`handshakeTimeoutMs` 同时约束 `hello` 和后续 `start` / `resume` 到 `ready` 的等待窗口，允许范围为 100–300000 ms。`operationTimeoutMs` 约束 turn 的 durable `busy` 回执以及 status/cancel/detach 等操作，允许范围为 100–1200000 ms；首次 turn 若要先创建远端 compute、准备 workspace 与 Actor，再持久化输入后回 `busy`，部署方必须按该完整路径的实测上界留出预算。显式关闭的 control-worker 唤醒会分别保留 `hello` 与 `resume` 两段 handshake 预算，`close_result` 外层等待保留完整 operation 预算；graceful shutdown 也把 active-turn drain 与 detach/reattach operation 拆成独立预算，并让 daemon/fleet supervisor 覆盖公共协议上限。两类超时都会 fail closed，BotMux 不会把未 ready 的 provider 或尚未 durable admission 的 turn 当成成功。
+`handshakeTimeoutMs` 同时约束 `hello` 和后续 `start` / `resume` 到 `ready` 的等待窗口，允许范围为 100–300000 ms。`operationTimeoutMs` 约束 turn 的 durable `busy` 回执以及 status/cancel/detach 等操作，允许范围为 100–1200000 ms；首次 turn 若要先创建远端 compute、准备 workspace 与 Actor，再持久化输入后回 `busy`，部署方必须按该完整路径的实测上界留出预算。显式关闭的 control-worker 唤醒会分别保留 `hello` 与 `resume` 两段 handshake 预算，`close_result` 外层等待保留完整 operation 预算。Graceful shutdown 另可用 `BOTMUX_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS` 把 detach/reattach 控制操作限制在 100–1200000 ms；默认仍等于公共 operation 上限，显式缩短时 worker 和 provider 都使用该上限，daemon/fleet supervisor 也按同一个值派生外层预算。该设置不改变 turn admission、status、cancel 或显式 close 的 `operationTimeoutMs`。所有超时都会 fail closed，BotMux 不会把未 ready 的 provider、尚未 durable admission 的 turn 或未确认恢复的 shutdown fence 当成成功。
 
 `envPolicy.mode: "strict"` 不支持 `remote-runner`：BotMux 可以收窄本机 provider 子进程的环境，但无法证明 provider 背后的远端进程同样满足 strict 环境契约，因此启动会 fail closed。
 
@@ -278,6 +278,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 
 - 显式关闭使用两阶段流程：BotMux 先发送 `cancel`，收到 `status: closed` 后持久化关闭，再提交本地 worker 退出。取消结果未知时会保持会话和写入门禁，不会伪装成已关闭。
 - `BOTMUX_REMOTE_SHUTDOWN_MODE` 默认是 `drain`。该模式下 Daemon 正常退出使用 `detach`：provider 应等待当前 turn 收敛并返回 `status: detached`，不得取消可恢复的远端状态。
+- `BOTMUX_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS` 只限制 graceful shutdown 的 detach/reattach 控制请求；默认 `1200000`，允许范围为 100–1200000 ms。受更短进程终止窗口约束的部署必须同时缩短该值并保留 abort、final delivery、lineage persistence 与 worker exit 的外层余量；它不会缩短普通 turn 的 durable `busy` 等待。
 - `handoff` 模式只允许与 durable coordination `primary` 及 `turn_recovery` capability 同时使用。Daemon 先停止新准入，为每个 Remote Runner Session 持久化一个受信 handoff control，再停止本副本的 control consumer、detach 本地 worker/observer 并释放 canonical Session route lease。继任副本通过 control lane 主动取得 lease 并 reattach 同一 remote generation，不需要等待下一条用户消息；它在 `recoveredTurn` 和 worker readiness 都成立后才结算 handoff 并恢复输出。该模式不取消远端 turn，也不等待其完成，适合多副本滚动替换；缺少任一 fencing/recovery 前提时启动失败，而不是退回可能丢 turn 的快速退出。
 - `drain` 模式默认最多等待 active remote turn 12 秒。运行长任务的部署可以设置 provider-neutral 的 `BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS`（12,000 到 86,400,000 毫秒）；BotMux 会把同一 drain deadline 传给 Remote Runner backend，并同步派生 daemon、fleet supervisor 和 CLI 的外层等待预算，避免普通 provider operation timeout 或任一外层 supervisor 提前截断 active turn。provider 发出 `final` 只表示模型执行完成，daemon 还会在提交 detach 前等待对应的用户可见最终回复完成投递；这段固定 20 秒的 delivery drain 预算同样包含在全部外层预算中，避免 worker 退出后首个发送尝试才发现原 generation 已失效。该配置只控制 `drain` 的 active-turn 等待时间，不改变 turn 自身超时，也不会把取消作为超时后的兜底行为。进程编排层的 termination grace 必须大于派生出的 fleet hard-stop 预算。
 - 如果 shutdown 在持久化阶段失败，BotMux 使用 `reattach` 回滚已经确认的 `detach`；回滚没有得到

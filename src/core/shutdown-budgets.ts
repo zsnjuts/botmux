@@ -56,11 +56,45 @@ export const REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS = parseRemoteShutdownDrainTimeoutM
 /** Baseline admission restoration for remote backends with no longer provider
  * operation contract. Remote Runner derives a larger per-session value. */
 export const REMOTE_ADMISSION_RESTORE_TIMEOUT_MS = 11_000;
-/** A Remote Runner detach/reattach operation may consume the full public
- * protocol budget. The daemon and supervisor reserve it separately from active
- * turn drain, with a small IPC/result scheduling margin. */
+/** Shutdown detach/reattach is a separate control-plane operation from turn
+ * admission. Deployments with a long turn operation budget may cap this phase
+ * so their process supervisor can still finish prepare/abort inside its hard
+ * termination window. The public default preserves the full protocol budget. */
+export const REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_ENV =
+  'BOTMUX_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS';
+export const MIN_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS = 100;
+export const DEFAULT_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS =
+  REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS;
+
+export function parseRemoteRunnerShutdownProviderTimeoutMs(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS;
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error(
+      `${REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_ENV} must be a base-10 positive integer`,
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)
+      || parsed < MIN_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS
+      || parsed > REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS) {
+    throw new Error(
+      `${REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_ENV} must be between `
+      + `${MIN_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS} and `
+      + `${REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS}`,
+    );
+  }
+  return parsed;
+}
+
+export const REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS =
+  parseRemoteRunnerShutdownProviderTimeoutMs(
+    process.env[REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_ENV],
+  );
+
+/** Daemon-side wait adds a small IPC/result scheduling margin to the provider
+ * control timeout. */
 export const REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS =
-  REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS + 5_000;
+  REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS + 5_000;
 
 /** Bounded acquisition of the bot-wide mutation lease. A timed-out waiter is
  * removed and can never run after shutdown has already been refused. */
@@ -107,7 +141,10 @@ export interface ShutdownBudgets {
   fleetDaemonExitWaitMs: number;
 }
 
-export function deriveShutdownBudgets(remoteDrainTimeoutMs: number): ShutdownBudgets {
+export function deriveShutdownBudgets(
+  remoteDrainTimeoutMs: number,
+  remoteRunnerShutdownOperationTimeoutMs = REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
+): ShutdownBudgets {
   if (
     !Number.isSafeInteger(remoteDrainTimeoutMs)
     || remoteDrainTimeoutMs < MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS
@@ -115,16 +152,23 @@ export function deriveShutdownBudgets(remoteDrainTimeoutMs: number): ShutdownBud
   ) {
     throw new Error('remote shutdown drain timeout is outside the supported range');
   }
+  if (!Number.isSafeInteger(remoteRunnerShutdownOperationTimeoutMs)
+      || remoteRunnerShutdownOperationTimeoutMs
+        < MIN_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS + 5_000
+      || remoteRunnerShutdownOperationTimeoutMs
+        > REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS + 5_000) {
+    throw new Error('remote runner shutdown operation timeout is outside the supported range');
+  }
   const daemonShutdownMaxMs =
     BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
     + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
     + remoteDrainTimeoutMs
-    + REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS
+    + remoteRunnerShutdownOperationTimeoutMs
     + REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS
     + REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
     + Math.max(
       REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
-      REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
+      remoteRunnerShutdownOperationTimeoutMs,
       DAEMON_WORKER_EXIT_GRACE_MS,
     )
     + DAEMON_SHUTDOWN_OVERHEAD_MS;

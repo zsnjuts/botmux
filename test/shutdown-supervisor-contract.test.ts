@@ -8,6 +8,7 @@ import {
   DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS,
   DEFAULT_REMOTE_SHUTDOWN_MODE,
   DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  DEFAULT_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS,
   deriveShutdownBudgets,
   FLEET_DAEMON_EXIT_WAIT_MS,
   FLEET_DAEMON_KILL_TIMEOUT_MS,
@@ -16,6 +17,7 @@ import {
   MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
   parseRemoteShutdownMode,
   parseRemoteShutdownDrainTimeoutMs,
+  parseRemoteRunnerShutdownProviderTimeoutMs,
   REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
   REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
   REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
@@ -23,6 +25,8 @@ import {
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
   REMOTE_SHUTDOWN_MODE,
   REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
+  REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_ENV,
+  REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS,
 } from '../src/core/shutdown-budgets.js';
 import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from '../src/core/fleet-supervisor-policy.js';
@@ -85,6 +89,20 @@ describe('graceful shutdown supervisor contract', () => {
       expect(() => parseRemoteShutdownDrainTimeoutMs(value), value).toThrow();
     }
     expect(() => parseRemoteShutdownDrainTimeoutMs('86400001')).toThrow();
+  });
+
+  it('strictly parses a shutdown-only Remote Runner provider timeout', () => {
+    expect(parseRemoteRunnerShutdownProviderTimeoutMs(undefined)).toBe(
+      DEFAULT_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS,
+    );
+    expect(parseRemoteRunnerShutdownProviderTimeoutMs('100')).toBe(100);
+    expect(parseRemoteRunnerShutdownProviderTimeoutMs('5000')).toBe(5_000);
+    for (const value of ['', '0', '99', '5000.5', ' 5000', '5000 ', '+5000', '01']) {
+      expect(() => parseRemoteRunnerShutdownProviderTimeoutMs(value), value).toThrow();
+    }
+    expect(REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS).toBe(
+      DEFAULT_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS,
+    );
   });
 
   it('keeps remote shutdown drain as the default and strictly parses handoff mode', () => {
@@ -154,6 +172,15 @@ describe('graceful shutdown supervisor contract', () => {
     expect(budgets.fleetDaemonExitWaitMs).toBeGreaterThan(DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS);
   });
 
+  it('keeps a shutdown-only Remote Runner cap inside a bounded process window', () => {
+    const budgets = deriveShutdownBudgets(780_000, 10_000);
+    expect(budgets).toEqual({
+      daemonShutdownMaxMs: 826_000,
+      fleetDaemonKillTimeoutMs: 827_000,
+      fleetDaemonExitWaitMs: 831_500,
+    });
+  });
+
   it('applies the override to module-level daemon, supervisor, and CLI budgets', () => {
     const child = spawnSyncTsEvalWithRepoImports(`
       import {
@@ -179,6 +206,41 @@ describe('graceful shutdown supervisor contract', () => {
       DAEMON_SHUTDOWN_MAX_MS: 6_095_000,
       FLEET_DAEMON_KILL_TIMEOUT_MS: 6_096_000,
       FLEET_DAEMON_EXIT_WAIT_MS: 6_100_500,
+    });
+  });
+
+  it('applies the shutdown-only provider cap to every module-level outer budget', () => {
+    const child = spawnSyncTsEvalWithRepoImports(`
+      import {
+        REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS,
+        REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
+        DAEMON_SHUTDOWN_MAX_MS,
+        FLEET_DAEMON_KILL_TIMEOUT_MS,
+        FLEET_DAEMON_EXIT_WAIT_MS,
+      } from './src/core/shutdown-budgets.js';
+      process.stdout.write(JSON.stringify({
+        REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS,
+        REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS,
+        DAEMON_SHUTDOWN_MAX_MS,
+        FLEET_DAEMON_KILL_TIMEOUT_MS,
+        FLEET_DAEMON_EXIT_WAIT_MS,
+      }));
+    `, {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS: '780000',
+        [REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_ENV]: '5000',
+      },
+      encoding: 'utf8',
+    });
+    expect(child.status, String(child.stderr)).toBe(0);
+    expect(JSON.parse(String(child.stdout))).toEqual({
+      REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS: 5_000,
+      REMOTE_RUNNER_SHUTDOWN_OPERATION_TIMEOUT_MS: 10_000,
+      DAEMON_SHUTDOWN_MAX_MS: 826_000,
+      FLEET_DAEMON_KILL_TIMEOUT_MS: 827_000,
+      FLEET_DAEMON_EXIT_WAIT_MS: 831_500,
     });
   });
 
