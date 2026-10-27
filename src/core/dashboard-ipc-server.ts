@@ -2320,73 +2320,14 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
       });
       if (!proof.ok) return jsonRes(res, 409, { ok: false, error: proof.error });
     }
-    const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
-    const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
-    try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
-    let trustedPresentation: Parameters<typeof recordRelayedTurnDelivery>[0]['trustedPresentation'];
-    if (ds && liveTurnId) {
-      const replyContext = frozenReplyContextForTurn(ds, liveTurnId);
-      let policy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
-      try {
-        policy = resolveFeedbackPolicyForDelivery({
-          dataDir: config.session.dataDir,
-          larkAppId: ds.larkAppId,
-          chatId: ds.chatId,
-          bot: getBot(ds.larkAppId).config,
-        });
-      } catch { /* a disappearing bot has no feedback authority */ }
-      let baseCard: Record<string, unknown> | undefined;
-      if (policy) {
-        const messageId = typeof body.messageId === 'string' ? body.messageId : '';
-        if (providerDetail === undefined) {
-          try {
-            providerDetail = await getMessageDetail(ds.larkAppId, messageId, {
-              userCardContent: true,
-              timeoutMs: 10_000,
-            });
-          } catch (error) {
-            return jsonRes(res, 502, {
-              ok: false,
-              error: 'turn_delivery_feedback_readback_failed',
-              detail: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-        baseCard = providerFinalCardFromReadback({
-          detail: providerDetail,
-          messageId,
-          larkAppId: ds.larkAppId,
-          chatId: ds.chatId,
-          expectedTarget: replyContext.target,
-        });
-        if (!baseCard) {
-          return jsonRes(res, 409, { ok: false, error: 'turn_delivery_feedback_readback_invalid' });
-        }
+    // Provider readback is the authority for a scheduled final. Settle it and,
+    // when requested, persist the cleanup envelope before touching the
+    // auxiliary feedback/delivery index. A broken index must not turn a final
+    // that Lark already proved into a failed scheduled run.
+    if (scheduledFinal && liveTurnId) {
+      if (!trustedFinalReceipt) {
+        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_receipt_unavailable' });
       }
-      trustedPresentation = {
-        topicRootId: replyContext.target.mode === 'thread'
-          ? replyContext.target.rootMessageId
-          : ds.session.rootMessageId,
-        ...(policy ? { policy } : {}),
-        ...(baseCard ? { baseCard } : {}),
-        ...(replyContext.replyTargetSenderOpenId ?? ds.session.ownerOpenId
-          ? { requesterSubjectId: replyContext.replyTargetSenderOpenId ?? ds.session.ownerOpenId }
-          : {}),
-      };
-    }
-    if (scheduledFinal && !scheduledDeliveryFenceIsCurrent()) {
-      return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
-    }
-    const result = recordRelayedTurnDelivery({
-      ds,
-      body,
-      store: feedbackStore,
-      webhookDestinations,
-      teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
-      ...(trustedPresentation ? { trustedPresentation } : {}),
-    });
-    if (result.ok && scheduledFinal && liveTurnId) {
       const messageId = body.messageId as string;
       const observed = persistedCleanupReplay
         ? false
@@ -2421,6 +2362,98 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
       } else if (!observed) {
         return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_authority_changed' });
       }
+    }
+    const acceptScheduledDeliveryWithoutIndex = (reason: string) => {
+      logger.warn(
+        `[turn-delivery] Trusted scheduled final settled without auxiliary delivery index: ${reason}`,
+      );
+      return jsonRes(res, 200, {
+        ok: true,
+        deliveryIndexed: false,
+        ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}),
+      });
+    };
+    let result: ReturnType<typeof recordRelayedTurnDelivery>;
+    try {
+      const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
+      const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
+      let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
+      try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
+      let trustedPresentation: Parameters<typeof recordRelayedTurnDelivery>[0]['trustedPresentation'];
+      if (ds && liveTurnId) {
+        const replyContext = frozenReplyContextForTurn(ds, liveTurnId);
+        let policy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
+        try {
+          policy = resolveFeedbackPolicyForDelivery({
+            dataDir: config.session.dataDir,
+            larkAppId: ds.larkAppId,
+            chatId: ds.chatId,
+            bot: getBot(ds.larkAppId).config,
+          });
+        } catch { /* a disappearing bot has no feedback authority */ }
+        let baseCard: Record<string, unknown> | undefined;
+        if (policy) {
+          const messageId = typeof body.messageId === 'string' ? body.messageId : '';
+          if (providerDetail === undefined) {
+            try {
+              providerDetail = await getMessageDetail(ds.larkAppId, messageId, {
+                userCardContent: true,
+                timeoutMs: 10_000,
+              });
+            } catch (error) {
+              return jsonRes(res, 502, {
+                ok: false,
+                error: 'turn_delivery_feedback_readback_failed',
+                detail: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+          baseCard = providerFinalCardFromReadback({
+            detail: providerDetail,
+            messageId,
+            larkAppId: ds.larkAppId,
+            chatId: ds.chatId,
+            expectedTarget: replyContext.target,
+          });
+          if (!baseCard) {
+            if (scheduledFinal) {
+              return acceptScheduledDeliveryWithoutIndex('turn_delivery_feedback_readback_invalid');
+            }
+            return jsonRes(res, 409, { ok: false, error: 'turn_delivery_feedback_readback_invalid' });
+          }
+        }
+        trustedPresentation = {
+          topicRootId: replyContext.target.mode === 'thread'
+            ? replyContext.target.rootMessageId
+            : ds.session.rootMessageId,
+          ...(policy ? { policy } : {}),
+          ...(baseCard ? { baseCard } : {}),
+          ...(replyContext.replyTargetSenderOpenId ?? ds.session.ownerOpenId
+            ? { requesterSubjectId: replyContext.replyTargetSenderOpenId ?? ds.session.ownerOpenId }
+            : {}),
+        };
+      }
+      if (scheduledFinal && !scheduledDeliveryFenceIsCurrent()) {
+        return acceptScheduledDeliveryWithoutIndex('scheduled_delivery_origin_changed_after_settlement');
+      }
+      result = recordRelayedTurnDelivery({
+        ds,
+        body,
+        store: feedbackStore,
+        webhookDestinations,
+        teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
+        ...(trustedPresentation ? { trustedPresentation } : {}),
+      });
+    } catch (error) {
+      if (scheduledFinal && trustedFinalReceipt) {
+        return acceptScheduledDeliveryWithoutIndex(
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      throw error;
+    }
+    if (!result.ok && scheduledFinal && trustedFinalReceipt) {
+      return acceptScheduledDeliveryWithoutIndex(result.error);
     }
     return result.ok
       ? jsonRes(res, 200, {

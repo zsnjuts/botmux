@@ -10,7 +10,7 @@
  * to another turn.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -184,6 +184,115 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
         turnId,
       },
     });
+  });
+
+  it('keeps a proved scheduled final successful when the auxiliary delivery index cannot open', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000015';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'proved final without index' }] },
+    }, proof), 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_proved_without_index',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    await __testOnly_closeSkillFeedbackStores();
+    rmSync(dataDir!, { recursive: true, force: true });
+    writeFileSync(dataDir!, 'not-a-directory');
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_proved_without_index',
+      content: 'proved final without index',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      deliveryIndexed: false,
+      trustedFinalReceipt: {
+        messageId: 'om_proved_without_index',
+        turnId,
+        workerGeneration: 7,
+        dispatchAttempt: 2,
+        proof,
+      },
+    });
+    await expect(settlement.settled).resolves.toEqual({ messageId: 'om_proved_without_index' });
+  });
+
+  it('settles a proved final but keeps the task when cleanup receipt persistence fails', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000016';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'proved final without cleanup receipt' }] },
+    }, proof), 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_cleanup_receipt_failed',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+    const receiptHandler = vi.fn(() => false);
+    setScheduledSelfCleanupReceiptHandler(receiptHandler);
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_cleanup_receipt_failed',
+      content: 'proved final without cleanup receipt',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+      receiptScheduleSelfCleanup: true,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'scheduled_cleanup_receipt_not_recorded',
+    });
+    expect(receiptHandler).toHaveBeenCalledTimes(1);
+    await expect(settlement.settled).resolves.toEqual({ messageId: 'om_cleanup_receipt_failed' });
   });
 
   it('does not settle a client-reported id that provider readback cannot prove', async () => {
