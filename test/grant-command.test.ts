@@ -158,6 +158,51 @@ describe('parseGrantTargets (multi)', () => {
     expect(parseGrantTargets(postMsg, 'ou_bot')).toEqual([{ openId: 'ou_t', name: '张三' }]);
   });
 
+  // 线上实测形态：post 的 at 节点 user_id 是 `@_user_N` 占位符，真实 open_id 只在同 key 的
+  // message.mentions 条目里。占位符绝不能被当作 open_id 写进授权卡。
+  it('post with @_user_N placeholders: resolves grantee via message.mentions', () => {
+    const postMsg = {
+      content: JSON.stringify({ zh_cn: { content: [[
+        { tag: 'at', user_id: '@_user_1', user_name: 'Codex' },
+        { tag: 'text', text: ' /grant ' },
+        { tag: 'at', user_id: '@_user_2', user_name: '张三' },
+      ]] } }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Codex' },
+        { key: '@_user_2', id: { open_id: 'ou_real' }, name: '张三' },
+      ],
+    };
+    expect(parseGrantTargets(postMsg, 'ou_bot')).toEqual([{ openId: 'ou_real', name: '张三' }]);
+    expect(isGrantTargetOnly(postMsg, 'ou_bot')).toBe(false);
+  });
+
+  it('post with an unresolvable placeholder: drops it instead of using it as an open_id', () => {
+    const postMsg = {
+      content: JSON.stringify({ zh_cn: { content: [[
+        { tag: 'at', user_id: 'ou_bot', user_name: 'Codex' },
+        { tag: 'text', text: ' /grant ' },
+        { tag: 'at', user_id: '@_user_9', user_name: '张三' },
+      ]] } }),
+      mentions: [],
+    };
+    expect(parseGrantTargets(postMsg, 'ou_bot')).toEqual([]);
+  });
+
+  it('post with placeholders: this bot only as a target is recognised', () => {
+    const postMsg = {
+      content: JSON.stringify({ zh_cn: { content: [[
+        { tag: 'at', user_id: '@_user_1', user_name: 'OtherBot' },
+        { tag: 'text', text: ' /grant ' },
+        { tag: 'at', user_id: '@_user_2', user_name: 'Codex' },
+      ]] } }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_other' }, name: 'OtherBot' },
+        { key: '@_user_2', id: { open_id: 'ou_bot' }, name: 'Codex' },
+      ],
+    };
+    expect(isGrantTargetOnly(postMsg, 'ou_bot')).toBe(true);
+  });
+
   it('post fallback: bare /grant (only the bot @ed) → empty (whole-chat)', () => {
     const barePost = {
       content: JSON.stringify({ zh_cn: { content: [[
@@ -284,7 +329,10 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
   it('card send failed → nothing persisted, the nonce does not survive a restart', async () => {
     replyMock.mockRejectedValueOnce(new Error('send failed'));
     await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
-    const grantChat = findCardCallbackValue(JSON.parse(replyMock.mock.calls.at(-1)![2]), 'grant_chat');
+    const grantChat = findCardCallbackValue(JSON.parse(replyMock.mock.calls[0][2]), 'grant_chat');
+    // 发卡失败要给 owner 一条可见回执（纯文字，不是第二张卡）。
+    expect(replyMock).toHaveBeenCalledTimes(2);
+    expect(replyMock.mock.calls[1][3]).toBeUndefined();
     pending._simulateRestartForTest();
     expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(false);
   });
@@ -311,7 +359,9 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     resetTriggered();
     expect(hasTriggeredMessage('b1', 'om_x')).toBe(true);
     await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
-    expect(replyMock).toHaveBeenCalledOnce();
+    // 第一次：一张卡 + 一条失败回执；第二次被执行 claim 拦下，不重发卡。
+    expect(replyMock).toHaveBeenCalledTimes(2);
+    expect(replyMock.mock.calls.filter(c => c[3] === 'interactive')).toHaveLength(1);
   });
 
   it('allows a distinct command and keeps execution claims scoped to each app', async () => {

@@ -252,10 +252,19 @@ export async function tryHandleGrantCommand(
     },
     loc,
   );
-  await replyMessage(larkAppId, messageId, card, 'interactive')
-    // 卡已送达才落盘：daemon 重启后 owner 照样能点这张卡。
-    .then(() => markPendingDelivered(larkAppId, chatId, targetIds, nonce))
-    .catch(err => logger.debug(`grant card reply failed: ${err}`));
+  try {
+    await replyMessage(larkAppId, messageId, card, 'interactive');
+  } catch (err) {
+    // 发卡失败对 owner 必须可见：否则 owner 以为已授权、目标仍被拒，整条授权链路静默失败。
+    // 失败可能只是响应丢失（卡其实已送达），所以不撤 pending、不改执行 claim、不重发卡，
+    // 只补一句结果不确定的文字回执。
+    logger.warn(`[grant:${larkAppId}] owner /grant card send failed in ${chatId}: ${err}`);
+    await replyMessage(larkAppId, messageId, t('cmd.grant.card_failed', undefined, loc))
+      .catch(replyErr => logger.warn(`[grant:${larkAppId}] grant card failure notice failed: ${replyErr}`));
+    return true;
+  }
+  // 卡已送达才落盘：daemon 重启后 owner 照样能点这张卡。
+  markPendingDelivered(larkAppId, chatId, targetIds, nonce);
   logger.info(`[grant:${larkAppId}] owner /grant card for ${targets.length} target(s) in ${chatId}`);
   return true;
 }
