@@ -553,6 +553,12 @@ describe('botmux send per-turn final idempotency', () => {
     try {
       const sent = f.run('final', 'scheduled answer');
       expect(sent.result.status).not.toBe(0);
+      expect(String(sent.result.stderr)).toContain(
+        `scheduled_final_identity_missing remoteRunnerOutbound=no`,
+      );
+      expect(String(sent.result.stderr)).toContain(
+        `generation=${workerGeneration === undefined ? 'missing' : 'invalid'}`,
+      );
       expect(String(sent.result.stderr)).toContain('trusted receipt identity');
       expect(String(sent.result.stdout)).not.toContain('CAPTURE_DURABLE=');
       expect(String(sent.result.stdout)).not.toContain('CAPTURE_REPLY=');

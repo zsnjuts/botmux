@@ -10298,11 +10298,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   // The env marker is not authority by itself. A genuine host relay CLI is a
   // direct child of the session's durably recorded worker pid; sandboxed or
   // semi-trusted descendants cannot satisfy that parent binding.
-  const trustedRelayCtx = trustedRelayCandidate && isTrustedVcMeetingHostRelayParent(
+  const trustedRelayParentMatches = !!trustedRelayCandidate && isTrustedVcMeetingHostRelayParent(
     trustedHostRelay,
     trustedRelaySession?.pid,
     process.ppid,
-  )
+  );
+  const trustedRelayCtx = trustedRelayParentMatches
     ? trustedRelayCandidate
     : undefined;
   // Keep origin authority independent from the requested destination.  In
@@ -11801,6 +11802,21 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   if (scheduledTurn && effectiveResponseKind === 'final'
       && (!scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof)) {
+    console.error(
+      '[botmux send diagnostic] scheduled_final_identity_missing'
+      + ` remoteRunnerOutbound=${remoteRunnerOutbound ? 'yes' : 'no'}`
+      + ` hostRelay=${trustedHostRelay ? 'present' : 'absent'}`
+      + ` relayCandidateSession=${!trustedRelayCandidate ? 'missing'
+        : trustedRelayCandidate.sessionId === sid ? 'match' : 'mismatch'}`
+      + ` relayCandidateTurn=${trustedRelayCandidate?.turnId ? 'present' : 'missing'}`
+      + ` relaySession=${trustedRelaySession ? 'found' : 'missing'}`
+      + ` relaySessionPid=${Number.isInteger(trustedRelaySession?.pid) ? 'present' : 'missing'}`
+      + ` parentBinding=${trustedRelayParentMatches ? 'match' : 'mismatch'}`
+      + ` liveMarker=${liveMarkerCtx?.turnId ? 'turn' : liveMarkerCtx?.sessionId ? 'session' : 'missing'}`
+      + ` originTurn=${currentTurnId ? 'present' : 'missing'}`
+      + ` generation=${typeof s.workerGeneration !== 'number' ? 'missing'
+        : Number.isSafeInteger(s.workerGeneration) && s.workerGeneration > 0 ? 'valid' : 'invalid'}`,
+    );
     console.error('botmux send refused: scheduled final requires a trusted receipt identity');
     process.exit(2);
   }

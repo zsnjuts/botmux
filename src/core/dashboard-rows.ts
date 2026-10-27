@@ -30,6 +30,12 @@ export interface SessionRow extends SessionMessagePreview {
   creationSource?: string;
   workspace?: WorkspaceMetadata | null;
   sessionId: string;
+  /** Exact worker lifetime. The host-side CLI session resolver consumes the
+   * detail projection too; omitting this field downgrades an active scheduled
+   * Host relay into a generation-less Session even when the durable row is
+   * correct. Informational on dashboard surfaces, authority remains with the
+   * daemon/session store. */
+  workerGeneration?: number;
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
@@ -296,6 +302,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
   const topicId = sessionThreadId(ds.session);
   return {
     sessionId: ds.session.sessionId,
+    workerGeneration: ds.workerGeneration,
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
@@ -379,6 +386,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
   const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
+    workerGeneration: s.workerGeneration,
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
@@ -440,6 +448,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
   const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
+    workerGeneration: s.workerGeneration,
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
