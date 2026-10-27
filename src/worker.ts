@@ -23006,14 +23006,21 @@ async function spawnCli(
       log(`Ignored stale remote failure for turn ${failure.turnId.substring(0, 12)}`);
       return;
     }
-    send({
-      type: 'final_output',
-      content: failure.message,
-      lastUuid: failure.turnId,
-      turnId: failure.turnId,
-      dispatchAttempt: currentBotmuxDispatchAttempt,
-      turnFailed: true,
-    });
+    // `cancelled` is a lifecycle terminal, not an assistant answer or an
+    // execution failure. The command/card path that requested cancellation
+    // already owns the user-visible acknowledgement; echoing the provider's
+    // diagnostic as final_output makes a successful stop look like a failed
+    // model turn. Failed and ambiguous terminals still surface their message.
+    if (failure.status !== 'cancelled') {
+      send({
+        type: 'final_output',
+        content: failure.message,
+        lastUuid: failure.turnId,
+        turnId: failure.turnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+        turnFailed: true,
+      });
+    }
     emitTurnTerminal(
       failure.turnId,
       failure.status,
