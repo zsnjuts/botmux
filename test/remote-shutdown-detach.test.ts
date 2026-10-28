@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import type { DaemonSession } from '../src/core/types.js';
 import {
+  __testOnly_remoteRunnerShutdownOperationTimeoutMs,
+  __testOnly_remoteRunnerShutdownProviderTimeoutMs,
   abortRemoteShutdownFleet,
   abortPreparedRemoteShutdown,
   canAbortVerifiedExitedRemotePreparation,
@@ -52,6 +54,15 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
     config.session.dataDir = previousDataDir;
     sessionStore.init('test-app');
     rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('budgets detach and reattach independently from active-turn drain', () => {
+    expect(__testOnly_remoteRunnerShutdownProviderTimeoutMs(undefined)).toBe(30_000);
+    expect(__testOnly_remoteRunnerShutdownProviderTimeoutMs(900_000)).toBe(900_000);
+    expect(__testOnly_remoteRunnerShutdownOperationTimeoutMs(undefined)).toBe(35_000);
+    expect(__testOnly_remoteRunnerShutdownOperationTimeoutMs(900_000)).toBe(905_000);
+    expect(__testOnly_remoteRunnerShutdownOperationTimeoutMs(1_200_000)).toBe(1_205_000);
+    expect(__testOnly_remoteRunnerShutdownOperationTimeoutMs(1_200_001)).toBe(35_000);
   });
 
   function fixture(
@@ -210,6 +221,32 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       'remote_shutdown_prepare',
       'remote_shutdown_commit',
     ]);
+  });
+
+  it('keeps the worker drain input separate from a long Remote Runner operation budget', async () => {
+    const f = fixture(undefined, (worker, message) => {
+      if (message.type === 'remote_shutdown_prepare') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'remote_shutdown_result',
+          requestId: message.requestId,
+          phase: 'prepare',
+          ok: true,
+          taskId: null,
+        }));
+      }
+    }, 'remote-runner');
+    f.ds.initConfig = {
+      backendType: 'remote-runner',
+      backendConfig: { operationTimeoutMs: 900_000 },
+    } as any;
+
+    await expect(prepareRemoteSessionForShutdown(f.ds, { drainTimeoutMs: 12_000 }))
+      .resolves.toMatchObject({ ok: true, fence: 'prepared' });
+    expect(f.messages[0]).toMatchObject({
+      type: 'remote_shutdown_prepare',
+      drainTimeoutMs: 12_000,
+      operationTimeoutMs: 900_000,
+    });
   });
 
   it('keeps the prepared remote generation fenced until its final reply delivery settles', async () => {

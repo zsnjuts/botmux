@@ -28,6 +28,37 @@ describe('TurnSendLedger', () => {
     }
   });
 
+  it('persists the exact trusted cleanup envelope across CLI generations', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-send-ledger-'));
+    const scheduledKey = {
+      ...key,
+      turnId: 'schedule:deadbeef:00000000-0000-4000-8000-000000000001',
+    };
+    const receipt = {
+      domain: 'botmux.scheduled-final-receipt.v1' as const,
+      trusted: true as const,
+      messageId: 'om_first',
+      turnId: scheduledKey.turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 1,
+      proof: 'bmxsfr_123456789abcd',
+    };
+    try {
+      const first = new TurnSendLedger(dataDir);
+      await first.execute(scheduledKey, 'final', 'answer', async () => 'om_first');
+      await first.recordTrustedFinalReceipt(scheduledKey, receipt);
+
+      const restored = new TurnSendLedger(dataDir).read(scheduledKey);
+      expect(restored?.final?.trustedFinalReceipt).toEqual(receipt);
+      await expect(new TurnSendLedger(dataDir).recordTrustedFinalReceipt(
+        scheduledKey,
+        { ...receipt, messageId: 'om_other' },
+      )).rejects.toThrow('does not match the delivered final');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a different final and ordinary progress after final', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-send-ledger-'));
     try {

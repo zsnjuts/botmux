@@ -28044,7 +28044,10 @@ process.on('message', async (raw: unknown) => {
         shutdownDetachRequestId = msg.requestId;
         shutdownDetachPhase = 'preparing';
         try {
-          result = await backend?.prepareShutdownDetach?.(msg.drainTimeoutMs)
+          result = await backend?.prepareShutdownDetach?.(
+            msg.drainTimeoutMs,
+            msg.operationTimeoutMs,
+          )
             ?? { ok: false, taskId: null, error: 'shutdown_detach_unsupported' };
         } catch (err) {
           result = {
@@ -28102,7 +28105,7 @@ process.on('message', async (raw: unknown) => {
       log(`Remote shutdown detach aborted (${msg.requestId})`);
       let result: SessionShutdownDetachResult;
       try {
-        result = await backend?.abortShutdownDetach?.()
+        result = await backend?.abortShutdownDetach?.(msg.operationTimeoutMs)
           ?? { ok: false, taskId: null, error: 'shutdown_abort_unsupported' };
       } catch (err) {
         result = {

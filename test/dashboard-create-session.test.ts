@@ -1268,15 +1268,99 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
   });
 
-  it('retains a fresh-session reservation and opening prompt when fork pre-accept throws', async () => {
+  it('cleans a rejected fresh reservation so the next fire can create a new owner', async () => {
     const active = new Map<string, DaemonSession>();
     forkWorkerMock.mockImplementationOnce(() => { throw new Error('scheduler fork failed'); });
 
     await expect(executeScheduledTask(task(), active, vi.fn())).rejects.toThrow('scheduler fork failed');
 
-    const ds = active.get(sessionKey(ROOT, APP));
-    expect(ds?.initialStartPending).toBe(true);
-    expect(ds?.pendingPrompt).toBe('scheduled prompt');
-    expect(ds?.worker).toBeNull();
+    expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
+
+    await expect(executeScheduledTask(task(), active, vi.fn())).resolves.toBeUndefined();
+    const replacement = active.get(sessionKey(ROOT, APP));
+    expect(replacement).toBeDefined();
+    expect(replacement?.initialStartPending).toBe(false);
+    expect(replacement?.pendingPrompt).toBeUndefined();
+    expect(forkWorkerMock).toHaveBeenCalledTimes(2);
+    expect(forkWorkerMock.mock.calls[1]?.[0]).toBe(replacement);
+  });
+
+  it.each([
+    ['retained-topic', {}],
+    ['new-topic', { rootMessageId: undefined, scope: 'chat', executionPosition: 'new-topic' }],
+  ])('cleans a delayed rejected %s candidate and lets the next fire rebuild', async (_name, patch) => {
+    const active = new Map<string, DaemonSession>();
+    let rejectAdmission: (() => void) | undefined;
+    forkWorkerMock.mockImplementationOnce((_ds, _input, _resume, opts) => {
+      opts.onAdmission?.('deferred');
+      rejectAdmission = () => opts.onAdmission?.('rejected');
+      return true;
+    });
+    vi.mocked(sessionStore.closeSession).mockImplementation((id: string) => {
+      const row = store.get(id);
+      if (row) {
+        row.status = 'closed';
+        store.set(id, row);
+      }
+    });
+    const scheduledTask = { ...task(), ...patch } as ScheduledTask;
+
+    await expect(executeScheduledTask(scheduledTask, active, vi.fn())).resolves.toBeUndefined();
+    const first = [...active.values()][0];
+    expect(first).toBeDefined();
+    expect(first.initialStartPending).toBe(true);
+    expect(first.pendingPrompt).toContain('scheduled prompt');
+    expect(first.session.lastCliInput).toBeTruthy();
+
+    rejectAdmission?.();
+    await Promise.resolve();
+    expect([...active.values()]).toEqual([]);
+    expect(store.get(first.session.sessionId)).toMatchObject({
+      status: 'closed',
+      lastCliInput: undefined,
+      lastUserPrompt: undefined,
+    });
+
+    forkWorkerMock.mockImplementationOnce(() => true);
+    await expect(executeScheduledTask(scheduledTask, active, vi.fn())).resolves.toBeUndefined();
+    const replacement = [...active.values()][0];
+    expect(replacement).toBeDefined();
+    expect(replacement).not.toBe(first);
+    expect(replacement.session.sessionId).not.toBe(first.session.sessionId);
+  });
+
+  it('holds a deferred fresh admission until its exact final decision and ignores a stale rejection', async () => {
+    const active = new Map<string, DaemonSession>();
+    let settleFirst: ((admission: 'accepted' | 'deferred' | 'rejected') => void) | undefined;
+    forkWorkerMock.mockImplementationOnce((_ds, _input, _resume, opts) => {
+      opts.onAdmission?.('deferred');
+      settleFirst = opts.onAdmission;
+      return true;
+    });
+
+    await expect(executeScheduledTask(task(), active, vi.fn())).resolves.toBeUndefined();
+    const first = active.get(sessionKey(ROOT, APP));
+    expect(first).toBeDefined();
+    expect(first?.initialStartPending).toBe(true);
+    await expect(executeScheduledTask(task(), active, vi.fn()))
+      .rejects.toThrow('initial_start_pending');
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+
+    settleFirst?.('accepted');
+    expect(first?.initialStartPending).toBe(false);
+    expect(first?.pendingPrompt).toBeUndefined();
+
+    forkWorkerMock.mockImplementationOnce((_ds, _input, _resume, opts) => {
+      opts.onAdmission?.('accepted');
+      return true;
+    });
+    await expect(executeScheduledTask(task(), active, vi.fn())).resolves.toBeUndefined();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(first);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(2);
+
+    settleFirst?.('rejected');
+    await Promise.resolve();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(first);
+    expect(store.get(first!.session.sessionId)?.status).toBe('active');
   });
 });

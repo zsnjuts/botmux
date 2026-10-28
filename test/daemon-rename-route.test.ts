@@ -1051,8 +1051,14 @@ describe('/rename production routing — must not pre-create a session (review P
     const send = vi.fn();
     ds.worker = { killed: false, send } as any;
     // Bot config remains Claude: the existing session's frozen CLI wins.
-    for (const [id, text] of [['om_queue_1', 'first <tag>\n/compact is literal text'], ['om_queue_2', 'next']]) {
-      await handleThreadReply(makeEventData(id, `/queue ${text}`, root), makeCtx(root, id));
+    const inputs = [
+      ['om_queue_1', 'first <tag>\n/compact is literal text', '1792907862000'],
+      ['om_queue_2', 'next', '1792907863000'],
+    ] as const;
+    for (const [id, text, createTime] of inputs) {
+      const data = makeEventData(id, `/queue ${text}`, root);
+      data.message.create_time = createTime;
+      await handleThreadReply(data, makeCtx(root, id));
     }
     expect(repliedText()).toContain('已接纳');
     const turns = send.mock.calls.map(([m]) => m).filter(m => m.type === 'message');
@@ -1069,6 +1075,14 @@ describe('/rename production routing — must not pre-create a session (review P
       expect(entry.codexAppSteerable).toBeUndefined();
       expect(entry.replyTarget).toEqual({ mode: 'thread', rootMessageId: root });
     }
+    expect(ds.session.turnReplyContexts?.om_queue_1).toMatchObject({
+      sourceMessageId: 'om_queue_1',
+      sourceMessageCreateTime: 1792907862000,
+    });
+    expect(ds.session.turnReplyContexts?.om_queue_2).toMatchObject({
+      sourceMessageId: 'om_queue_2',
+      sourceMessageCreateTime: 1792907863000,
+    });
     expect(repliedText()).toContain('已接纳');
   });
 

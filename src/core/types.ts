@@ -590,6 +590,11 @@ export interface DaemonSession {
    * daemon-minted schedule turn id and never persisted. The worker can name a
    * turn id but cannot add or change the identity behind it. */
   scheduledTurnCallers?: Map<string, TrustedCaller>;
+  /** Exact scheduled turns accepted by this worker generation, independent of
+   * creator identity. Legacy/CLI/bot-created schedules intentionally have no
+   * TrustedCaller, but their scheduler settlement still needs lifecycle
+   * convergence on close, suspend, replacement, or worker exit. */
+  scheduledRunTurnIds?: Set<string>;
   /** Exact principal-lane turn/generation that still owns the worker until a
    * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
    * the worker's earlier managed-origin revoke must not clear this FIFO fence,

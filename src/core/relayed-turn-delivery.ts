@@ -1,6 +1,7 @@
 import type { DaemonSession } from './types.js';
 import type { FeedbackWebhookDestination } from '../services/feedback-outbox.js';
 import type { SkillFeedbackStore } from '../services/skill-feedback-store.js';
+import type { FeedbackPolicy } from '../services/feedback-policy.js';
 
 /**
  * Daemon-side half of `botmux send --response-kind final` for a CLI that
@@ -15,9 +16,9 @@ import type { SkillFeedbackStore } from '../services/skill-feedback-store.js';
  * therefore taken from the live DaemonSession — the CLI contributes only the
  * platform message id and the answer text it just delivered. The worst a
  * session can do is mis-index its own current turn, which a non-isolated CLI
- * can already do by writing the store directly. No feedback policy or base
- * card is accepted: an isolated CLI cannot read bot config, so its card never
- * carries a feedback control.
+ * can already do by writing the store directly. Feedback presentation is
+ * accepted only through `trustedPresentation`, which the daemon reconstructs
+ * from Host config, frozen turn identity and Provider readback — never body.
  */
 export const RELAYED_TURN_DELIVERY_ROUTE = 'turn-delivery';
 /** Larger than any Lark message body; the store keeps only a content hash. */
@@ -35,6 +36,12 @@ export function recordRelayedTurnDelivery(input: {
   store: Pick<SkillFeedbackStore, 'findDeliveryByPlatformMessage' | 'recordTurnDelivery'>;
   webhookDestinations?: FeedbackWebhookDestination[];
   teamId?: string;
+  trustedPresentation?: {
+    topicRootId: string;
+    policy?: FeedbackPolicy;
+    baseCard?: Record<string, unknown>;
+    requesterSubjectId?: string;
+  };
 }): RelayedTurnDeliveryResult {
   const { ds, body, store } = input;
   if (!ds || ds.session.status === 'closed') return { ok: false, status: 404, error: 'session_not_active' };
@@ -65,15 +72,26 @@ export function recordRelayedTurnDelivery(input: {
     platformAppId: ds.larkAppId,
     platformMessageId: messageId,
     chatId: ds.chatId,
-    topicRootId: ds.session.rootMessageId,
+    topicRootId: input.trustedPresentation?.topicRootId ?? ds.session.rootMessageId,
     dispatchAttempt: ds.managedTurnOrigin?.dispatchAttempt,
     content,
     cliId: ds.session.cliId,
     cliVersion: ds.cliVersion,
     model: ds.session.model,
     reasoningEffort: ds.session.reasoningEffort,
-    cardMode: 'card',
+    cardMode: input.trustedPresentation?.policy && input.trustedPresentation.baseCard
+      ? 'feedback'
+      : 'card',
     status: 'delivered',
+    ...(input.trustedPresentation?.policy
+      ? { policy: input.trustedPresentation.policy }
+      : {}),
+    ...(input.trustedPresentation?.baseCard
+      ? { baseCard: input.trustedPresentation.baseCard }
+      : {}),
+    ...(input.trustedPresentation?.requesterSubjectId
+      ? { requesterSubjectId: input.trustedPresentation.requesterSubjectId }
+      : {}),
     webhookDestinations: input.webhookDestinations,
     context: input.teamId ? { teamId: input.teamId } : {},
   });

@@ -58,7 +58,7 @@ import {
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, getMessageDetail, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
@@ -143,7 +143,11 @@ import {
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
-import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
+import {
+  REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS,
+  REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
+  type RemoteRunnerConfig,
+} from '../adapters/backend/remote-runner-config.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
@@ -766,6 +770,17 @@ import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-ou
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
+import {
+  observeScheduledRunProviderReadbackDelivery,
+  observeScheduledRunTerminal,
+} from './scheduled-run-settlement.js';
+import {
+  deriveScheduledFinalDeliveryProof,
+  scheduledFinalCardHasExactProof,
+  stampScheduledFinalDeliveryProof,
+  verifyScheduledFinalDeliveryReadback,
+} from './scheduled-final-delivery-proof.js';
+import { markGroupContextCardPurpose } from '../im/lark/group-context-card.js';
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
@@ -6085,6 +6100,45 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
 /**
+ * A deliberate worker-generation retirement cannot leave the scheduler's
+ * in-memory rendezvous pending forever.  Only an explicit same-turn handoff
+ * may keep the settlement alive for the replacement generation; routing
+ * transfer uses its own detach path and does not call this helper.
+ */
+function settleScheduledRunBeforeWorkerRetirement(
+  ds: DaemonSession,
+  errorCode: string,
+  takeoverTurnId?: string,
+  fallbackTurnId?: string,
+): void {
+  const retiredTurnIds = new Set<string>();
+  const managedTurnId = ds.managedTurnOrigin?.turnId;
+  if (managedTurnId) retiredTurnIds.add(managedTurnId);
+  for (const turnId of ds.scheduledTurnCallers?.keys() ?? []) {
+    retiredTurnIds.add(turnId);
+  }
+  for (const turnId of ds.scheduledRunTurnIds ?? []) {
+    retiredTurnIds.add(turnId);
+  }
+  if (ds.currentTurnId && parseScheduledTurnId(ds.currentTurnId)) {
+    retiredTurnIds.add(ds.currentTurnId);
+  }
+  if (fallbackTurnId && parseScheduledTurnId(fallbackTurnId)) {
+    retiredTurnIds.add(fallbackTurnId);
+  }
+  for (const retiredTurnId of retiredTurnIds) {
+    if (retiredTurnId === takeoverTurnId) continue;
+    observeScheduledRunTerminal({
+      turnId: retiredTurnId,
+      status: 'failed',
+      errorCode,
+    });
+    forgetScheduledTurnCaller(ds, retiredTurnId);
+    forgetScheduledRunTurn(ds, retiredTurnId);
+  }
+}
+
+/**
  * Retire a session's worker (and, worker-less, its orphaned backing session).
  *
  * CONTRACT FOR REMOTE BACKENDS (riff / mojo): a LIVE remote worker is refused
@@ -6138,6 +6192,7 @@ export function killWorker(
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  settleScheduledRunBeforeWorkerRetirement(ds, 'worker_retired');
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
   // daemon-side copy synchronously; the worker may never get a chance to send
@@ -6222,6 +6277,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  settleScheduledRunBeforeWorkerRetirement(ds, 'worker_process_retired');
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
@@ -7065,6 +7121,18 @@ async function abortLiveRemoteWorkerClose(
   return false;
 }
 
+export function __testOnly_remoteRunnerCloseResultTimeoutMs(
+  operationTimeoutMs: number | undefined,
+): number {
+  const normalized = typeof operationTimeoutMs === 'number'
+      && Number.isSafeInteger(operationTimeoutMs)
+      && operationTimeoutMs >= 100
+      && operationTimeoutMs <= REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS
+    ? operationTimeoutMs
+    : 30_000;
+  return normalized + 5_000;
+}
+
 async function prepareLiveRemoteWorkerClose(
   ds: DaemonSession,
   backendType: 'riff' | 'mojo' | 'remote-runner',
@@ -7296,7 +7364,7 @@ async function prepareLiveRemoteWorkerClose(
     const closeResultTimeoutMs = backendType === 'mojo'
       ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS
       : backendType === 'remote-runner'
-        ? Math.min(305_000, Math.max(5_000, remoteRunnerOperationTimeoutMs! + 5_000))
+        ? __testOnly_remoteRunnerCloseResultTimeoutMs(remoteRunnerOperationTimeoutMs)
         : 23_000;
     const timer = setTimeout(
       // A timed-out prepare may still be running remotely; the outcome is unknown.
@@ -7623,8 +7691,22 @@ type RemoteRunnerExplicitCloseWake = (
   wakeRequestId: string,
 ) => Promise<boolean>;
 type RemoteRunnerCloseFork = typeof forkWorker;
-const REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS = 45_000;
 const REMOTE_RUNNER_CLOSE_WAKE_POLL_MS = 50;
+
+export function __testOnly_remoteRunnerCloseWakeTimeoutMs(
+  handshakeTimeoutMs: number | undefined,
+): number {
+  const normalized = typeof handshakeTimeoutMs === 'number'
+      && Number.isSafeInteger(handshakeTimeoutMs)
+      && handshakeTimeoutMs >= 100
+      && handshakeTimeoutMs <= REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS
+    ? handshakeTimeoutMs
+    : 15_000;
+  // Worker startup performs hello, then close-control resume. Either protocol
+  // phase may consume the configured handshake budget; preserve the historical
+  // 45s default floor and add a bounded IPC scheduling margin.
+  return Math.max(45_000, normalized * 2 + 5_000);
+}
 
 /**
  * Materialize only the generic provider control channel for an explicit close.
@@ -7642,6 +7724,9 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
   wakeRequestId: string,
   forkImpl: RemoteRunnerCloseFork = forkWorker,
 ): Promise<boolean> {
+  const closeWakeTimeoutMs = __testOnly_remoteRunnerCloseWakeTimeoutMs(
+    (ds.initConfig?.backendConfig as RemoteRunnerConfig | undefined)?.handshakeTimeoutMs,
+  );
   if (ds.worker && !ds.worker.killed) {
     // Active-session takeover publishes the local DaemonSession immediately
     // after fork admission, before the replacement worker has necessarily
@@ -7650,7 +7735,7 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
     // the exact admitted generation instead of treating mere process existence
     // as control readiness.
     const worker = ds.worker;
-    const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+    const deadline = Date.now() + closeWakeTimeoutMs;
     while (Date.now() < deadline) {
       if (findActiveBySessionId(ds.session.sessionId) !== ds
           || ds.session.status !== 'active'
@@ -7714,7 +7799,7 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
   }
 
   const worker = ds.worker;
-  const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+  const deadline = Date.now() + closeWakeTimeoutMs;
   while (Date.now() < deadline) {
     if (findActiveBySessionId(ds.session.sessionId) !== ds
         || ds.session.status !== 'active'
@@ -8674,6 +8759,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
     // No live worker ⟹ no live CLI prompt; converge the flag with reality.
     ds.cliReady = false;
     // There is no live generation that can still own this capability.
+    settleScheduledRunBeforeWorkerRetirement(ds, 'worker_missing');
     ds.managedTurnOrigin = undefined;
     invalidateTuiPrompt(ds, 'suspendWorker:no_worker');
     return false;
@@ -8686,6 +8772,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
     clearLifecycleRetirement(ds, w);
     return false;
   }
+  settleScheduledRunBeforeWorkerRetirement(ds, 'worker_suspended');
   try {
     w.send({ type: 'suspend' } as DaemonToWorker);
   } catch {
@@ -12483,10 +12570,24 @@ function rememberScheduledTurnCaller(
   (ds.scheduledTurnCallers ??= new Map()).set(turnId, { ...expected });
 }
 
+/** Track scheduler settlement ownership independently of creator identity.
+ * The daemon alone supplies accepted worker turn ids; parsing keeps ordinary
+ * IM turns out of this lifecycle registry. */
+function rememberScheduledRunTurn(ds: DaemonSession, turnId: string | undefined): void {
+  if (!turnId || !parseScheduledTurnId(turnId)) return;
+  (ds.scheduledRunTurnIds ??= new Set()).add(turnId);
+}
+
 function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined): void {
   if (!turnId || !ds.scheduledTurnCallers) return;
   ds.scheduledTurnCallers.delete(turnId);
   if (ds.scheduledTurnCallers.size === 0) ds.scheduledTurnCallers = undefined;
+}
+
+function forgetScheduledRunTurn(ds: DaemonSession, turnId: string | undefined): void {
+  if (!turnId || !ds.scheduledRunTurnIds) return;
+  ds.scheduledRunTurnIds.delete(turnId);
+  if (ds.scheduledRunTurnIds.size === 0) ds.scheduledRunTurnIds = undefined;
 }
 
 /** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
@@ -12609,6 +12710,7 @@ export function sendWorkerInput(
           ? { dispatchAttempt: opts.dispatchAttempt }
           : {}),
       });
+      rememberScheduledRunTurn(ds, queuedTurnId);
       return true;
     } catch (err) {
       logger.error(
@@ -12727,6 +12829,7 @@ export function sendWorkerInput(
     );
     return false;
   }
+  rememberScheduledRunTurn(ds, effectiveTurnId ?? routingTurnId);
   rememberScheduledTurnCaller(ds, effectiveTurnId ?? routingTurnId, opts.trustedCaller);
   {
     const admittedTurnId = effectiveTurnId ?? routingTurnId ?? `admitted-turn-${randomUUID()}`;
@@ -13123,6 +13226,10 @@ export function promoteQueuedActivationTail(
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
+    // Defense in depth for restored/pre-existing tails: admission normally
+    // registered this at durable staging time, but promotion is the last
+    // authoritative boundary before the worker owns the turn.
+    rememberScheduledRunTurn(ds, head.turnId);
     rememberScheduledTurnCaller(ds, head.turnId, exactInput.trustedCaller);
     recordAdmittedOrdinaryUserTurn(ds, head.turnId, {
       beginRecovery: true,
@@ -13600,7 +13707,12 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
-      forkWorker(ds, promptInput, resumeOrTurnId);
+      forkWorker(ds, promptInput, resumeOrTurnId, opts);
+    } else {
+      // The deferred spawn owned this caller's exact admission lifecycle. If
+      // activation closed/replaced the Session, explicitly terminate that
+      // lifecycle instead of leaving a scheduler receipt pending forever.
+      opts.onAdmission?.('rejected');
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -13814,7 +13926,10 @@ export function forkWorker(
       }).then(outcome => {
         // The session may have been closed/superseded while we waited; the
         // registry guard also rejects revived-generation forks.
-        if (findActiveBySessionId(ds.session.sessionId) !== ds) return;
+        if (findActiveBySessionId(ds.session.sessionId) !== ds) {
+          opts.onAdmission?.('rejected');
+          return;
+        }
         if (outcome.result !== 'allowed') {
           notifyBlocked(outcome.decision, outcome.reclaimed);
           opts.onAdmission?.('rejected');
@@ -13872,8 +13987,12 @@ export function forkWorker(
         );
         if (findActiveBySessionId(ds.session.sessionId) === ds) {
           notifyBlocked(admission, 0);
-          opts.onAdmission?.('rejected');
         }
+        // The scheduler owns a pending settlement even if the Session was
+        // replaced while reclaim/re-check failed.  UI belongs only to the
+        // current Session, but admission rejection must always reach its exact
+        // caller so the durable task cannot remain running forever.
+        opts.onAdmission?.('rejected');
       });
       return true;
     }
@@ -14053,6 +14172,7 @@ export function forkWorker(
   if (ds.worker && !ds.worker.killed) {
     const replacedWorker = ds.worker;
     logger.warn(`[${t}] Worker already running (pid: ${replacedWorker.pid}), killing before re-fork`);
+    settleScheduledRunBeforeWorkerRetirement(ds, 'worker_replaced', initAttributionTurnId);
     trackLifecycleRetirement(ds, replacedWorker);
     try { replacedWorker.send({ type: 'close' } as DaemonToWorker); } catch { /* ignore */ }
     try { replacedWorker.kill(); } catch { /* ignore */ }
@@ -14341,6 +14461,14 @@ export function forkWorker(
   worker.on('error', (err) => {
     const reason = (err as Error)?.message ?? String(err);
     logger.error(`[${t}] Worker fork error: ${reason}`);
+    if (initAttributionTurnId) {
+      observeScheduledRunTerminal({
+        turnId: initAttributionTurnId,
+        status: 'failed',
+        errorCode: 'worker_fork_error',
+      });
+      forgetScheduledRunTurn(ds, initAttributionTurnId);
+    }
     if (ds.worker === worker) {
       if (ds.session.queuedActivationPending) {
         // The durable opening journal remains authoritative until the adapter
@@ -14739,6 +14867,7 @@ export function forkWorker(
   ds.cliReady = false;
   ds.worker = worker;
   initializeWorkerIpcBootstrap(worker);
+  rememberScheduledRunTurn(ds, initAttributionTurnId);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   {
     const initCallerOpenId = turnCallerOpenIdFor(ds, initMsg.turnId);
@@ -18113,6 +18242,7 @@ function setupWorkerHandlers(
             + `(turn=${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
           );
         }
+        forgetScheduledRunTurn(ds, msg.turnId);
         forgetScheduledTurnCaller(ds, msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         // Defense in depth: the worker sends a token-matched revoke before the
@@ -18621,6 +18751,15 @@ function setupWorkerHandlers(
         } catch (err: any) {
           logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        // Bridge final delivery runs asynchronously from the ordered terminal
+        // IPC. Wait for that exact drain before deciding that a non-silent
+        // scheduled turn ended without a provider receipt.
+        await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+        observeScheduledRunTerminal({
+          turnId: msg.turnId,
+          status: msg.status,
+          ...(msg.errorCode ? { errorCode: msg.errorCode } : {}),
+        });
         break;
       }
 
@@ -19043,6 +19182,7 @@ function setupWorkerHandlers(
             }
           }
           const key = `${ds.session.sessionId}:${settlement.generation}:${settlement.seq}`;
+          const frozenScheduledOrigin = freezeScheduledTurnOrigin(ds, msg);
           let inFlight = codexAppFinalSettlementInFlight.get(key);
           if (!inFlight) {
             inFlight = (async () => {
@@ -19075,6 +19215,10 @@ function setupWorkerHandlers(
                       () => ds.worker === worker
                         && ds.session.sessionId === msg.sessionId,
                       preview.settledEntry.replyTarget,
+                      undefined,
+                      undefined,
+                      undefined,
+                      frozenScheduledOrigin,
                     );
                   });
               if (!owned) return false;
@@ -19386,6 +19530,20 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.workerCardViewToken = null;
+      if (unexpectedWorkerExit) {
+        // A ready worker can accept a scheduled follow-up and die before it
+        // publishes managed_turn_origin.  scheduledTurnCallers is already a
+        // daemon-verified exact-turn admission record, so settle every pending
+        // scheduled turn owned by this generation before clearing that map.
+        // Routing transfer and deliberate lifecycle retirement are excluded by
+        // unexpectedWorkerExit and have their own handoff/retirement fences.
+        settleScheduledRunBeforeWorkerRetirement(
+          ds,
+          'worker_exit',
+          undefined,
+          preReadyExit ? startupState.initTurnId : undefined,
+        );
+      }
       ds.managedTurnOrigin = undefined;
       ds.scheduledTurnCallers = undefined;
       ds.taskContinuationRpcProof = undefined;
@@ -19538,6 +19696,36 @@ function setupWorkerHandlers(
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
+/** The live managed origin of a scheduled turn, captured synchronously while
+ * handling its final_output IPC. The worker emits final_output before the
+ * revoke + turn_terminal pair, but the bridge delivers on a later timer tick,
+ * after the daemon already cleared `ds.managedTurnOrigin` for that turn. */
+export interface FrozenScheduledTurnOrigin {
+  turnId: string;
+  dispatchAttempt?: number;
+  workerGeneration: number;
+}
+
+function freezeScheduledTurnOrigin(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+): FrozenScheduledTurnOrigin | undefined {
+  const origin = ds.managedTurnOrigin;
+  const workerGeneration = ds.workerGeneration;
+  if (parseScheduledTurnId(msg.turnId) === null
+    || origin?.turnId !== msg.turnId
+    || origin.dispatchAttempt !== msg.dispatchAttempt
+    || typeof workerGeneration !== 'number'
+    || ds.session.workerGeneration !== workerGeneration) {
+    return undefined;
+  }
+  return {
+    turnId: msg.turnId,
+    ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+    workerGeneration,
+  };
+}
+
 export interface DurableBridgeFinalOutputRequest {
   daemonSession: DaemonSession;
   turnId: string;
@@ -19547,6 +19735,9 @@ export interface DurableBridgeFinalOutputRequest {
   target:
     | { kind: 'send'; chatId: string }
     | { kind: 'reply'; messageId: string; replyInThread: boolean };
+  /** A failed turn's diagnostic is user-visible but never the run's final. */
+  turnFailed?: boolean;
+  frozenScheduledOrigin?: FrozenScheduledTurnOrigin;
 }
 
 export type DurableBridgeFinalOutputResult =
@@ -19576,6 +19767,9 @@ function deliverFinalOutputWithShutdownDrain(
   isStillOwned: () => boolean,
 ): void {
   const finishDrain = beginFinalOutputDelivery(ds, msg.turnId);
+  // Must run synchronously in the IPC handler, before the trailing
+  // turn_terminal revokes the origin.
+  const frozenScheduledOrigin = freezeScheduledTurnOrigin(ds, msg);
   try {
     deliverFinalOutput(
       ds,
@@ -19584,6 +19778,11 @@ function deliverFinalOutputWithShutdownDrain(
       0,
       () => finishDrain(),
       isStillOwned,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      frozenScheduledOrigin,
     );
   } catch (error) {
     finishDrain();
@@ -19968,6 +20167,7 @@ function deliverFinalOutput(
   frozenRenderSnapshot?: ReplyCardRenderSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
   imageFallback: ReplyImageState = { omitImages: false },
+  frozenScheduledOrigin?: FrozenScheduledTurnOrigin,
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
@@ -20012,6 +20212,7 @@ function deliverFinalOutput(
       setTimeout(() => deliverFinalOutput(
         ds, unresolvedMsg, t, next, onComplete, isStillOwned,
         frozenReplyTarget, frozenRenderSnapshot, frozenInitiator, imageFallback,
+        frozenScheduledOrigin,
       ), FINAL_OUTPUT_RETRY_BACKOFF_MS[next] ?? 0);
       return;
     }
@@ -20513,6 +20714,32 @@ function deliverFinalOutput(
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
       }
+      const scheduledTaskId = !msg.turnFailed ? parseScheduledTurnId(msg.turnId) : null;
+      const scheduledWorkerGeneration = ds.workerGeneration;
+      const scheduledProof = scheduledTaskId && typeof scheduledWorkerGeneration === 'number'
+        && ds.session.workerGeneration === scheduledWorkerGeneration
+        ? deriveScheduledFinalDeliveryProof({
+            turnId: msg.turnId,
+            workerGeneration: scheduledWorkerGeneration,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          })
+        : undefined;
+      if (scheduledTaskId) {
+        if (!scheduledProof) {
+          throw new Error('scheduled daemon final identity is unavailable');
+        }
+        const scheduledCard = JSON.parse(cardJson) as Record<string, any>;
+        stampScheduledFinalDeliveryProof(scheduledCard, scheduledProof);
+        // The exact-proof gate (here, in the durable primary and at readback)
+        // also requires the final-message purpose carrier that `botmux send
+        // --response-kind final` adds; without it every bridge final failed.
+        cardJson = markGroupContextCardPurpose(JSON.stringify(scheduledCard), 'message');
+        if (!scheduledFinalCardHasExactProof(cardJson, scheduledProof)) {
+          throw new Error('scheduled daemon final card proof is unavailable');
+        }
+      }
       const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
@@ -20600,6 +20827,48 @@ function deliverFinalOutput(
           );
         }
       };
+      const confirmScheduledProviderDelivery = async (messageId: string): Promise<boolean> => {
+        if (!scheduledTaskId) return true;
+        const expectedTarget = frozenReplyTarget
+          ?? resolveSessionReplyTarget(ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId));
+        const ownsExactGeneration = (): boolean => isStillOwned()
+          && ds.session.status === 'active'
+          && ds.workerGeneration === scheduledWorkerGeneration
+          && ds.session.workerGeneration === scheduledWorkerGeneration
+          && ((ds.managedTurnOrigin?.turnId === msg.turnId
+            && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt)
+            || (frozenScheduledOrigin?.turnId === msg.turnId
+              && frozenScheduledOrigin.dispatchAttempt === msg.dispatchAttempt
+              && frozenScheduledOrigin.workerGeneration === scheduledWorkerGeneration));
+        if (!scheduledProof || !ownsExactGeneration()) return false;
+        let detail: unknown;
+        try {
+          detail = await getMessageDetail(ds.larkAppId, messageId, {
+            userCardContent: true,
+            timeoutMs: 10_000,
+          });
+        } catch (error) {
+          logger.error(
+            `[${t}] Scheduled daemon final readback failed: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          return false;
+        }
+        if (!ownsExactGeneration()) return false;
+        const verified = verifyScheduledFinalDeliveryReadback({
+          detail,
+          messageId,
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          expectedTarget,
+          proof: scheduledProof,
+        });
+        if (!verified.ok || !ownsExactGeneration()) {
+          logger.error(`[${t}] Scheduled daemon final receipt rejected: ${verified.ok ? 'owner_changed' : verified.error}`);
+          return false;
+        }
+        return observeScheduledRunProviderReadbackDelivery(msg.turnId, messageId);
+      };
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
         // Managed VC receivers are accounted in their own delivery store and
@@ -20614,6 +20883,7 @@ function deliverFinalOutput(
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
         confirmLinkRefDraft();
+        await confirmScheduledProviderDelivery(preparedListenerReply.messageId);
         onComplete?.(true, preparedListenerReply.messageId);
         return;
       }
@@ -20674,6 +20944,8 @@ function deliverFinalOutput(
             msgType: canonicalOutput.msgType,
             providerUuid: deliveryReplyOptions.uuid,
             target: durableTarget,
+            ...(msg.turnFailed ? { turnFailed: true } : {}),
+            ...(frozenScheduledOrigin ? { frozenScheduledOrigin } : {}),
           })
         : undefined;
       if (durableDelivery?.kind === 'ambiguous') {
@@ -20711,6 +20983,10 @@ function deliverFinalOutput(
       const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await (managedReceiver
         ? sendFinal(canonicalOutput.content)
         : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
+      // A scheduled fallback settles only after exact Provider readback. This
+      // covers direct sends, unified-card replay and the durable outbox with
+      // the same proof/target/worker-generation gate.
+      if (!msg.turnFailed) await confirmScheduledProviderDelivery(messageId);
       if (!isStillOwned()) {
         // The provider already returned its stable message id. Ownership loss
         // only suppresses later local bookkeeping; it cannot make that external
@@ -20897,7 +21173,8 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, renderSnapshot, initiator, imageFallback);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, renderSnapshot, initiator, imageFallback,
+        frozenScheduledOrigin);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
@@ -21096,6 +21373,7 @@ export function forkAdoptWorker(
   if (ds.worker && !ds.worker.killed) {
     const replacedWorker = ds.worker;
     logger.warn(`[${t}] Worker already running, killing before adopt-fork`);
+    settleScheduledRunBeforeWorkerRetirement(ds, 'worker_replaced', opts?.turnId);
     trackLifecycleRetirement(ds, replacedWorker);
     try { replacedWorker.send({ type: 'close' } as DaemonToWorker); } catch {}
     try { replacedWorker.kill(); } catch {}

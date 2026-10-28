@@ -4244,6 +4244,44 @@ describe('GET /api/sessions', () => {
 });
 
 describe('GET /api/sessions/:sessionId', () => {
+  it('includes the active worker generation required by Host relay send resolution', async () => {
+    const ds = {
+      session: {
+        sessionId: 's-generation',
+        cliId: 'remote-runner',
+        chatId: 'oc_generation',
+        rootMessageId: 'om_generation',
+        title: 'generation',
+        status: 'active',
+        createdAt: new Date(0).toISOString(),
+        larkAppId: 'cli_generation',
+        backendType: 'remote-runner',
+      },
+      worker: { killed: false },
+      workerPort: null,
+      workerToken: null,
+      workerGeneration: 7,
+      larkAppId: 'cli_generation',
+      chatId: 'oc_generation',
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: 1,
+      lastMessageAt: 1,
+      hasHistory: false,
+      workingDir: '/repo',
+    } as any;
+    workerPool.setActiveSessionsRegistry(new Map([['om_generation::cli_generation', ds]]));
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-generation`);
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).session).toMatchObject({
+      sessionId: 's-generation',
+      workerGeneration: 7,
+    });
+  });
+
   it('returns 404 for unknown sessionId', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/nonexistent-id`);
@@ -4501,6 +4539,7 @@ describe('POST /api/sessions/:sessionId/durable-send', () => {
         content: '{"schema":"2.0"}',
         msgType: 'interactive',
         providerUuid: 'bts_fixture',
+        responseKind: 'final',
         hookContext: { sessionId: 'session-durable-send' },
       };
       const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
@@ -4548,6 +4587,7 @@ describe('POST /api/sessions/:sessionId/durable-send', () => {
           content: 'hello',
           msgType: 'text',
           providerUuid: 'bts_fixture',
+          responseKind: 'progress',
         }),
       });
 

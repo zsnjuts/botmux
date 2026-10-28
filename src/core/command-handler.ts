@@ -128,6 +128,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { beginReplyTargetTurn, rehomeReplyTargetState } from './reply-target.js';
+import { normalizeScheduleSourceMessageCreateTime } from './schedule-reference-time.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
@@ -961,6 +962,7 @@ async function handleScheduleCommand(
   larkAppId?: string,
   senderOpenId?: string,
   senderUnionId?: string,
+  sourceMessageCreateTime?: string,
 ): Promise<void> {
   const { activeSessions } = deps;
   const sessionReply = (rid: string, content: string, msgType?: string) =>
@@ -1048,7 +1050,14 @@ async function handleScheduleCommand(
   }
 
   // Natural language: /schedule 每日17:50给我"帮我看看AI新闻"
-  const parsed = scheduler.parseNaturalSchedule(trimmed);
+  const sourceMessageTimeMs = normalizeScheduleSourceMessageCreateTime(
+    sourceMessageCreateTime,
+  );
+  const parsed = scheduler.parseNaturalSchedule(
+    trimmed,
+    sourceMessageTimeMs,
+    { requireTrustedReferenceTime: true },
+  );
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = resolveScheduleWorkingDir(ds, chatId, larkAppId);
@@ -1065,35 +1074,43 @@ async function handleScheduleCommand(
     const schedName = schedPrompt !== parsed.prompt
       ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
       : parsed.name;
-    const task = scheduler.addTask({
-      name: schedName,
-      schedule: trimmed,
-      parsed: parsed.parsed,
-      prompt: schedPrompt,
-      workingDir,
-      chatId,
-      // Only a topic-executing task keeps the captured root. At top-level the
-      // root is dropped so a later delivery toggle can never silently pull
-      // execution back into the originating (e.g. adopted) topic.
-      rootMessageId: executionPosition === 'topic' ? capturedRootMessageId : undefined,
-      scope: taskScope,
-      executionPosition,
-      chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
-      larkAppId,
-      // Stamp the creator so the task's scheduled turns can authenticate
-      // workflow commands as them (scheduled-turn-provenance). On the
-      // sandboxed relay path the daemon re-checks the creator is still
-      // allowed at every run mutation; the default non-sandbox route does
-      // not re-check membership.
-      ownerOpenId: senderOpenId,
-      // union_id is the tenant-stable half of the same identity; it is what a
-      // scheduled turn presents to per-user backends. Only stamped for human
-      // creators (see the call site) — a task created by a bot deliberately
-      // keeps no user identity.
-      ownerUnionId: senderUnionId,
-      deliver: 'origin',
-      silent,
-    });
+    let task: ReturnType<typeof scheduler.addTask>;
+    try {
+      task = scheduler.addTask({
+        name: schedName,
+        schedule: trimmed,
+        parsed: parsed.parsed,
+        referenceTimeMs: sourceMessageTimeMs,
+        prompt: schedPrompt,
+        workingDir,
+        chatId,
+        // Only a topic-executing task keeps the captured root. At top-level the
+        // root is dropped so a later delivery toggle can never silently pull
+        // execution back into the originating (e.g. adopted) topic.
+        rootMessageId: executionPosition === 'topic' ? capturedRootMessageId : undefined,
+        scope: taskScope,
+        executionPosition,
+        chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
+        larkAppId,
+        // Stamp the creator so the task's scheduled turns can authenticate
+        // workflow commands as them (scheduled-turn-provenance). On the
+        // sandboxed relay path the daemon re-checks the creator is still
+        // allowed at every run mutation; the default non-sandbox route does
+        // not re-check membership.
+        ownerOpenId: senderOpenId,
+        // union_id is the tenant-stable half of the same identity; it is what a
+        // scheduled turn presents to per-user backends. Only stamped for human
+        // creators (see the call site) — a task created by a bot deliberately
+        // keeps no user identity.
+        ownerUnionId: senderUnionId,
+        deliver: 'origin',
+        silent,
+      });
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== 'once_schedule_in_past') throw error;
+      await sessionReply(rootId, t('schedule.once_in_past', undefined, loc));
+      return;
+    }
     const next = scheduler.getNextRun(task.id);
     const nextStr = next ? next.toLocaleString(timeLocale, { timeZone }) : 'N/A';
     const createdMsg = t('schedule.created', {
@@ -3874,6 +3891,7 @@ export async function handleCommand(
           // access, with the audit trail pointing at the bot. Withholding the
           // union_id here is what makes such a task fail closed later.
           message.senderType === 'user' ? message.senderUnionId : undefined,
+          message.createTime,
         );
         logger.info(`[${logTag}] Schedule command handled`);
         break;

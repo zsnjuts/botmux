@@ -772,6 +772,74 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(onComplete).toHaveBeenCalledWith(true, 'om_durable');
   });
 
+  it.each([false, true])(
+    'freezes a scheduled turn origin at final_output for delivery after turn_terminal (turnFailed=%s)',
+    async (turnFailed) => {
+      const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { setDurableBridgeFinalOutputHandler } = await import('../src/core/worker-pool.js');
+      const durable = vi.fn(async (_request: unknown) => ({ kind: 'delivered' as const, messageId: 'om_durable' }));
+      setDurableBridgeFinalOutputHandler(durable);
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      const turnId = 'schedule:abcdef12:22222222-2222-4222-8222-222222222222';
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      const workerGeneration = ds.workerGeneration as number;
+      ds.session.workerGeneration = workerGeneration;
+      ds.managedTurnOrigin = { turnId, dispatchAttempt: 1, capability: 'cap' };
+
+      // The worker emits final_output, then revoke + turn_terminal, back to
+      // back; the bridge delivers on a later timer tick.
+      (ds.worker as any).emit('message', {
+        type: 'final_output', sessionId: ds.session.sessionId, turnId, dispatchAttempt: 1,
+        content: turnFailed ? 'TAE TraeX Runner 已停止：capacity' : 'scheduled reminder',
+        lastUuid: turnId, ...(turnFailed ? { turnFailed: true } : {}),
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+      (ds.worker as any).emit('message', {
+        type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, dispatchAttempt: 1,
+        status: turnFailed ? 'failed' : 'completed',
+      } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+      expect(ds.managedTurnOrigin).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(durable).toHaveBeenCalledTimes(1);
+      const request = durable.mock.calls[0][0] as Record<string, unknown>;
+      expect(request).toMatchObject({
+        turnId,
+        frozenScheduledOrigin: { turnId, dispatchAttempt: 1, workerGeneration },
+      });
+      expect(request.turnFailed === true).toBe(turnFailed);
+      expect(sessionReply).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not freeze an origin for a final_output that arrives after its turn_terminal', async () => {
+    const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const { setDurableBridgeFinalOutputHandler } = await import('../src/core/worker-pool.js');
+    const durable = vi.fn(async (_request: unknown) => ({ kind: 'delivered' as const, messageId: 'om_durable' }));
+    setDurableBridgeFinalOutputHandler(durable);
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const turnId = 'schedule:abcdef12:33333333-3333-4333-8333-333333333333';
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    ds.session.workerGeneration = ds.workerGeneration;
+    ds.managedTurnOrigin = { turnId, dispatchAttempt: 1, capability: 'cap' };
+
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, dispatchAttempt: 1, status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId, dispatchAttempt: 1,
+      content: 'late reminder', lastUuid: turnId,
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+
+    for (const [request] of durable.mock.calls) {
+      expect(request).not.toHaveProperty('frozenScheduledOrigin');
+    }
+  });
+
   it('keeps the reply-card write fence on the non-primary final path', async () => {
     vi.useRealTimers();
     const bot = getBot('app_test');

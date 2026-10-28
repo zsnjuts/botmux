@@ -921,6 +921,7 @@ export const messages: Record<string, string> = {
   'schedule.position_top_level': '执行位置：群消息顶层（后续会话形态跟随普通群会话模式）',
   'schedule.position_topic': '执行位置：当前话题下',
   'schedule.silent_note': '静默模式: 触发时不发「执行中」提示，模型判断满足条件才 botmux send 报警，否则完全静默',
+  'schedule.once_in_past': '这个一次性任务的执行时间在你发消息时就已经过去了，没有创建。请换一个将来的时间。',
   'schedule.parse_failed': '无法解析定时任务，请使用自然语言格式：\n\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报\n/schedule 每小时 检查服务健康状态\n/schedule 每30分钟 ping一下服务\n/schedule 每月1号9:00 生成月报\n\n管理命令：\n/schedule list — 查看所有任务\n/schedule remove <id> — 删除任务\n/schedule enable <id> — 启用任务\n/schedule disable <id> — 禁用任务\n/schedule run <id> — 立即执行一次',
 
   // ─── /help ───────────────────────────────────────────────────────────────

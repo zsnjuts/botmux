@@ -10,11 +10,13 @@
  * to another turn.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   setIpcAuthSecret,
+  setScheduledSelfCleanupReceiptHandler,
+  setScheduledSelfCleanupReceiptLookupHandler,
   startIpcServer,
   type IpcServerHandle,
 } from '../src/core/dashboard-ipc-server.js';
@@ -25,6 +27,18 @@ import {
   __testOnly_closeSkillFeedbackStores,
 } from '../src/services/skill-feedback-store.js';
 import { RELAYED_TURN_DELIVERY_MAX_BYTES } from '../src/core/relayed-turn-delivery.js';
+import {
+  __testOnlyResetScheduledRunSettlements,
+  beginScheduledRunSettlement,
+  revokeScheduledRunSettlements,
+} from '../src/core/scheduled-run-settlement.js';
+import {
+  deriveScheduledFinalDeliveryProof,
+  stampScheduledFinalDeliveryProof,
+} from '../src/core/scheduled-final-delivery-proof.js';
+import { markGroupContextCardPurpose } from '../src/im/lark/group-context-card.js';
+import * as larkClient from '../src/im/lark/client.js';
+import * as botRegistry from '../src/bot-registry.js';
 
 const SECRET = 'turn-delivery-narrow-secret';
 const CAP_A = 'ab12cd34'.repeat(8);
@@ -35,9 +49,12 @@ let dataDir: string | null = null;
 let prevDataDir: string | null = null;
 
 afterEach(async () => {
+  __testOnlyResetScheduledRunSettlements();
   if (handle) await handle.close();
   handle = null;
   setIpcAuthSecret(null);
+  setScheduledSelfCleanupReceiptHandler(null);
+  setScheduledSelfCleanupReceiptLookupHandler(null);
   await __testOnly_closeSkillFeedbackStores();
   if (prevDataDir !== null) config.session.dataDir = prevDataDir;
   prevDataDir = null;
@@ -56,6 +73,7 @@ function liveSession(sessionId: string, capability: string, turnId: string | und
       cliSessionId: `native-${sessionId}`,
       cliId: 'claude-code',
       model: 'opus',
+      workerGeneration: 7,
       ...extra,
     },
     worker: { killed: false, connected: true, send: vi.fn() },
@@ -63,6 +81,7 @@ function liveSession(sessionId: string, capability: string, turnId: string | und
     chatId: `oc_${sessionId}`,
     chatType: 'group',
     cliVersion: '9.9.9',
+    workerGeneration: 7,
     managedTurnOrigin: { capability, ...(turnId ? { turnId, dispatchAttempt: 2 } : {}) },
   };
 }
@@ -90,6 +109,464 @@ async function rowFor(messageId: string) {
 }
 
 describe('POST /api/sessions/:sessionId/turn-delivery', () => {
+  it('settles the exact scheduled turn only from an authenticated final receipt', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000011';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const stamped = stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, proof);
+    const card = markGroupContextCardPurpose(stamped, 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_answer_final',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_answer_final',
+      content: 'final answer',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.clone().json()).toMatchObject({
+      ok: true,
+      trustedFinalReceipt: {
+        domain: 'botmux.scheduled-final-receipt.v1',
+        trusted: true,
+        messageId: 'om_answer_final',
+        turnId,
+        workerGeneration: 7,
+        dispatchAttempt: 2,
+        proof,
+      },
+    });
+    await expect(settlement.settled).resolves.toEqual({ messageId: 'om_answer_final' });
+
+    const replay = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_answer_final',
+      content: 'final answer',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      ok: true,
+      duplicate: true,
+      trustedFinalReceipt: {
+        domain: 'botmux.scheduled-final-receipt.v1',
+        messageId: 'om_answer_final',
+        turnId,
+      },
+    });
+  });
+
+  it('keeps a proved scheduled final successful when the auxiliary delivery index cannot open', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000015';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'proved final without index' }] },
+    }, proof), 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_proved_without_index',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    await __testOnly_closeSkillFeedbackStores();
+    rmSync(dataDir!, { recursive: true, force: true });
+    writeFileSync(dataDir!, 'not-a-directory');
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_proved_without_index',
+      content: 'proved final without index',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      deliveryIndexed: false,
+      trustedFinalReceipt: {
+        messageId: 'om_proved_without_index',
+        turnId,
+        workerGeneration: 7,
+        dispatchAttempt: 2,
+        proof,
+      },
+    });
+    await expect(settlement.settled).resolves.toEqual({ messageId: 'om_proved_without_index' });
+  });
+
+  it('settles a proved final but keeps the task when cleanup receipt persistence fails', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000016';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'proved final without cleanup receipt' }] },
+    }, proof), 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_cleanup_receipt_failed',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+    const receiptHandler = vi.fn(() => false);
+    setScheduledSelfCleanupReceiptHandler(receiptHandler);
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_cleanup_receipt_failed',
+      content: 'proved final without cleanup receipt',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+      receiptScheduleSelfCleanup: true,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'scheduled_cleanup_receipt_not_recorded',
+    });
+    expect(receiptHandler).toHaveBeenCalledTimes(1);
+    await expect(settlement.settled).resolves.toEqual({ messageId: 'om_cleanup_receipt_failed' });
+  });
+
+  it('does not settle a client-reported id that provider readback cannot prove', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000012';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_forged',
+      content: 'not actually delivered',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'provider_message_not_found' });
+    let settled = false;
+    void settlement.settled.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+  });
+
+  it('rejects a proved final delivered to another topic in the same chat', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000112';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'misrouted final' }] },
+    }, proof), 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_wrong_topic_final',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_other_topic',
+      parent_id: 'om_other_topic',
+      thread_id: 'omt_other_topic',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      requireFinalDelivery: true,
+    });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_wrong_topic_final',
+      content: 'misrouted final',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'provider_target_mismatch' });
+    let settled = false;
+    void settlement.settled.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+  });
+
+  it('replays a persisted cleanup receipt after remove revoked the live settlement', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000113';
+    const sessions = { 'sess-a': liveSession('sess-a', CAP_A, turnId) };
+    await setup(sessions);
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'cleanup final' }] },
+    }, proof), 'message');
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_cleanup_final',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      larkAppId: 'cli_app',
+      requireFinalDelivery: true,
+    });
+    let persisted: Record<string, unknown> | undefined;
+    setScheduledSelfCleanupReceiptHandler(request => {
+      const { action, ...value } = request;
+      if (action === 'record') {
+        persisted = value;
+        return true;
+      }
+      return JSON.stringify(persisted) === JSON.stringify(value);
+    });
+    setScheduledSelfCleanupReceiptLookupHandler(input => {
+      if (!persisted
+          || persisted.appId !== input.appId
+          || persisted.taskId !== input.taskId
+          || persisted.turnId !== input.turnId
+          || persisted.messageId !== input.messageId) return undefined;
+      return {
+        domain: 'botmux.scheduled-final-receipt.v1',
+        trusted: true,
+        messageId: String(persisted.messageId),
+        turnId: String(persisted.turnId),
+        workerGeneration: Number(persisted.workerGeneration),
+        ...(typeof persisted.dispatchAttempt === 'number'
+          ? { dispatchAttempt: persisted.dispatchAttempt }
+          : {}),
+        proof: String(persisted.proof),
+      };
+    });
+    const payload = {
+      originCapability: CAP_A,
+      messageId: 'om_cleanup_final',
+      content: 'cleanup final',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+      receiptScheduleSelfCleanup: true,
+    };
+
+    const first = await post('sess-a', payload);
+    expect(first.status).toBe(200);
+    await expect(settlement.settled).resolves.toEqual({ messageId: 'om_cleanup_final' });
+    expect(revokeScheduledRunSettlements('deadbeef', 'cli_app')).toBe(1);
+    sessions['sess-a'] = liveSession('sess-a', CAP_A, turnId, { workerGeneration: 8 });
+    sessions['sess-a'].workerGeneration = 8;
+
+    const afterLostRemoveResponse = await post('sess-a', {
+      ...payload,
+      receiptWorkerGeneration: 8,
+      receiptProof: deriveScheduledFinalDeliveryProof({
+        turnId,
+        workerGeneration: 8,
+        dispatchAttempt: 2,
+      }),
+    });
+    expect(afterLostRemoveResponse.status).toBe(200);
+    expect(await afterLostRemoveResponse.json()).toMatchObject({
+      ok: true,
+      duplicate: true,
+      trustedFinalReceipt: {
+        messageId: 'om_cleanup_final',
+        turnId,
+        workerGeneration: 7,
+        proof,
+      },
+    });
+  });
+
+  it('rejects a receipt from a stale worker generation before provider readback', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000013';
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, turnId) });
+    const staleProof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 6,
+      dispatchAttempt: 2,
+    })!;
+    const readback = vi.spyOn(larkClient, 'getMessageDetail');
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_stale_generation',
+      content: 'stale',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 6,
+      receiptDispatchAttempt: 2,
+      receiptProof: staleProof,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'scheduled_delivery_origin_changed',
+    });
+    expect(readback).not.toHaveBeenCalled();
+  });
+
+  it('rejects a scheduled receipt when the worker is replaced during Provider readback', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000014';
+    const sessions = { 'sess-a': liveSession('sess-a', CAP_A, turnId) };
+    await setup(sessions);
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId,
+      workerGeneration: 7,
+      dispatchAttempt: 2,
+    })!;
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'replacement fence final' }] },
+    }, proof), 'message');
+    let resolveReadback: ((value: unknown) => void) | undefined;
+    const readback = vi.spyOn(larkClient, 'getMessageDetail').mockImplementation(() =>
+      new Promise(resolve => { resolveReadback = resolve; }) as any);
+    const receiptHandler = vi.fn(() => true);
+    setScheduledSelfCleanupReceiptHandler(receiptHandler);
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'deadbeef',
+      larkAppId: 'cli_app',
+      requireFinalDelivery: true,
+    });
+
+    const response = post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_replaced_during_readback',
+      content: 'replacement fence final',
+      responseKind: 'final',
+      receiptTurnId: turnId,
+      receiptWorkerGeneration: 7,
+      receiptDispatchAttempt: 2,
+      receiptProof: proof,
+      receiptScheduleSelfCleanup: true,
+    });
+    await vi.waitFor(() => expect(readback).toHaveBeenCalledTimes(1));
+    const replacement = liveSession('sess-a', CAP_A, turnId, { workerGeneration: 8 });
+    replacement.workerGeneration = 8;
+    sessions['sess-a'] = replacement;
+    resolveReadback?.({ items: [{
+      message_id: 'om_replaced_during_readback',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+
+    const res = await response;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'scheduled_delivery_origin_changed',
+    });
+    expect(receiptHandler).not.toHaveBeenCalled();
+    expect(await rowFor('om_replaced_during_readback')).toBeUndefined();
+    let settled = false;
+    void settlement.settled.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+  });
+
   it('records the row from the live session, ignoring body-supplied correlation fields', async () => {
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
     const res = await post('sess-a', {
@@ -122,6 +599,112 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
       policy: undefined,
       baseCard: undefined,
     });
+  });
+
+  it('reconstructs feedback and an exact chat-scope topic target from Host readback', async () => {
+    const turnId = 'om_feedback_turn';
+    const ds = liveSession('sess-a', CAP_A, turnId, {
+      scope: 'chat',
+      ownerOpenId: 'ou_owner',
+      turnReplyContexts: {
+        [turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_exact_topic' },
+          replyTargetSenderOpenId: 'ou_requester',
+        },
+      },
+    });
+    ds.scope = 'chat';
+    await setup({ 'sess-a': ds });
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+      config: {
+        apiOnly: false,
+        feedback: { enabled: true, audience: 'requester' },
+        chatFeedbackPolicies: {},
+      },
+    } as any);
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: 'feedback final' },
+        { tag: 'action', element_id: 'botmux_feedback', actions: [] },
+      ] },
+    };
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_feedback_final',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_exact_topic',
+      parent_id: 'om_exact_topic',
+      thread_id: 'omt_exact_topic',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(card) },
+    }] });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_feedback_final',
+      content: 'feedback final',
+      responseKind: 'final',
+    });
+    expect(res.status).toBe(200);
+    expect(await rowFor('om_feedback_final')).toMatchObject({
+      cardMode: 'feedback',
+      policy: { audience: 'requester' },
+      baseCard: {
+        body: { elements: [{ element_id: 'botmux_feedback' }] },
+      },
+      requesterSubjectId: 'ou_requester',
+      topicRootId: 'om_exact_topic',
+    });
+  });
+
+  it('rejects feedback readback with contradictory Provider sender metadata', async () => {
+    const turnId = 'om_feedback_sender_conflict';
+    const ds = liveSession('sess-a', CAP_A, turnId, {
+      ownerOpenId: 'ou_owner',
+      turnReplyContexts: {
+        [turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_root_sess-a' },
+          replyTargetSenderOpenId: 'ou_requester',
+        },
+      },
+    });
+    await setup({ 'sess-a': ds });
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+      config: {
+        apiOnly: false,
+        feedback: { enabled: true, audience: 'requester' },
+        chatFeedbackPolicies: {},
+      },
+    } as any);
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{
+      message_id: 'om_feedback_sender_conflict',
+      chat_id: 'oc_sess-a',
+      root_id: 'om_root_sess-a',
+      parent_id: 'om_root_sess-a',
+      thread_id: 'omt_sess-a',
+      deleted: false,
+      msg_type: 'interactive',
+      sender: { id: 'cli_app', id_type: 'app_id', sender_type: 'user' },
+      body: { content: JSON.stringify({
+        schema: '2.0',
+        body: { elements: [{ tag: 'markdown', content: 'feedback final' }] },
+      }) },
+    }] });
+
+    const res = await post('sess-a', {
+      originCapability: CAP_A,
+      messageId: 'om_feedback_sender_conflict',
+      content: 'feedback final',
+      responseKind: 'final',
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'turn_delivery_feedback_readback_invalid',
+    });
+    expect(await rowFor('om_feedback_sender_conflict')).toBeUndefined();
   });
 
   it('403s a capability presented against another session and writes nothing', async () => {
@@ -161,6 +744,7 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
 
   it.each([
     ['non-om message id', { messageId: 'oc_not_a_message', content: 'x' }],
+    ['malformed om message id', { messageId: 'om_!', content: 'x' }],
     ['message id with a path separator', { messageId: 'om_a/b', content: 'x' }],
     ['empty content', { messageId: 'om_empty', content: '' }],
     ['non-string content', { messageId: 'om_obj', content: { text: 'x' } }],

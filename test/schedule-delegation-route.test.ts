@@ -6,6 +6,8 @@ import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.j
 import { dispatchCallerFromReply, scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
+import { resolveScheduleReferenceTime } from '../src/core/schedule-reference-time.js';
+import { scheduleRequiresReferenceTime } from '../src/core/scheduler.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
 import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
 
@@ -19,7 +21,10 @@ const route = source.statements.find(node => ts.isExpressionStatement(node)
 const handler = (route.expression as ts.CallExpression).arguments[2];
 const callerHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
   && node.name?.text === 'scheduleCallerForTurn');
+const referenceTimeHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'scheduleReferenceTimeForTurn');
 const code = ts.transpileModule(`${callerHelper?.getText(source) ?? ''}
+${referenceTimeHelper?.getText(source) ?? ''}
 const handler = ${handler.getText(source)}`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
@@ -30,7 +35,12 @@ function harness(overrides: Record<string, unknown> = {}) {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
     workingDir: '/repo',
     session: { sessionId: 'target-session', scope: 'thread', rootMessageId: 'om_root',
-      replyTargets: { [turnId]: { rootMessageId: 'om_root' } } },
+      replyTargets: { [turnId]: { rootMessageId: 'om_root' } },
+      turnReplyContexts: { [turnId]: {
+        target: { mode: 'thread', rootMessageId: 'om_root' },
+        sourceMessageId: 'om_source',
+        sourceMessageCreateTime: 1792907862000,
+      } } },
     workerGeneration: 7,
     managedTurnOrigin: { capability: 'c'.repeat(64), turnId },
     activeInteractiveTurn: { turnId, caller: {
@@ -57,6 +67,8 @@ function harness(overrides: Record<string, unknown> = {}) {
     getBot: () => ({ config: { triggerUserAuth: { enabled: true,
       tools: ['lark-cli', 'bytedcli'] } } }),
     pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
+    getGroupContextMessage: vi.fn(), resolveScheduleReferenceTime, scheduleRequiresReferenceTime,
+    logger: { warn: vi.fn() },
     dispatchUserForTurn: async () => ({
       domain: 'botmux.dispatch-user.v2', deliveryId: 'delivery-1', messageId: turnId,
       sourceSessionId: 'source-session', sourceAppId: 'cli_source', sourceTurnId: 'om_human',
@@ -98,6 +110,60 @@ describe('delegated schedule add route', () => {
       ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
     }));
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('anchors relative parsing to the frozen platform message time', async () => {
+    const h = harness({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_user_target',
+    });
+    h.body.task.schedule = '30m';
+    h.scope.readGlobalConfig = () => ({});
+    h.scope.getBot = () => ({ config: {} });
+
+    expect((await h.run()).status).toBe(201);
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      schedule: '30m',
+      referenceTimeMs: 1792907862000,
+    }));
+  });
+
+  it('fails closed when a relative schedule has no trusted platform message time', async () => {
+    const h = harness({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_user_target',
+    });
+    h.body.task.schedule = '30m';
+    delete h.ds.session.turnReplyContexts.om_kickoff.sourceMessageCreateTime;
+    h.scope.getGroupContextMessage.mockReturnValue({ createTime: 1792907999000 });
+    h.scope.readGlobalConfig = () => ({});
+    h.scope.getBot = () => ({ config: {} });
+
+    expect(await h.run()).toMatchObject({
+      status: 409,
+      value: {
+        error: 'schedule_delegation_commit_failed',
+        detail: 'schedule_reference_time_unavailable',
+      },
+    });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('allows a recurring schedule when the platform message time is unavailable', async () => {
+    const h = harness({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_user_target',
+    });
+    delete h.ds.session.turnReplyContexts.om_kickoff.sourceMessageCreateTime;
+    h.scope.readGlobalConfig = () => ({});
+    h.scope.getBot = () => ({ config: {} });
+
+    expect((await h.run()).status).toBe(201);
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      schedule: 'every 30m',
+      referenceTimeMs: undefined,
+      requireTrustedReferenceTime: true,
+    }));
   });
 
   it('rejects a provider-selected Actor outside a frozen Remote Runner relay', async () => {

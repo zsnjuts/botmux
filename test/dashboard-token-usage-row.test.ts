@@ -49,6 +49,22 @@ function makeDs(): DaemonSession {
 }
 
 describe('dashboard SessionRow status projection', () => {
+  it('preserves the exact worker generation for active and persisted detail rows', () => {
+    const active = makeDs();
+    active.workerGeneration = 7;
+    active.session.workerGeneration = 6;
+
+    expect(composeRowFromActive(active).workerGeneration).toBe(7);
+    expect(composeRowFromPersistedActive({
+      ...active.session,
+      status: 'active',
+    }).workerGeneration).toBe(6);
+    expect(composeRowFromClosed({
+      ...active.session,
+      status: 'closed',
+    }).workerGeneration).toBe(6);
+  });
+
   it('exposes dispatch requested launch and observed runtime separately', () => {
     const ds = makeDs();
     ds.session.dispatchLaunchSpec = {

@@ -469,7 +469,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setScheduledSelfCleanupReceiptHandler, setScheduledSelfCleanupReceiptLookupHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -546,7 +546,11 @@ import {
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
-import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
+import {
+  recordScheduleSelfCleanupReceiptAfterDelivery,
+  ScheduleAuthorityStore,
+  type ScheduleSelfCleanupReceipt,
+} from './services/schedule-authority-store.js';
 import {
   appendDurablePrimaryInputCommit,
   durablePrimaryExistingTurnDisposition,
@@ -555,6 +559,19 @@ import {
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
+import { resolveScheduleReferenceTime } from './core/schedule-reference-time.js';
+import { scheduleRequiresReferenceTime } from './core/scheduler.js';
+import {
+  deriveScheduledFinalDeliveryProof,
+  matchesScheduledFinalReceiptEnvelope,
+  scheduledFinalCardHasExactProof,
+  scheduledFinalReceiptEnvelope,
+} from './core/scheduled-final-delivery-proof.js';
+import {
+  executeScheduledRunAwaitingSettlement,
+  isConfirmedLarkMessageId,
+  observeScheduledRunDaemonProviderDelivery,
+} from './core/scheduled-run-settlement.js';
 import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
@@ -6185,6 +6202,8 @@ async function submitQueuedMessage(
     senderOpenId: message.senderId,
     participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
     inThread: !!message.threadId,
+    sourceMessageId: message.messageId,
+    sourceMessageCreateTime: message.createTime,
   });
   await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
   // Identity refresh and reaction delivery both await external work.
@@ -7874,6 +7893,23 @@ function scheduleCallerForTurn(ds: DaemonSession, turnId: string): TrustedCaller
   return dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
 }
 
+/** Resolve the time the user actually issued the schedule request. Relative
+ * schedules must not silently start their countdown only after the model has
+ * finished asking questions and invoked the tool. If the platform create_time
+ * is unavailable, relative schedules fail closed instead of changing anchors. */
+function scheduleReferenceTimeForTurn(
+  ds: DaemonSession,
+  turnId: string,
+  schedule: string,
+): number | undefined {
+  const sourceMessageCreateTime = ds.session.turnReplyContexts?.[turnId]?.sourceMessageCreateTime;
+  const referenceTimeMs = resolveScheduleReferenceTime({ sourceMessageCreateTime });
+  if (referenceTimeMs === undefined && scheduleRequiresReferenceTime(schedule)) {
+    throw new Error('schedule_reference_time_unavailable');
+  }
+  return referenceTimeMs;
+}
+
 // Managed schedule creation. The caller supplies task input only; creator
 // identity, grant scope and the commit authority are derived from this exact
 // live turn and the host-signed dispatch record.
@@ -8080,6 +8116,8 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       creatorChatId: ds.chatId,
       creatorRootMessageId: expectedRoot,
       creatorLarkAppId: ds.larkAppId,
+      referenceTimeMs: scheduleReferenceTimeForTurn(ds, turnId, task.schedule),
+      requireTrustedReferenceTime: true,
       chatType: ds.chatType === 'p2p' ? 'p2p' as const : 'topic_group' as const,
       silent: task.silent === true,
       followActive: task.followActive === true,
@@ -8173,14 +8211,29 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
   }
   const action = body.action;
+  const finalCleanup = action === 'remove-after-final';
+  const claimedFinalReceipt = body.trustedFinalReceipt;
+  const claimedFinalTurnId = claimedFinalReceipt
+    && typeof claimedFinalReceipt === 'object'
+    && !Array.isArray(claimedFinalReceipt)
+    && typeof claimedFinalReceipt.turnId === 'string'
+    ? claimedFinalReceipt.turnId
+    : undefined;
+  const claimedFinalTaskId = claimedFinalTurnId
+    ? parseScheduledTurnId(claimedFinalTurnId)
+    : null;
   const scheduledTaskId = turnId ? parseScheduledTurnId(turnId) : null;
   const requestedId = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
-  const id = requestedId === 'self' && scheduledTaskId ? scheduledTaskId : requestedId;
+  const selfTaskId = finalCleanup ? claimedFinalTaskId : scheduledTaskId;
+  const id = requestedId === 'self' && selfTaskId ? selfTaskId : requestedId;
   if (!verified.ok) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_origin_unproven' });
   }
-  if (!id || !['update', 'remove', 'pause', 'resume', 'run'].includes(action)) {
+  if (!id || !['update', 'remove', 'remove-after-final', 'pause', 'resume', 'run'].includes(action)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
+  }
+  if (finalCleanup && !claimedFinalTaskId) {
+    return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_invalid' });
   }
   if (!scheduleAuthorityStore) {
     return jsonRes(res, 503, { ok: false, error: 'schedule_authority_store_unavailable' });
@@ -8220,8 +8273,9 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     }
     providerActorAdmin = true;
   }
-  const potentialScheduledSelfManager = !!ds && scheduledTaskId === id
-    && (action === 'pause' || action === 'remove');
+  const potentialScheduledSelfManager = !!ds
+    && (finalCleanup ? claimedFinalTaskId : scheduledTaskId) === id
+    && (action === 'pause' || action === 'remove' || finalCleanup);
   if (!hostAdmin && !currentHumanAdmin && !providerActorAdmin && !potentialScheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
   }
@@ -8235,7 +8289,7 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   if (potentialScheduledSelfManager && !scheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_self_manage_denied' });
   }
-  if (scheduledSelfManager) {
+  if (scheduledSelfManager && !(finalCleanup && authority.state === 'revoked')) {
     try {
       await authorizeScheduleSelfManage(authority, {
         selfManageEnabled: readGlobalConfig().scheduleDelegation?.selfManageEnabled === true,
@@ -8260,6 +8314,55 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   if (action === 'update' && authority.task.preconditionRef) {
     return jsonRes(res, 409, { ok: false, error: 'schedule_precondition_dashboard_update_required' });
+  }
+  let finalCleanupReceipt: ScheduleSelfCleanupReceipt | undefined;
+  if (finalCleanup) {
+    const value = claimedFinalReceipt;
+    const messageId = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>).messageId
+      : undefined;
+    const workerGeneration = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>).workerGeneration
+      : undefined;
+    const dispatchAttempt = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>).dispatchAttempt
+      : undefined;
+    if (!claimedFinalTurnId || claimedFinalTaskId !== id
+        || !isConfirmedLarkMessageId(messageId)
+        || !Number.isSafeInteger(workerGeneration) || Number(workerGeneration) < 1
+        || (dispatchAttempt !== undefined
+          && (!Number.isSafeInteger(dispatchAttempt) || Number(dispatchAttempt) < 1))) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_invalid' });
+    }
+    const proof = deriveScheduledFinalDeliveryProof({
+      turnId: claimedFinalTurnId,
+      workerGeneration: Number(workerGeneration),
+      ...(typeof dispatchAttempt === 'number' ? { dispatchAttempt } : {}),
+    });
+    if (!proof) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_invalid' });
+    }
+    const expected = scheduledFinalReceiptEnvelope({
+      messageId,
+      turnId: claimedFinalTurnId,
+      workerGeneration: Number(workerGeneration),
+      ...(typeof dispatchAttempt === 'number' ? { dispatchAttempt } : {}),
+      proof,
+    });
+    if (!matchesScheduledFinalReceiptEnvelope(value, expected)) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_final_cleanup_receipt_mismatch' });
+    }
+    finalCleanupReceipt = {
+      appId,
+      taskId: id,
+      turnId: expected.turnId,
+      workerGeneration: expected.workerGeneration,
+      ...(expected.dispatchAttempt !== undefined
+        ? { dispatchAttempt: expected.dispatchAttempt }
+        : {}),
+      proof: expected.proof,
+      messageId: expected.messageId,
+    };
   }
   let ok = false;
   let error: string | undefined;
@@ -8287,6 +8390,19 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     ok = result.ok;
     error = result.error;
   } else if (action === 'remove') ok = scheduler.removeTask(id);
+  else if (action === 'remove-after-final' && finalCleanupReceipt) {
+    try {
+      const result = scheduler.removeTaskAfterVerifiedFinal(finalCleanupReceipt);
+      return jsonRes(res, 200, { ok: true, ...(result.replay ? { replay: true } : {}) });
+    } catch (cleanupError) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: cleanupError instanceof Error
+          ? cleanupError.message
+          : 'schedule_final_cleanup_failed',
+      });
+    }
+  }
   else if (action === 'pause') ok = scheduler.disableTask(id);
   else if (action === 'resume') ok = scheduler.enableTask(id);
   else if (action === 'run') {
@@ -23238,7 +23354,7 @@ async function startInitialPassthroughSession(args: {
   const substituteReplyMode = substitute
     ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute, senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId, sourceMessageId: parsed.messageId });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute, senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId, sourceMessageId: parsed.messageId, sourceMessageCreateTime: parsed.createTime });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -23507,6 +23623,36 @@ function durableOutboxTargetForTurn(ds: DaemonSession, turnId: string): DurableL
         messageId: target.rootMessageId,
         replyInThread: target.mode === 'thread',
       };
+}
+
+function sameDurableOutboxTarget(
+  actual: DurableLarkOutboxTarget,
+  expected: DurableLarkOutboxTarget,
+): boolean {
+  if (actual.kind !== expected.kind) return false;
+  if (actual.kind === 'send' && expected.kind === 'send') {
+    return actual.chatId === expected.chatId;
+  }
+  if (actual.kind === 'reply' && expected.kind === 'reply') {
+    return actual.messageId === expected.messageId
+      && actual.replyInThread === expected.replyInThread;
+  }
+  return actual.kind === 'update' && expected.kind === 'update'
+    && actual.messageId === expected.messageId;
+}
+
+function sameScheduleSelfCleanupReceipt(
+  left: ScheduleSelfCleanupReceipt | undefined,
+  right: ScheduleSelfCleanupReceipt,
+): boolean {
+  return !!left
+    && left.appId === right.appId
+    && left.taskId === right.taskId
+    && left.turnId === right.turnId
+    && left.workerGeneration === right.workerGeneration
+    && left.dispatchAttempt === right.dispatchAttempt
+    && left.proof === right.proof
+    && left.messageId === right.messageId;
 }
 
 /**
@@ -24659,7 +24805,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Turn key is the reply anchor (== messageId outside session-group births) so
   // the per-turn reply context and currentReplyTarget.turnId line up with the
   // worker's turn id — current-turn provenance requires that equality.
-  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId, sourceMessageCreateTime: parsed.createTime });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -26794,6 +26940,7 @@ async function handleThreadReplyAdmitted(
         inThread: !!parsed.threadId,
         foldedRootId: ctx.foldedRootId,
         sourceMessageId: parsed.messageId,
+        sourceMessageCreateTime: parsed.createTime,
       });
       if (callerOpenId) ds.session.lastCallerOpenId = callerOpenId;
       publishLastInputFromBotPatch(ds);
@@ -26961,7 +27108,7 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId, sourceMessageCreateTime: parsed.createTime });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -27424,7 +27571,7 @@ async function handleThreadReplyAdmitted(
       : 'thread';
     const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId, sourceMessageCreateTime: parsed.createTime });
     sessionStore.updateSession(newDs.session);
     const registration = await claimNewDaemonSession(activeSessions, newDs);
     if (!registration.accepted) {
@@ -30271,6 +30418,41 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const authoritativeTasks = scheduleAuthorityStore.listTasks(cfg.larkAppId);
     scheduleStore.replaceAuthoritativeProjection(authoritativeTasks, cfg.larkAppId);
     scheduler.setScheduleAuthorityStore(scheduleAuthorityStore);
+    setScheduledSelfCleanupReceiptHandler(request => {
+      if (!scheduleAuthorityStore) return false;
+      const receipt: ScheduleSelfCleanupReceipt = {
+        appId: request.appId,
+        taskId: request.taskId,
+        turnId: request.turnId,
+        workerGeneration: request.workerGeneration,
+        ...(request.dispatchAttempt !== undefined
+          ? { dispatchAttempt: request.dispatchAttempt }
+          : {}),
+        proof: request.proof,
+        messageId: request.messageId,
+      };
+      if (request.action === 'record') {
+        scheduleAuthorityStore.recordSelfCleanupReceipt(receipt);
+        return true;
+      }
+      return sameScheduleSelfCleanupReceipt(
+        scheduleAuthorityStore.getSelfCleanupReceipt(
+          receipt.appId,
+          receipt.taskId,
+          receipt.turnId,
+        ),
+        receipt,
+      );
+    });
+    setScheduledSelfCleanupReceiptLookupHandler(input => {
+      const receipt = scheduleAuthorityStore?.getSelfCleanupReceipt(
+        input.appId,
+        input.taskId,
+        input.turnId,
+      );
+      if (!receipt || receipt.messageId !== input.messageId) return undefined;
+      return scheduledFinalReceiptEnvelope(receipt);
+    });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     logger.error(
@@ -30279,6 +30461,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     );
     try { scheduleAuthorityStore?.close(); } catch { /* no-op */ }
     scheduleAuthorityStore = null;
+    setScheduledSelfCleanupReceiptHandler(null);
+    setScheduledSelfCleanupReceiptLookupHandler(null);
     scheduler.setScheduleAuthorityUnavailable(error);
   }
   void runDurableConfigMutation({
@@ -32149,6 +32333,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       );
       const current = await durableCoordinationRuntime.store.readSession(canonicalKey);
       const scheduledTaskId = parseScheduledTurnId(request.turnId);
+      const receiptWorkerGeneration = request.daemonSession.workerGeneration;
+      // A bridge final arrives after turn_terminal revoked the live origin; it
+      // carries the origin the worker pool froze at the final_output IPC edge.
+      // Prefer the live origin, and accept the frozen one only for the exact
+      // turn of the still-current worker generation.
+      const liveTurnOrigin = request.daemonSession.managedTurnOrigin?.turnId === request.turnId
+        ? request.daemonSession.managedTurnOrigin
+        : undefined;
+      const frozenTurnOrigin = !liveTurnOrigin
+        && scheduledTaskId
+        && request.frozenScheduledOrigin?.turnId === request.turnId
+        && request.frozenScheduledOrigin.workerGeneration === receiptWorkerGeneration
+        ? request.frozenScheduledOrigin
+        : undefined;
       const inbound = resolveDurablePrimaryOutputClaim({
         current,
         turnId: request.turnId,
@@ -32156,7 +32354,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         authority: scheduledTaskId
           ? scheduleAuthorityStore?.getRecord(request.daemonSession.larkAppId, scheduledTaskId)
           : undefined,
+        ...(frozenTurnOrigin ? { frozenScheduledTurnId: frozenTurnOrigin.turnId } : {}),
       });
+      const receiptDispatchAttempt = (liveTurnOrigin ?? frozenTurnOrigin
+        ?? request.daemonSession.managedTurnOrigin)?.dispatchAttempt;
+      const receiptProof = typeof receiptWorkerGeneration === 'number'
+        ? deriveScheduledFinalDeliveryProof({
+            turnId: request.turnId,
+            workerGeneration: receiptWorkerGeneration,
+            ...(receiptDispatchAttempt !== undefined
+              ? { dispatchAttempt: receiptDispatchAttempt }
+              : {}),
+          })
+        : undefined;
+      const persistedCleanupReceipt = request.scheduleSelfCleanup === true && scheduledTaskId
+        ? scheduleAuthorityStore?.getSelfCleanupReceipt(
+            request.daemonSession.larkAppId,
+            scheduledTaskId,
+            request.turnId,
+          )
+        : undefined;
+      const trustedFinalTarget = request.responseKind === 'final'
+        && scheduledTaskId !== null
+        && sameDurableOutboxTarget(
+          request.target,
+          durableOutboxTargetForTurn(request.daemonSession, request.turnId),
+        );
+      const liveTrustedFinalTarget = trustedFinalTarget
+        && request.daemonSession.session.workerGeneration === receiptWorkerGeneration
+        && receiptProof !== undefined
+        && scheduledFinalCardHasExactProof(request.content, receiptProof);
+      const persistedTrustedFinalTarget = trustedFinalTarget
+        && !!persistedCleanupReceipt
+        && scheduledFinalCardHasExactProof(request.content, persistedCleanupReceipt.proof);
+      if (request.responseKind === 'final' && scheduledTaskId
+          && !liveTrustedFinalTarget && !persistedTrustedFinalTarget) {
+        throw new Error('durable scheduled final lacks an exact Card 2.0 proof');
+      }
       const message = durableLarkOutboxMessage({
         messageId: `out_${request.providerUuid}`,
         sessionKey: canonicalKey,
@@ -32188,13 +32422,99 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const providerMessageId = receipt && typeof receipt === 'object' && !Array.isArray(receipt)
         ? (receipt as Record<string, unknown>).providerMessageId
         : undefined;
-      if (typeof providerMessageId !== 'string' || !providerMessageId.startsWith('om_')) {
+      if (!isConfirmedLarkMessageId(providerMessageId)) {
         return { kind: 'ambiguous', error: 'delivered outbox receipt lacks provider message id' };
       }
-      return { kind: 'delivered' as const, messageId: providerMessageId };
+      const authorityAfterDelivery = scheduledTaskId
+        ? scheduleAuthorityStore?.getRecord(request.daemonSession.larkAppId, scheduledTaskId)
+        : undefined;
+      let targetStillCurrent = false;
+      try {
+        targetStillCurrent = sameDurableOutboxTarget(
+          request.target,
+          durableOutboxTargetForTurn(request.daemonSession, request.turnId),
+        );
+      } catch { /* frozen target disappeared: fail closed below */ }
+      const originAfterDelivery = request.daemonSession.managedTurnOrigin;
+      const turnOriginStillCurrent = frozenTurnOrigin
+        ? frozenTurnOrigin.dispatchAttempt === receiptDispatchAttempt
+        : originAfterDelivery?.turnId === request.turnId
+          && originAfterDelivery.dispatchAttempt === receiptDispatchAttempt;
+      const liveIdentityStillCurrent = liveTrustedFinalTarget
+        && request.daemonSession.workerGeneration === receiptWorkerGeneration
+        && request.daemonSession.session.workerGeneration === receiptWorkerGeneration
+        && turnOriginStillCurrent
+        && targetStillCurrent
+        && authorityAfterDelivery?.state === 'active'
+        && authorityAfterDelivery.task.lastStatus === 'running';
+      let trustedFinalReceipt = persistedTrustedFinalTarget
+        && persistedCleanupReceipt?.messageId === providerMessageId
+        ? scheduledFinalReceiptEnvelope(persistedCleanupReceipt)
+        : undefined;
+      let cleanupReceiptAuthorityConfirmed = request.scheduleSelfCleanup !== true
+        || trustedFinalReceipt !== undefined;
+      let trustedFinalDelivery = !!trustedFinalReceipt || (liveIdentityStillCurrent
+        && observeScheduledRunDaemonProviderDelivery(request.turnId, providerMessageId));
+      if (!trustedFinalReceipt && liveIdentityStillCurrent && request.scheduleSelfCleanup === true
+          && scheduledTaskId && receiptProof
+          && typeof receiptWorkerGeneration === 'number') {
+        const cleanupReceipt: ScheduleSelfCleanupReceipt = {
+          appId: request.daemonSession.larkAppId,
+          taskId: scheduledTaskId,
+          turnId: request.turnId,
+          workerGeneration: receiptWorkerGeneration,
+          ...(receiptDispatchAttempt !== undefined
+            ? { dispatchAttempt: receiptDispatchAttempt }
+            : {}),
+          proof: receiptProof,
+          messageId: providerMessageId,
+        };
+        if (trustedFinalDelivery) {
+          const persistence = recordScheduleSelfCleanupReceiptAfterDelivery(
+            scheduleAuthorityStore ?? undefined,
+            cleanupReceipt,
+          );
+          cleanupReceiptAuthorityConfirmed = persistence.recorded;
+          if (!persistence.recorded) {
+            logger.warn(
+              `[schedule] Provider final delivered but self-cleanup receipt was not persisted: ${persistence.error}`,
+            );
+          }
+        } else {
+          cleanupReceiptAuthorityConfirmed = sameScheduleSelfCleanupReceipt(
+            scheduleAuthorityStore?.getSelfCleanupReceipt(
+              cleanupReceipt.appId,
+              cleanupReceipt.taskId,
+              cleanupReceipt.turnId,
+            ),
+            cleanupReceipt,
+          );
+          trustedFinalDelivery = cleanupReceiptAuthorityConfirmed;
+        }
+      }
+      trustedFinalReceipt ??= trustedFinalDelivery && cleanupReceiptAuthorityConfirmed && receiptProof
+        && typeof receiptWorkerGeneration === 'number'
+        ? scheduledFinalReceiptEnvelope({
+            messageId: providerMessageId,
+            turnId: request.turnId,
+            workerGeneration: receiptWorkerGeneration,
+            ...(receiptDispatchAttempt !== undefined
+              ? { dispatchAttempt: receiptDispatchAttempt }
+              : {}),
+            proof: receiptProof,
+          })
+        : undefined;
+      return {
+        kind: 'delivered' as const,
+        messageId: providerMessageId,
+        ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}),
+      };
     };
-    setDurableBridgeFinalOutputHandler(request => deliverDurablePrimaryMessage({
+    setDurableBridgeFinalOutputHandler(({ turnFailed, ...request }) => deliverDurablePrimaryMessage({
       ...request,
+      // A failed scheduled turn still shows its diagnostic, but never as the
+      // run's trusted final: the terminal status settles that run as failed.
+      responseKind: turnFailed ? 'auxiliary' : 'final',
       hookContext: {
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,
@@ -32542,80 +32862,102 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const results = await executeScheduledTaskForTargets(
               task,
               targetChatIds,
-              targetTask => withBotTurnAdmission(
-                effectiveAppId,
-                () => executeScheduledTask(
-                  targetTask,
-                  activeSessions,
-                  refreshCliVersion,
-                  additionalPrompt,
-                  {
-                    ...(targetTask.boundSessionId
-                      ? { scheduledTurnId: `schedule:${targetTask.id}:${executionContext.runId}` }
-                      : {}),
-                    prepareTurnIdentity: (session, turnId) =>
-                      prepareTurnCliIdentity(session, turnId),
-                    resumeBoundSession: async input => {
-                      if (input.larkAppId !== effectiveAppId) {
-                        throw new Error('bound Session application mismatch');
-                      }
-                      const deadline = Date.now() + 45_000;
-                      for (;;) {
-                        try {
-                          if (durableCoordinationRuntime?.mode === 'primary') {
-                            const control = durablePrimaryControlRuntimeByApp.get(input.larkAppId);
-                            if (!control) throw new Error('durable primary Session control is unavailable');
-                            await control.resumeTrustedDirect({
-                              operationId: `schedule-bound-resume:${input.turnId}:${input.sessionId}`,
-                              sessionId: input.sessionId,
-                              rootId: input.rootMessageId,
-                            });
-                          } else {
-                            const stored = sessionStore.getSession(input.sessionId);
-                            if (!stored
-                                || stored.larkAppId !== input.larkAppId
-                                || stored.chatId !== input.chatId
-                                || storedSessionAnchorId(stored) !== input.rootMessageId) {
-                              throw new Error('bound Session identity mismatch');
-                            }
-                            if (stored.status !== 'closed') {
-                              throw new Error('bound Session is not closed yet');
-                            }
-                            const resumed = await resumeSession(input.sessionId, activeSessions);
-                            if (!resumed.ok) {
-                              throw new Error(`bound Session resume failed: ${resumed.error}`);
-                            }
-                            if (resumed.recoveryPending === true) {
-                              while ((!resumed.ds.worker
-                                  || resumed.ds.worker.killed
-                                  || resumed.ds.workerReady !== true)
-                                  && Date.now() < deadline) {
-                                await new Promise<void>(resolve => setTimeout(resolve, 100));
+              async targetTask => {
+                // One claimed run may fan out to several chats. Keep the
+                // durable run id for the common single-target path and mint a
+                // separate valid scheduled-turn id per fan-out target.
+                const scheduledTurnId = `schedule:${targetTask.id}:${
+                  targetChatIds.length === 1 ? executionContext.runId : randomUUID()
+                }`;
+                await executeScheduledRunAwaitingSettlement({
+                  turnId: scheduledTurnId,
+                  taskId: targetTask.id,
+                  larkAppId: effectiveAppId,
+                  requireFinalDelivery: targetTask.silent !== true,
+                  authorityIsCurrent: () => {
+                    if (scheduleAuthorityStore) {
+                      const authority = scheduleAuthorityStore.getRecord(effectiveAppId, targetTask.id);
+                      return authority?.state === 'active'
+                        && authority.task.lastStatus === 'running'
+                        && authority.task.lastRunId === executionContext.runId;
+                    }
+                    const current = scheduleStore.getTask(targetTask.id, effectiveAppId);
+                    return current?.lastStatus === 'running'
+                      && current.lastRunId === executionContext.runId;
+                  },
+                }, () => withBotTurnAdmission(
+                  effectiveAppId,
+                  () => executeScheduledTask(
+                    targetTask,
+                    activeSessions,
+                    refreshCliVersion,
+                    additionalPrompt,
+                    {
+                        scheduledTurnId,
+                        prepareTurnIdentity: (session, turnId) =>
+                          prepareTurnCliIdentity(session, turnId),
+                        resumeBoundSession: async input => {
+                          if (input.larkAppId !== effectiveAppId) {
+                            throw new Error('bound Session application mismatch');
+                          }
+                          const deadline = Date.now() + 45_000;
+                          for (;;) {
+                            try {
+                              if (durableCoordinationRuntime?.mode === 'primary') {
+                                const control = durablePrimaryControlRuntimeByApp.get(input.larkAppId);
+                                if (!control) throw new Error('durable primary Session control is unavailable');
+                                await control.resumeTrustedDirect({
+                                  operationId: `schedule-bound-resume:${input.turnId}:${input.sessionId}`,
+                                  sessionId: input.sessionId,
+                                  rootId: input.rootMessageId,
+                                });
+                              } else {
+                                const stored = sessionStore.getSession(input.sessionId);
+                                if (!stored
+                                    || stored.larkAppId !== input.larkAppId
+                                    || stored.chatId !== input.chatId
+                                    || storedSessionAnchorId(stored) !== input.rootMessageId) {
+                                  throw new Error('bound Session identity mismatch');
+                                }
+                                if (stored.status !== 'closed') {
+                                  throw new Error('bound Session is not closed yet');
+                                }
+                                const resumed = await resumeSession(input.sessionId, activeSessions);
+                                if (!resumed.ok) {
+                                  throw new Error(`bound Session resume failed: ${resumed.error}`);
+                                }
+                                if (resumed.recoveryPending === true) {
+                                  while ((!resumed.ds.worker
+                                      || resumed.ds.worker.killed
+                                      || resumed.ds.workerReady !== true)
+                                      && Date.now() < deadline) {
+                                    await new Promise<void>(resolve => setTimeout(resolve, 100));
+                                  }
+                                  if (!resumed.ds.worker
+                                      || resumed.ds.worker.killed
+                                      || resumed.ds.workerReady !== true) {
+                                    throw new Error('bound Session remote resume did not become ready');
+                                  }
+                                }
                               }
-                              if (!resumed.ds.worker
-                                  || resumed.ds.worker.killed
-                                  || resumed.ds.workerReady !== true) {
-                                throw new Error('bound Session remote resume did not become ready');
-                              }
+                              break;
+                            } catch (error) {
+                              const message = error instanceof Error ? error.message : String(error);
+                              const closing = message.includes('canonical Session is no longer closed')
+                                || message.includes('bound Session is not closed yet')
+                                || message.endsWith('bound Session resume failed: not_closed');
+                              if (!closing || Date.now() >= deadline) throw error;
+                              await new Promise<void>(resolve => setTimeout(resolve, 250));
                             }
                           }
-                          break;
-                        } catch (error) {
-                          const message = error instanceof Error ? error.message : String(error);
-                          const closing = message.includes('canonical Session is no longer closed')
-                            || message.includes('bound Session is not closed yet')
-                            || message.endsWith('bound Session resume failed: not_closed');
-                          if (!closing || Date.now() >= deadline) throw error;
-                          await new Promise<void>(resolve => setTimeout(resolve, 250));
-                        }
-                      }
-                      const resumed = findActiveBySessionId(input.sessionId);
-                      if (!resumed) throw new Error('bound Session resume did not install a local owner');
-                      return resumed;
+                          const resumed = findActiveBySessionId(input.sessionId);
+                          if (!resumed) throw new Error('bound Session resume did not install a local owner');
+                          return resumed;
+                        },
                     },
-                  },
-                ),
-              ),
+                  ),
+                ));
+              },
             );
             if (targetChatIds.length > 1) targetResults = results;
           } catch (error) {
