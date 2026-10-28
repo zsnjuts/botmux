@@ -780,6 +780,7 @@ import {
   stampScheduledFinalDeliveryProof,
   verifyScheduledFinalDeliveryReadback,
 } from './scheduled-final-delivery-proof.js';
+import { markGroupContextCardPurpose } from '../im/lark/group-context-card.js';
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
@@ -19181,6 +19182,7 @@ function setupWorkerHandlers(
             }
           }
           const key = `${ds.session.sessionId}:${settlement.generation}:${settlement.seq}`;
+          const frozenScheduledOrigin = freezeScheduledTurnOrigin(ds, msg);
           let inFlight = codexAppFinalSettlementInFlight.get(key);
           if (!inFlight) {
             inFlight = (async () => {
@@ -19213,6 +19215,10 @@ function setupWorkerHandlers(
                       () => ds.worker === worker
                         && ds.session.sessionId === msg.sessionId,
                       preview.settledEntry.replyTarget,
+                      undefined,
+                      undefined,
+                      undefined,
+                      frozenScheduledOrigin,
                     );
                   });
               if (!owned) return false;
@@ -19690,6 +19696,36 @@ function setupWorkerHandlers(
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
+/** The live managed origin of a scheduled turn, captured synchronously while
+ * handling its final_output IPC. The worker emits final_output before the
+ * revoke + turn_terminal pair, but the bridge delivers on a later timer tick,
+ * after the daemon already cleared `ds.managedTurnOrigin` for that turn. */
+export interface FrozenScheduledTurnOrigin {
+  turnId: string;
+  dispatchAttempt?: number;
+  workerGeneration: number;
+}
+
+function freezeScheduledTurnOrigin(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+): FrozenScheduledTurnOrigin | undefined {
+  const origin = ds.managedTurnOrigin;
+  const workerGeneration = ds.workerGeneration;
+  if (parseScheduledTurnId(msg.turnId) === null
+    || origin?.turnId !== msg.turnId
+    || origin.dispatchAttempt !== msg.dispatchAttempt
+    || typeof workerGeneration !== 'number'
+    || ds.session.workerGeneration !== workerGeneration) {
+    return undefined;
+  }
+  return {
+    turnId: msg.turnId,
+    ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+    workerGeneration,
+  };
+}
+
 export interface DurableBridgeFinalOutputRequest {
   daemonSession: DaemonSession;
   turnId: string;
@@ -19699,6 +19735,9 @@ export interface DurableBridgeFinalOutputRequest {
   target:
     | { kind: 'send'; chatId: string }
     | { kind: 'reply'; messageId: string; replyInThread: boolean };
+  /** A failed turn's diagnostic is user-visible but never the run's final. */
+  turnFailed?: boolean;
+  frozenScheduledOrigin?: FrozenScheduledTurnOrigin;
 }
 
 export type DurableBridgeFinalOutputResult =
@@ -19728,6 +19767,9 @@ function deliverFinalOutputWithShutdownDrain(
   isStillOwned: () => boolean,
 ): void {
   const finishDrain = beginFinalOutputDelivery(ds, msg.turnId);
+  // Must run synchronously in the IPC handler, before the trailing
+  // turn_terminal revokes the origin.
+  const frozenScheduledOrigin = freezeScheduledTurnOrigin(ds, msg);
   try {
     deliverFinalOutput(
       ds,
@@ -19736,6 +19778,11 @@ function deliverFinalOutputWithShutdownDrain(
       0,
       () => finishDrain(),
       isStillOwned,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      frozenScheduledOrigin,
     );
   } catch (error) {
     finishDrain();
@@ -20120,6 +20167,7 @@ function deliverFinalOutput(
   frozenRenderSnapshot?: ReplyCardRenderSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
   imageFallback: ReplyImageState = { omitImages: false },
+  frozenScheduledOrigin?: FrozenScheduledTurnOrigin,
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
@@ -20164,6 +20212,7 @@ function deliverFinalOutput(
       setTimeout(() => deliverFinalOutput(
         ds, unresolvedMsg, t, next, onComplete, isStillOwned,
         frozenReplyTarget, frozenRenderSnapshot, frozenInitiator, imageFallback,
+        frozenScheduledOrigin,
       ), FINAL_OUTPUT_RETRY_BACKOFF_MS[next] ?? 0);
       return;
     }
@@ -20683,7 +20732,10 @@ function deliverFinalOutput(
         }
         const scheduledCard = JSON.parse(cardJson) as Record<string, any>;
         stampScheduledFinalDeliveryProof(scheduledCard, scheduledProof);
-        cardJson = JSON.stringify(scheduledCard);
+        // The exact-proof gate (here, in the durable primary and at readback)
+        // also requires the final-message purpose carrier that `botmux send
+        // --response-kind final` adds; without it every bridge final failed.
+        cardJson = markGroupContextCardPurpose(JSON.stringify(scheduledCard), 'message');
         if (!scheduledFinalCardHasExactProof(cardJson, scheduledProof)) {
           throw new Error('scheduled daemon final card proof is unavailable');
         }
@@ -20783,8 +20835,11 @@ function deliverFinalOutput(
           && ds.session.status === 'active'
           && ds.workerGeneration === scheduledWorkerGeneration
           && ds.session.workerGeneration === scheduledWorkerGeneration
-          && ds.managedTurnOrigin?.turnId === msg.turnId
-          && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt;
+          && ((ds.managedTurnOrigin?.turnId === msg.turnId
+            && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt)
+            || (frozenScheduledOrigin?.turnId === msg.turnId
+              && frozenScheduledOrigin.dispatchAttempt === msg.dispatchAttempt
+              && frozenScheduledOrigin.workerGeneration === scheduledWorkerGeneration));
         if (!scheduledProof || !ownsExactGeneration()) return false;
         let detail: unknown;
         try {
@@ -20889,6 +20944,8 @@ function deliverFinalOutput(
             msgType: canonicalOutput.msgType,
             providerUuid: deliveryReplyOptions.uuid,
             target: durableTarget,
+            ...(msg.turnFailed ? { turnFailed: true } : {}),
+            ...(frozenScheduledOrigin ? { frozenScheduledOrigin } : {}),
           })
         : undefined;
       if (durableDelivery?.kind === 'ambiguous') {
@@ -21116,7 +21173,8 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, renderSnapshot, initiator, imageFallback);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, renderSnapshot, initiator, imageFallback,
+        frozenScheduledOrigin);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

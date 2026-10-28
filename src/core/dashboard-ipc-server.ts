@@ -418,6 +418,9 @@ export interface DurableSessionSendRequest {
   responseKind: 'progress' | 'final' | 'auxiliary';
   scheduleSelfCleanup?: boolean;
   hookContext?: Record<string, unknown>;
+  /** Exact scheduled-turn origin frozen by the worker pool at the final_output
+   * IPC edge. Only the bridge fallback sets it. */
+  frozenScheduledOrigin?: import('./worker-pool.js').FrozenScheduledTurnOrigin;
 }
 
 export type DurableSessionSendResult =

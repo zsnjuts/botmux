@@ -207,6 +207,31 @@ describe('durable primary scheduled output claim', () => {
     })).toThrow(/durable scheduled output authority is not committed/);
   });
 
+  it('accepts the origin frozen at final_output after turn_terminal revoked the live one', () => {
+    const revoked = { ...daemonSession(), managedTurnOrigin: undefined };
+    expect(resolveDurablePrimaryOutputClaim({
+      current: current(),
+      turnId: scheduledTurn,
+      daemonSession: revoked,
+      authority: authority(),
+      frozenScheduledTurnId: scheduledTurn,
+    })).toMatchObject({ messageId: scheduledTurn });
+    expect(() => resolveDurablePrimaryOutputClaim({
+      current: current(),
+      turnId: scheduledTurn,
+      daemonSession: revoked,
+      authority: authority(),
+      frozenScheduledTurnId: 'schedule:a1b2c3d4:11111111-1111-4111-8111-111111111111',
+    })).toThrow(/durable scheduled output authority is not committed/);
+    expect(() => resolveDurablePrimaryOutputClaim({
+      current: current(),
+      turnId: scheduledTurn,
+      daemonSession: revoked,
+      authority: authority({ state: 'paused' }),
+      frozenScheduledTurnId: scheduledTurn,
+    })).toThrow(/durable scheduled output authority is not committed/);
+  });
+
   it('keeps an uncommitted ordinary turn fail-closed', () => {
     expect(() => resolveDurablePrimaryOutputClaim({
       current: current(),

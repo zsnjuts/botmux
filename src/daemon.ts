@@ -32316,6 +32316,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       );
       const current = await durableCoordinationRuntime.store.readSession(canonicalKey);
       const scheduledTaskId = parseScheduledTurnId(request.turnId);
+      const receiptWorkerGeneration = request.daemonSession.workerGeneration;
+      // A bridge final arrives after turn_terminal revoked the live origin; it
+      // carries the origin the worker pool froze at the final_output IPC edge.
+      // Prefer the live origin, and accept the frozen one only for the exact
+      // turn of the still-current worker generation.
+      const liveTurnOrigin = request.daemonSession.managedTurnOrigin?.turnId === request.turnId
+        ? request.daemonSession.managedTurnOrigin
+        : undefined;
+      const frozenTurnOrigin = !liveTurnOrigin
+        && scheduledTaskId
+        && request.frozenScheduledOrigin?.turnId === request.turnId
+        && request.frozenScheduledOrigin.workerGeneration === receiptWorkerGeneration
+        ? request.frozenScheduledOrigin
+        : undefined;
       const inbound = resolveDurablePrimaryOutputClaim({
         current,
         turnId: request.turnId,
@@ -32323,9 +32337,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         authority: scheduledTaskId
           ? scheduleAuthorityStore?.getRecord(request.daemonSession.larkAppId, scheduledTaskId)
           : undefined,
+        ...(frozenTurnOrigin ? { frozenScheduledTurnId: frozenTurnOrigin.turnId } : {}),
       });
-      const receiptWorkerGeneration = request.daemonSession.workerGeneration;
-      const receiptDispatchAttempt = request.daemonSession.managedTurnOrigin?.dispatchAttempt;
+      const receiptDispatchAttempt = (liveTurnOrigin ?? frozenTurnOrigin
+        ?? request.daemonSession.managedTurnOrigin)?.dispatchAttempt;
       const receiptProof = typeof receiptWorkerGeneration === 'number'
         ? deriveScheduledFinalDeliveryProof({
             turnId: request.turnId,
@@ -32403,11 +32418,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           durableOutboxTargetForTurn(request.daemonSession, request.turnId),
         );
       } catch { /* frozen target disappeared: fail closed below */ }
+      const originAfterDelivery = request.daemonSession.managedTurnOrigin;
+      const turnOriginStillCurrent = frozenTurnOrigin
+        ? frozenTurnOrigin.dispatchAttempt === receiptDispatchAttempt
+        : originAfterDelivery?.turnId === request.turnId
+          && originAfterDelivery.dispatchAttempt === receiptDispatchAttempt;
       const liveIdentityStillCurrent = liveTrustedFinalTarget
         && request.daemonSession.workerGeneration === receiptWorkerGeneration
         && request.daemonSession.session.workerGeneration === receiptWorkerGeneration
-        && request.daemonSession.managedTurnOrigin?.turnId === request.turnId
-        && request.daemonSession.managedTurnOrigin.dispatchAttempt === receiptDispatchAttempt
+        && turnOriginStillCurrent
         && targetStillCurrent
         && authorityAfterDelivery?.state === 'active'
         && authorityAfterDelivery.task.lastStatus === 'running';
@@ -32474,9 +32493,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}),
       };
     };
-    setDurableBridgeFinalOutputHandler(request => deliverDurablePrimaryMessage({
+    setDurableBridgeFinalOutputHandler(({ turnFailed, ...request }) => deliverDurablePrimaryMessage({
       ...request,
-      responseKind: 'final',
+      // A failed scheduled turn still shows its diagnostic, but never as the
+      // run's trusted final: the terminal status settles that run as failed.
+      responseKind: turnFailed ? 'auxiliary' : 'final',
       hookContext: {
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,

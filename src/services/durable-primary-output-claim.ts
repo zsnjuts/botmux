@@ -47,6 +47,10 @@ export function resolveDurablePrimaryOutputClaim(input: {
   turnId: string;
   daemonSession: Pick<DaemonSession, 'larkAppId' | 'chatId' | 'managedTurnOrigin' | 'session'>;
   authority?: ScheduleAuthorityRecord;
+  /** Bridge finals are delivered after the ordered turn_terminal IPC has
+   * already revoked the live origin. The worker pool freezes the exact origin
+   * while handling the final_output IPC of the same worker generation. */
+  frozenScheduledTurnId?: string;
 }): DurableLarkMessageClaim {
   const taskId = parseScheduledTurnId(input.turnId);
   if (input.current) {
@@ -76,7 +80,8 @@ export function resolveDurablePrimaryOutputClaim(input: {
   const task = authority?.task;
   if (!authority || !task || task.id !== taskId
       || (authority.state !== 'active' && !completedOneShot(authority))
-      || input.daemonSession.managedTurnOrigin?.turnId !== input.turnId
+      || (input.daemonSession.managedTurnOrigin?.turnId !== input.turnId
+        && input.frozenScheduledTurnId !== input.turnId)
       || (task.larkAppId !== undefined && task.larkAppId !== input.daemonSession.larkAppId)
       || !effectiveScheduleChatIds(task).includes(input.daemonSession.chatId)) {
     throw new Error(
