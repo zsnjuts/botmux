@@ -30,12 +30,7 @@ import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { MAX_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
-import {
-  checkNonce,
-  claimPendingGrant,
-  denyPending,
-  updatePendingGrantLimits,
-} from './grant-pending.js';
+import { grantPendingStore } from './grant-pending.js';
 import { normalizeGrantDurationOption, normalizeGrantQuotaOption } from '../../services/grant-policy.js';
 import { claimOverloadNonce, releaseOverloadNonce } from './overload-nonce.js';
 import {
@@ -52,7 +47,7 @@ import { restartBrowser, resolveBrowserTargets } from '../../core/browser-restar
 import { readGlobalConfig } from '../../global-config.js';
 import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
 import { fetchDaemonIpc } from '../../core/daemon-ipc-auth.js';
-import { recordObservedBots } from '../../services/observed-bots-store.js';
+import { recordObservedBotsShared } from '../../services/observed-bots-store.js';
 import type { V3GateCardHandlerDeps } from './v3-gate-card-handler.js';
 import type { V3BlockedCardHandlerDeps } from './v3-blocked-card-handler.js';
 import type { V3LoopGrantCardHandlerDeps } from './v3-loop-grant-card-handler.js';
@@ -1503,7 +1498,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       : undefined;
     const originChatName = typeof value.chat_name === 'string' ? value.chat_name : undefined;
     // 全部 target 都得仍 pending 且 nonce 匹配，否则视为整卡失效。
-    if (!targets.length || !grantChatId || !nonce || !targets.every(tt => checkNonce(larkAppId, grantChatId, tt, nonce))) {
+    if (!targets.length || !grantChatId || !nonce || !(await grantPendingStore.check(larkAppId, grantChatId, targets, nonce))) {
       return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
     }
     // 兼容已发出的旧卡：旧卡用下拉 callback 暂存限制，新卡在授权按钮的 form_submit
@@ -1516,7 +1511,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (parsed === null) {
         return { toast: { type: 'error', content: t('card.grant.toast_bad_limit', undefined, loc) } };
       }
-      const updated = updatePendingGrantLimits(
+      const updated = await grantPendingStore.updateLimits(
         larkAppId,
         grantChatId,
         targets,
@@ -1532,7 +1527,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
     if (value.action === 'grant_deny') {
       // 拒绝落不了盘就不显示「已拒绝」：否则重启后旧卡复活，授权按钮能推翻这次拒绝。
-      if (!denyPending(larkAppId, grantChatId, targets)) {
+      if (!(await grantPendingStore.deny(larkAppId, grantChatId, targets))) {
         return { toast: { type: 'error', content: t('card.grant.toast_unsaved', undefined, loc) } };
       }
       if (delivery) {
@@ -1566,7 +1561,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     targets.forEach((tt, i) => idToName.set(tt, names[i] ?? ''));
     // 先核销整张卡的 nonce（内存 + 磁盘）再落授权：核销落不了盘就不授权，否则旧 nonce 会在
     // daemon 重启后复活，迟到的回调能再授权一次、把额度和有效期重置。
-    const claim = claimPendingGrant(larkAppId, grantChatId, targets, nonce);
+    const claim = await grantPendingStore.claim(larkAppId, grantChatId, targets, nonce);
     if (!claim.ok) {
       return { toast: { type: 'error', content: t(claim.reason === 'unsaved' ? 'card.grant.toast_unsaved' : 'card.grant.toast_expired', undefined, loc) } };
     }
@@ -1595,7 +1590,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     }
     // 全部失败：放回 pending + 不撤卡（owner 可点原卡重试），toast 报错。
     if (granted.length === 0) {
-      claim.restore();
+      await claim.restore();
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: failed[0]?.reason ?? 'unknown' }, loc) } };
     }
     // 部分成功：失败 target 的 pending 已随核销一起清掉——卡马上要变终态（owner 无法再点原卡重试），
@@ -1620,7 +1615,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const skipped = granted.length - botEntries.length;
       if (skipped > 0) logger.debug(`grant auto-introduce: skipped ${skipped} confirmed human target(s)`);
       if (botEntries.length > 0) {
-        recordObservedBots(config.session.dataDir, larkAppId, grantChatId, botEntries, 'introduce');
+        await recordObservedBotsShared(config.session.dataDir, larkAppId, grantChatId, botEntries, 'introduce');
       }
     } catch (err) {
       logger.warn(`grant auto-introduce (observed) failed (grant still applied): ${err}`);

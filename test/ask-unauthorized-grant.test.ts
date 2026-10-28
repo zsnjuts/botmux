@@ -52,14 +52,14 @@ function okDeps(over: Partial<AskGrantRequestDeps> = {}): AskGrantRequestDeps {
 }
 
 describe('requestGrantForAskClicker', () => {
-  it('有 owner 且未节流 → sent，并开出 pending（后续同人被节流）', () => {
-    expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps())).toBe('sent');
+  it('有 owner 且未节流 → sent，并开出 pending（后续同人被节流）', async () => {
+    expect(await requestGrantForAskClicker(ASK, 'ou_pm', okDeps())).toBe('sent');
     expect(isThrottled('cli_ask', 'oc_chat', 'ou_pm')).toBe(true);
   });
 
-  it('关键区别：openPending 不挂 messageData —— 授权后不重放，需再点一次', () => {
+  it('关键区别：openPending 不挂 messageData —— 授权后不重放，需再点一次', async () => {
     const openPending = vi.fn(() => 'n1');
-    requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ openPending: openPending as any }));
+    await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ openPending: openPending as any }));
     expect(openPending).toHaveBeenCalledTimes(1);
     const args = openPending.mock.calls[0] as unknown[];
     // 签名：(appId, chatId, target, quota, messageData, durationMs)
@@ -74,7 +74,7 @@ describe('requestGrantForAskClicker', () => {
 
   it('卡片以 request 模式发出（成员不能自助申请全局）', async () => {
     let sent: string | undefined;
-    requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
+    await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
       deliverCard: async (_t, json) => { sent = json; },
     }));
     await vi.waitFor(() => expect(sent).toBeDefined());
@@ -93,7 +93,7 @@ describe('requestGrantForAskClicker', () => {
   // 接线钉：卡发出去之后才落盘，daemon 重启后 owner 照样能点；发卡失败则什么都不留。
   it('发卡成功 → 卡片落盘，daemon 重启后 nonce 仍有效', async () => {
     let sent: string | undefined;
-    requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
+    await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
       deliverCard: async (_t, json) => { sent = json; },
     }));
     await vi.waitFor(() => expect(sent).toBeDefined());
@@ -107,7 +107,7 @@ describe('requestGrantForAskClicker', () => {
 
   it('发卡失败 → 不落盘，daemon 重启后不留节流', async () => {
     let attempted: string | undefined;
-    requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
+    await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
       deliverCard: async (_t, json) => { attempted = json; throw new Error('send failed'); },
     }));
     await vi.waitFor(() => expect(attempted).toBeDefined());
@@ -118,46 +118,46 @@ describe('requestGrantForAskClicker', () => {
     expect(isThrottled('cli_ask', 'oc_chat', 'ou_pm')).toBe(false);
   });
 
-  it('已 pending / 冷却期 → pending（不重复发卡）', () => {
-    expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps())).toBe('sent');
+  it('已 pending / 冷却期 → pending（不重复发卡）', async () => {
+    expect(await requestGrantForAskClicker(ASK, 'ou_pm', okDeps())).toBe('sent');
     const deliverCard = vi.fn(async () => {});
-    expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ deliverCard }))).toBe('pending');
+    expect(await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ deliverCard }))).toBe('pending');
     expect(deliverCard).not.toHaveBeenCalled();
   });
 
   // pi review F1：owner 点过「拒绝」后处于 10min 冷却期，必须与 pending 区分开——
   // 否则会把「已被拒绝」这件已决的事说成「等 owner 处理」。
-  it('owner 拒绝后的冷却期 → denied（不再混报成 pending）', () => {
-    expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps())).toBe('sent');
+  it('owner 拒绝后的冷却期 → denied（不再混报成 pending）', async () => {
+    expect(await requestGrantForAskClicker(ASK, 'ou_pm', okDeps())).toBe('sent');
     markDenied('cli_ask', 'oc_chat', 'ou_pm');
     const deliverCard = vi.fn(async () => {});
-    expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ deliverCard }))).toBe('denied');
+    expect(await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ deliverCard }))).toBe('denied');
     // 冷却期内同样不重复骚扰 owner
     expect(deliverCard).not.toHaveBeenCalled();
   });
 
-  it('开放模式（无 owner）→ unavailable', () => {
-    expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ getOwnerOpenId: () => undefined }))).toBe('unavailable');
+  it('开放模式（无 owner）→ unavailable', async () => {
+    expect(await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ getOwnerOpenId: () => undefined }))).toBe('unavailable');
     expect(isThrottled('cli_ask', 'oc_chat', 'ou_pm')).toBe(false);
   });
 
-  it('owner 关掉 autoGrantRequestCards → unavailable（沿用对话路径同一个开关）', () => {
-    const outcome = requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
+  it('owner 关掉 autoGrantRequestCards → unavailable（沿用对话路径同一个开关）', async () => {
+    const outcome = await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
       getBotConfig: () => ({ autoGrantRequestCards: false }),
     }));
     expect(outcome).toBe('unavailable');
     expect(isThrottled('cli_ask', 'oc_chat', 'ou_pm')).toBe(false);
   });
 
-  it('bot 未注册（getBotConfig 抛）→ unavailable，不让 ask 点击链路挂掉', () => {
-    const outcome = requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
+  it('bot 未注册（getBotConfig 抛）→ unavailable，不让 ask 点击链路挂掉', async () => {
+    const outcome = await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
       getBotConfig: () => { throw new Error('Bot not registered: cli_ask'); },
     }));
     expect(outcome).toBe('unavailable');
   });
 
   it('发卡失败 → 后台清掉 pending，下次再点能重试', async () => {
-    requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
+    await requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
       deliverCard: async () => { throw new Error('lark 500'); },
     }));
     await vi.waitFor(() => expect(isThrottled('cli_ask', 'oc_chat', 'ou_pm')).toBe(false));
@@ -165,7 +165,7 @@ describe('requestGrantForAskClicker', () => {
 
   it('chat-scope（rootMessageId 非 om_）仍投递：锚到 ask 卡片本身', async () => {
     let anchored: unknown;
-    requestGrantForAskClicker(
+    await requestGrantForAskClicker(
       { ...ASK, rootMessageId: null },
       'ou_pm',
       okDeps({ deliverCard: async (target) => { anchored = target.cardMessageId; } }),

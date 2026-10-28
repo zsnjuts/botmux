@@ -675,13 +675,13 @@ export function parseFormSelections(
  * 再自查一遍是纵深防御——把「不为已决的 ask 骚扰 owner」从对 broker 内部顺序的隐式依赖
  * 变成本函数自己的显式前置条件（pi review F2）。
  */
-function escalateUnauthorized(
+async function escalateUnauthorized(
   askId: string,
   nonce: string,
   clickerOpenId: string,
   locale: Locale | undefined,
   deps: AskCardActionDeps,
-): { toast: { type: string; content: string } } {
+): Promise<{ toast: { type: string; content: string } }> {
   const ask = getAskSnapshot(askId);
   if (!ask || ask.settled || ask.nonce !== nonce) return staleToast(locale);
   // A responder lock is not a missing group grant. Never ask the owner to
@@ -690,7 +690,7 @@ function escalateUnauthorized(
     return { toast: { type: 'warning', content: t('card.ask.toast.unauthorized', undefined, locale) } };
   }
   const requestGrant = deps.requestGrant ?? requestGrantForAskClicker;
-  const outcome = requestGrant(
+  const outcome = await requestGrant(
     {
       larkAppId: ask.larkAppId,
       chatId: ask.chatId,

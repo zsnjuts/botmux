@@ -36,7 +36,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
 const recordObservedMock = vi.fn();
 vi.mock('../src/services/observed-bots-store.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/services/observed-bots-store.js')>();
-  return { ...actual, recordObservedBots: (...a: any[]) => recordObservedMock(...a) };
+  return { ...actual, recordObservedBotsShared: async (...a: any[]) => recordObservedMock(...a) };
 });
 
 let configPath: string;

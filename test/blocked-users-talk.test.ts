@@ -222,7 +222,7 @@ describe('被黑用户不弹授权申请卡', () => {
     expect(isThrottled(APP, CHAT, 'ou_stranger')).toBe(true);
   });
 
-  it('ask 卡片点击路径：evaluateTalk 判 blocked → unavailable，不投递授权卡', () => {
+  it('ask 卡片点击路径：evaluateTalk 判 blocked → unavailable，不投递授权卡', async () => {
     const deliverCard = vi.fn(async () => {});
     const deps: AskGrantRequestDeps = {
       getOwnerOpenId: () => OWNER,
@@ -230,7 +230,7 @@ describe('被黑用户不弹授权申请卡', () => {
       evaluateTalk: () => ({ allowed: false, reason: 'blocked' }),
       deliverCard,
     };
-    const outcome = requestGrantForAskClicker(
+    const outcome = await requestGrantForAskClicker(
       { larkAppId: APP, chatId: CHAT, rootMessageId: null },
       SENDER,
       deps,

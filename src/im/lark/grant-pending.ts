@@ -27,6 +27,12 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { errorMessage } from '../../utils/error-message.js';
 import { isJsonObject, readJsonFileSoft } from '../../utils/json-file.js';
 import { logger } from '../../utils/logger.js';
+import type { DurableJson } from '../../services/durable-coordination.js';
+import {
+  getDurableChatSessionlessState,
+  type DurableChatSessionlessStateAccess,
+  type DurableGrantPendingEntry,
+} from '../../services/durable-chat-sessionless-state.js';
 
 const DENY_COOLDOWN_MS = 10 * 60 * 1000;
 /** pending 卡超过此窗口仍未处置即视作废弃（owner 一直没点），可回收。
@@ -548,6 +554,284 @@ function pruneOwnerDmSent(now: number): void {
     const recent = list.filter(ts => now - ts < OWNER_DM_WINDOW_MS);
     if (recent.length === 0) ownerDmSent.delete(k);
     else if (recent.length !== list.length) ownerDmSent.set(k, recent);
+  }
+}
+
+// ─── 跨副本入口（durable primary） ─────────────────────────────────────────────
+// 上面的同步实现以 Pod 本地文件为准。durable primary 下多个副本各有各的本地目录：
+// A 发出的卡被 B 收到点击时 B 读不到 pending，于是把 pending 改存 PostgreSQL 的
+// 按群共享记录（durable-chat-sessionless-state）。调用方统一走 grantPendingStore：
+// primary 下读写共享记录，其他模式原样调用上面的同步函数，行为不变。
+// 语义与本地实现一一对应；差别只有两处：
+//  - 没有「未送达不落盘」：共享记录在发卡前就写入。为免发卡途中崩溃留下的残留 pending
+//    把申请人节流 24h，未送达的 pending 超过 UNDELIVERED_PENDING_MS 即视为过期。
+//  - 写失败（数据库不可用、lease 争用超时）一律按 unsaved / false 处理，调用方拒绝处置。
+
+const UNDELIVERED_PENDING_MS = 10 * 60 * 1000;
+
+function isDurableExpired(e: DurableGrantPendingEntry, now: number): boolean {
+  if (e.state === 'pending' && e.delivered !== true && now - e.ts >= UNDELIVERED_PENDING_MS) return true;
+  return isExpired(e as Entry, now);
+}
+
+function pruneDurable(entries: Record<string, DurableGrantPendingEntry>, now: number): boolean {
+  let changed = false;
+  for (const [target, e] of Object.entries(entries)) {
+    if (isDurableExpired(e, now)) {
+      delete entries[target];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function livePending(
+  entries: Record<string, DurableGrantPendingEntry>,
+  targets: string[],
+  nonce: string,
+  now: number,
+): DurableGrantPendingEntry[] | undefined {
+  const found = targets.map(target => entries[target]);
+  if (!found.length || found.some(e => !e || e.state !== 'pending' || e.nonce !== nonce || isDurableExpired(e, now))) {
+    return undefined;
+  }
+  return found as DurableGrantPendingEntry[];
+}
+
+/** 飞书事件本来就是 JSON；深拷贝一次去掉 undefined 等非 JSON 值，坏了就不带重放。 */
+function toDurableMessageData(messageData: any): DurableJson | undefined {
+  if (messageData === undefined) return undefined;
+  try {
+    const copy = JSON.parse(JSON.stringify(messageData));
+    return isJsonObject(copy) ? copy as DurableJson : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export type AsyncPendingClaim =
+  | {
+      ok: true;
+      quota?: number;
+      durationMs?: number;
+      messageData?: any;
+      restore: () => Promise<void>;
+    }
+  | { ok: false; reason: Exclude<PendingWriteResult, 'ok'> };
+
+export const grantPendingStore = {
+  async open(
+    larkAppId: string,
+    chatId: string,
+    targets: string[],
+    quota: number | undefined = DEFAULT_GRANT_QUOTA,
+    messageData?: any,
+    durationMs: number | undefined = DEFAULT_GRANT_DURATION_MS,
+    /** primary 下由 Inbox 事件派生的稳定 nonce（见 SessionlessReplyKeys.stable），让重跑同一事件
+     *  写入的 pending 与飞书去重后留下的那张卡一致；不传则随机生成。 */
+    stableNonce?: string,
+  ): Promise<string> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) return openPendingMulti(larkAppId, chatId, targets, quota, messageData, durationMs);
+    const nonce = stableNonce ?? randomUUID();
+    const ts = Date.now();
+    const data = toDurableMessageData(messageData);
+    await durable.mutate(larkAppId, chatId, state => {
+      pruneDurable(state.grantPending, ts);
+      for (const target of targets) {
+        state.grantPending[target] = {
+          state: 'pending', nonce, ts,
+          ...(quota !== undefined ? { quota } : {}),
+          ...(durationMs !== undefined ? { durationMs } : {}),
+          ...(data !== undefined ? { messageData: data } : {}),
+        };
+      }
+      return { changed: true, result: undefined };
+    });
+    return nonce;
+  },
+
+  async markDelivered(larkAppId: string, chatId: string, targets: string[], nonce: string): Promise<void> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) return markPendingDelivered(larkAppId, chatId, targets, nonce);
+    await durable.mutate(larkAppId, chatId, state => {
+      let changed = false;
+      for (const target of targets) {
+        const e = state.grantPending[target];
+        if (e && e.state === 'pending' && e.nonce === nonce && !e.delivered) {
+          e.delivered = true;
+          changed = true;
+        }
+      }
+      return { changed, result: undefined };
+    }).catch(err => logger.warn(`[grant-pending:${larkAppId}] durable markDelivered failed: ${errorMessage(err)}`));
+  },
+
+  /** 全部目标都仍 pending 且 nonce 匹配。 */
+  async check(larkAppId: string, chatId: string, targets: string[], nonce: string): Promise<boolean> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) return targets.length > 0 && targets.every(target => checkNonce(larkAppId, chatId, target, nonce));
+    try {
+      const state = await durable.read(larkAppId, chatId);
+      return !!livePending(state.grantPending, targets, nonce, Date.now());
+    } catch (err) {
+      logger.warn(`[grant-pending:${larkAppId}] durable check failed: ${errorMessage(err)}`);
+      return false;
+    }
+  },
+
+  async updateLimits(
+    larkAppId: string,
+    chatId: string,
+    targets: string[],
+    nonce: string,
+    patch: { quota?: number | null; durationMs?: number | null },
+  ): Promise<PendingWriteResult> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) return updatePendingGrantLimits(larkAppId, chatId, targets, nonce, patch);
+    try {
+      return await durable.mutate(larkAppId, chatId, state => {
+        const entries = livePending(state.grantPending, targets, nonce, Date.now());
+        if (!entries) return { changed: false, result: 'stale' as const };
+        for (const e of entries) {
+          if ('quota' in patch) {
+            if (patch.quota === null || patch.quota === undefined) delete e.quota;
+            else e.quota = patch.quota;
+          }
+          if ('durationMs' in patch) {
+            if (patch.durationMs === null || patch.durationMs === undefined) delete e.durationMs;
+            else e.durationMs = patch.durationMs;
+          }
+        }
+        return { changed: true, result: 'ok' as const };
+      });
+    } catch (err) {
+      logger.warn(`[grant-pending:${larkAppId}] durable updateLimits failed: ${errorMessage(err)}`);
+      return 'unsaved';
+    }
+  },
+
+  /** 核销整张卡的 nonce，见 claimPendingGrant。 */
+  async claim(larkAppId: string, chatId: string, targets: string[], nonce: string): Promise<AsyncPendingClaim> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) {
+      const claim = claimPendingGrant(larkAppId, chatId, targets, nonce);
+      return claim.ok ? { ...claim, restore: async () => claim.restore() } : claim;
+    }
+    let claimed: DurableGrantPendingEntry[] | undefined;
+    try {
+      claimed = await durable.mutate(larkAppId, chatId, state => {
+        const entries = livePending(state.grantPending, targets, nonce, Date.now());
+        if (!entries) return { changed: false, result: undefined };
+        for (const target of targets) delete state.grantPending[target];
+        return { changed: true, result: entries };
+      });
+    } catch (err) {
+      logger.warn(`[grant-pending:${larkAppId}] durable claim failed: ${errorMessage(err)}`);
+      return { ok: false, reason: 'unsaved' };
+    }
+    if (!claimed) return { ok: false, reason: 'stale' };
+    const first = claimed[0]!;
+    return {
+      ok: true,
+      quota: first.quota,
+      durationMs: first.durationMs,
+      messageData: first.messageData,
+      restore: async () => {
+        await durable.mutate(larkAppId, chatId, state => {
+          let changed = false;
+          targets.forEach((target, i) => {
+            // 授权落库期间这个目标又开了新卡 / 被拒绝：以新的为准，不覆盖。
+            if (state.grantPending[target]) return;
+            state.grantPending[target] = claimed![i]!;
+            changed = true;
+          });
+          return { changed, result: undefined };
+        }).catch(err => logger.warn(`[grant-pending:${larkAppId}] durable restore failed: ${errorMessage(err)}`));
+      },
+    };
+  },
+
+  async clear(larkAppId: string, chatId: string, target: string): Promise<boolean> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) return clearPending(larkAppId, chatId, target);
+    try {
+      await durable.mutate(larkAppId, chatId, state => {
+        if (!state.grantPending[target]) return { changed: false, result: undefined };
+        delete state.grantPending[target];
+        return { changed: true, result: undefined };
+      });
+      return true;
+    } catch (err) {
+      logger.warn(`[grant-pending:${larkAppId}] durable clear failed: ${errorMessage(err)}`);
+      return false;
+    }
+  },
+
+  async deny(larkAppId: string, chatId: string, targets: string[]): Promise<boolean> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) return denyPending(larkAppId, chatId, targets);
+    const now = Date.now();
+    try {
+      await durable.mutate(larkAppId, chatId, state => {
+        pruneDurable(state.grantPending, now);
+        for (const target of targets) state.grantPending[target] = { state: 'denied', ts: now };
+        return { changed: true, result: undefined };
+      });
+      return true;
+    } catch (err) {
+      logger.warn(`[grant-pending:${larkAppId}] durable deny failed: ${errorMessage(err)}`);
+      return false;
+    }
+  },
+
+  /** 见 throttleReason。读不到共享记录时按「未节流」处理：最多多发一张卡，处置仍需管理员。 */
+  async throttleReason(larkAppId: string, chatId: string, target: string): Promise<'pending' | 'denied' | null> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) return throttleReason(larkAppId, chatId, target);
+    const e = await readDurableEntry(durable, larkAppId, chatId, target);
+    return e && !isDurableExpired(e, Date.now()) ? e.state : null;
+  },
+
+  async isThrottled(larkAppId: string, chatId: string, target: string): Promise<boolean> {
+    return (await grantPendingStore.throttleReason(larkAppId, chatId, target)) !== null;
+  },
+
+  /** 见 claimThrottleNotice；提示标记仍是本副本内存（只是限流，多副本下至多各提示一次）。 */
+  async claimThrottleNotice(
+    larkAppId: string,
+    chatId: string,
+    target: string,
+  ): Promise<{ reason: 'pending' | 'denied'; release: () => void } | null> {
+    const durable = getDurableChatSessionlessState();
+    if (!durable) return claimThrottleNotice(larkAppId, chatId, target);
+    const e = await readDurableEntry(durable, larkAppId, chatId, target);
+    if (!e || isDurableExpired(e, Date.now())) return null;
+    if (e.state === 'pending' && e.delivered !== true) return null;
+    const mark = e.state === 'pending' ? `pending:${e.nonce}` : `denied:${e.ts}`;
+    const markKey = `${larkAppId}:${key(chatId, target)}`;
+    if (throttleNoticeMarks.get(markKey) === mark) return null;
+    throttleNoticeMarks.set(markKey, mark);
+    return {
+      reason: e.state,
+      release: () => {
+        if (throttleNoticeMarks.get(markKey) === mark) throttleNoticeMarks.delete(markKey);
+      },
+    };
+  },
+};
+
+async function readDurableEntry(
+  durable: DurableChatSessionlessStateAccess,
+  larkAppId: string,
+  chatId: string,
+  target: string,
+): Promise<DurableGrantPendingEntry | undefined> {
+  try {
+    return (await durable.read(larkAppId, chatId)).grantPending[target];
+  } catch (err) {
+    logger.warn(`[grant-pending:${larkAppId}] durable read failed: ${errorMessage(err)}`);
+    return undefined;
   }
 }
 

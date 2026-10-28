@@ -28,6 +28,7 @@ const mockSetSubstituteEnabledForChat = vi.fn();
 vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
   isSubstituteEnabledForChat: (...a: any[]) => mockIsSubstituteEnabledForChat(...a),
   setSubstituteEnabledForChat: (...a: any[]) => mockSetSubstituteEnabledForChat(...a),
+  setSubstituteEnabledForChatShared: async (...a: any[]) => mockSetSubstituteEnabledForChat(...a),
 }));
 
 const mockGetBot = vi.fn(() => ({

@@ -25,6 +25,7 @@ import { mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
+import { getDurableChatSessionlessState } from './durable-chat-sessionless-state.js';
 
 const DEFAULT_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -86,6 +87,18 @@ export function recordObservedBots(
   if (valid.length === 0) return;
 
   const data = readFile(dataDir, larkAppId, chatId);
+  mergeObservedBotEntries(data, valid, source, now);
+  writeFileAtomic(dataDir, larkAppId, chatId, data);
+}
+
+/** recordObservedBots 的合并规则（纯函数，原地修改 data）：同名换了 open_id 的旧条目删掉，
+ *  已有条目保留 firstSeenAt、刷新名字和 lastSeenAt。durable primary 的共享记录复用同一规则。 */
+function mergeObservedBotEntries(
+  data: FileShape,
+  valid: ReadonlyArray<{ openId: string; name: string }>,
+  source: ObservedBotSource,
+  now: number,
+): void {
   for (const b of valid) {
     for (const [existingOpenId, entry] of Object.entries(data)) {
       if (entry.name === b.name && existingOpenId !== b.openId) {
@@ -100,7 +113,64 @@ export function recordObservedBots(
       data[b.openId] = { name: b.name, source, firstSeenAt: now, lastSeenAt: now };
     }
   }
-  writeFileAtomic(dataDir, larkAppId, chatId, data);
+}
+
+/**
+ * 跨副本版 recordObservedBots：durable primary 下先写进按群共享记录（PostgreSQL），再把
+ * 合并结果同步到本副本的本地文件；其他模式等同 recordObservedBots。本地文件在 primary
+ * 下只是同步读取方（client.ts 拼 <available_bots> 等）的缓存，别的副本处理该群消息前会
+ * 用 applyObservedBotsSnapshot 拉齐。
+ */
+export async function recordObservedBotsShared(
+  dataDir: string,
+  larkAppId: string,
+  chatId: string,
+  bots: ReadonlyArray<{ openId: string; name: string }>,
+  source: ObservedBotSource = 'introduce',
+  now: number = Date.now(),
+): Promise<void> {
+  const durable = getDurableChatSessionlessState();
+  if (!durable) {
+    recordObservedBots(dataDir, larkAppId, chatId, bots, source, now);
+    return;
+  }
+  const valid = bots.filter(b => b.openId && b.name);
+  if (valid.length === 0) return;
+  const snapshot = await durable.mutate(larkAppId, chatId, state => {
+    mergeObservedBotEntries(state.observedBots, valid, source, now);
+    return { changed: true, result: { ...state.observedBots } };
+  });
+  applyObservedBotsSnapshot(dataDir, larkAppId, chatId, snapshot);
+}
+
+/** 把共享记录里的花名册合并进本地文件（按 lastSeenAt 取新），有变化才写。 */
+export function applyObservedBotsSnapshot(
+  dataDir: string,
+  larkAppId: string,
+  chatId: string,
+  snapshot: Readonly<Record<string, FileEntry>>,
+): void {
+  const entries = Object.entries(snapshot);
+  if (entries.length === 0) return;
+  const data = readFile(dataDir, larkAppId, chatId);
+  let changed = false;
+  for (const [openId, entry] of entries) {
+    const local = data[openId];
+    if (local && local.lastSeenAt >= entry.lastSeenAt && local.name === entry.name) continue;
+    for (const [existingOpenId, existing] of Object.entries(data)) {
+      if (existing.name === entry.name && existingOpenId !== openId && existing.lastSeenAt <= entry.lastSeenAt) {
+        delete data[existingOpenId];
+      }
+    }
+    data[openId] = {
+      name: entry.name,
+      source: entry.source,
+      firstSeenAt: Math.min(local?.firstSeenAt ?? entry.firstSeenAt, entry.firstSeenAt),
+      lastSeenAt: Math.max(local?.lastSeenAt ?? 0, entry.lastSeenAt),
+    };
+    changed = true;
+  }
+  if (changed) writeFileAtomic(dataDir, larkAppId, chatId, data);
 }
 
 /**

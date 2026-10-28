@@ -12,12 +12,14 @@ import { localeForBot, t } from '../../i18n/index.js';
 import { normalizeGroupMentionMode, resolveGroupMentionMode, setChatMentionMode } from '../../services/chat-reply-mode-store.js';
 import { isSessionGroup } from '../../services/session-groups-store.js';
 import { logger } from '../../utils/logger.js';
+import type { SessionlessReplyKeys } from './sessionless-reply-keys.js';
 
 export async function tryHandleMentionModeCommand(
   larkAppId: string,
   message: any,
   senderOpenId: string | undefined,
   canTalk: boolean,
+  replyKeys?: SessionlessReplyKeys,
 ): Promise<boolean> {
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
@@ -34,7 +36,7 @@ export async function tryHandleMentionModeCommand(
   const messageId: string | undefined = message.message_id;
   const loc = localeForBot(larkAppId);
   const reply = (content: string) => messageId
-    ? replyMessage(larkAppId, messageId, content, 'text', false)
+    ? replyMessage(larkAppId, messageId, content, 'text', false, replyKeys?.next())
         .catch(err => logger.warn(`[mention-mode] reply failed: ${err?.message ?? err}`))
     : Promise.resolve();
   const arg = match[1]?.trim().toLowerCase();
