@@ -9,9 +9,10 @@ import { isBotAdmin } from './grant-owner.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
-import { markPendingDelivered, openPendingMulti } from './grant-pending.js';
+import { grantPendingStore } from './grant-pending.js';
 import { revokeGrant, addAllowedChatGroup, removeAllowedChatGroup } from '../../services/grant-store.js';
 import { replyMessage } from './client.js';
+import type { SessionlessReplyKeys } from './sessionless-reply-keys.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
 import {
@@ -100,9 +101,15 @@ export function isGrantTargetOnly(message: any, botOpenId: string | undefined, b
   return isCommandTargetOnly(message, botOpenId, GRANT_CMD_PATTERN, botAppId);
 }
 
+export interface GrantCommandOptions {
+  /** durable primary 下的回执去重键（见 sessionless-reply-keys.ts）；其他模式不传。 */
+  replyKeys?: SessionlessReplyKeys;
+}
+
 /** 返回 true 表示已拦截（不再进入路由/spawn）。 */
 export async function tryHandleGrantCommand(
   larkAppId: string, message: any, senderOpenId: string | undefined,
+  opts: GrantCommandOptions = {},
 ): Promise<boolean> {
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
@@ -128,11 +135,13 @@ export async function tryHandleGrantCommand(
   const loc = localeForBot(larkAppId);
   const messageId = message.message_id;
   const chatId = message.chat_id;
+  const send = (content: string, msgType: string = 'text') =>
+    replyMessage(larkAppId, messageId, content, msgType, false, opts.replyKeys?.next());
 
   // owner / admin 强闸门
   const owner = getOwnerOpenId(larkAppId);
   if (!senderOpenId || !isBotAdmin(larkAppId, senderOpenId)) {
-    await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.owner_only' : 'cmd.revoke.owner_only', undefined, loc))
+    await send(t(isGrant ? 'cmd.grant.owner_only' : 'cmd.revoke.owner_only', undefined, loc))
       .catch(err => logger.debug(`grant owner_only reply failed: ${err}`));
     return true;
   }
@@ -143,7 +152,7 @@ export async function tryHandleGrantCommand(
   // allowedChatGroups（chatId 级 talk-open，仅 canTalk，不授 canOperate）。
   if (targets.length === 0) {
     if (!chatId) {
-      await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc))
+      await send(t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc))
         .catch(err => logger.debug(`grant usage reply failed: ${err}`));
       return true;
     }
@@ -151,7 +160,7 @@ export async function tryHandleGrantCommand(
     // 被 parseGrantTargets .filter 掉）→ owner 本意是授权某个 bot，绝不能退化成「对全群
     // 开放 talk」的整群授权（operator daemon 视角的提权）。回 usage，明确不按 app_id 授权。
     if (hasAnyTargetMention(message, getBotOpenId(larkAppId))) {
-      await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc))
+      await send(t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc))
         .catch(err => logger.debug(`grant app-id-target guard reply failed: ${err}`));
       return true;
     }
@@ -160,7 +169,7 @@ export async function tryHandleGrantCommand(
     // 避免把"给某人 5 条额度"误执行成"对全群开放对话"。
     const rest = stripAllMentions(text, message?.mentions ?? []).replace(/^\/(grant|revoke)\b/i, '').trim();
     if (rest !== '' && rest.toLowerCase() !== 'all') {
-      await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.bad_quota' : 'cmd.revoke.usage', undefined, loc))
+      await send(t(isGrant ? 'cmd.grant.bad_quota' : 'cmd.revoke.usage', undefined, loc))
         .catch(err => logger.debug(`grant no-target guard reply failed: ${err}`));
       return true;
     }
@@ -177,7 +186,7 @@ export async function tryHandleGrantCommand(
         ? t('cmd.revoke.chat_failed', { reason: r.reason }, loc)
         : r.removed ? t('cmd.revoke.chat_done', undefined, loc) : t('cmd.revoke.chat_none', undefined, loc);
     }
-    await replyMessage(larkAppId, messageId, txt)
+    await send(txt)
       .catch(err => logger.debug(`grant whole-chat reply failed: ${err}`));
     logger.info(`[grant:${larkAppId}] ${isGrant ? 'grant' : 'revoke'} whole-chat ${chatId}`);
     return true;
@@ -210,7 +219,7 @@ export async function tryHandleGrantCommand(
     const txt = targets.length === 1
       ? lines[0]
       : `${t('cmd.revoke.multi_header', undefined, loc)}\n${lines.join('\n')}`;
-    await replyMessage(larkAppId, messageId, txt)
+    await send(txt)
       .catch(err => logger.debug(`revoke reply failed: ${err}`));
     logger.info(`[grant:${larkAppId}] revoke ${targets.length} target(s) in ${chatId}`);
     return true;
@@ -220,7 +229,7 @@ export async function tryHandleGrantCommand(
   // 无数字优先取 per-bot 覆盖值，未配置时使用卡片内置 3 条。
   const pq = parseGrantQuota(text, message?.mentions ?? []);
   if (!pq.ok) {
-    await replyMessage(larkAppId, messageId, t('cmd.grant.bad_quota', undefined, loc))
+    await send(t('cmd.grant.bad_quota', undefined, loc))
       .catch(err => logger.debug(`grant bad_quota reply failed: ${err}`));
     return true;
   }
@@ -232,14 +241,24 @@ export async function tryHandleGrantCommand(
 
   // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。额度（若有）对每个目标各自挂在 pending 上。
   const targetIds = targets.map(tgt => tgt.openId);
-  const nonce = openPendingMulti(
-    larkAppId,
-    chatId,
-    targetIds,
-    quota,
-    undefined,
-    durationMs,
-  );
+  let nonce: string;
+  try {
+    nonce = await grantPendingStore.open(
+      larkAppId,
+      chatId,
+      targetIds,
+      quota,
+      undefined,
+      durationMs,
+      opts.replyKeys?.stable('grant-card'),
+    );
+  } catch (err) {
+    // 只有 primary 的共享记录写不进才会走到这里：卡还没发，明确告诉 owner 本次未生效。
+    logger.warn(`[grant:${larkAppId}] owner /grant pending open failed in ${chatId}: ${err}`);
+    await send(t('cmd.grant.card_failed', undefined, loc))
+      .catch(replyErr => logger.warn(`[grant:${larkAppId}] grant pending failure notice failed: ${replyErr}`));
+    return true;
+  }
   const card = buildGrantCard(
     {
       ownerOpenId: senderOpenId ?? owner!,
@@ -252,10 +271,19 @@ export async function tryHandleGrantCommand(
     },
     loc,
   );
-  await replyMessage(larkAppId, messageId, card, 'interactive')
-    // 卡已送达才落盘：daemon 重启后 owner 照样能点这张卡。
-    .then(() => markPendingDelivered(larkAppId, chatId, targetIds, nonce))
-    .catch(err => logger.debug(`grant card reply failed: ${err}`));
+  try {
+    await send(card, 'interactive');
+  } catch (err) {
+    // 发卡失败对 owner 必须可见：否则 owner 以为已授权、目标仍被拒，整条授权链路静默失败。
+    // 失败可能只是响应丢失（卡其实已送达），所以不撤 pending、不改执行 claim、不重发卡，
+    // 只补一句结果不确定的文字回执。
+    logger.warn(`[grant:${larkAppId}] owner /grant card send failed in ${chatId}: ${err}`);
+    await send(t('cmd.grant.card_failed', undefined, loc))
+      .catch(replyErr => logger.warn(`[grant:${larkAppId}] grant card failure notice failed: ${replyErr}`));
+    return true;
+  }
+  // 卡已送达才落盘：daemon 重启后 owner 照样能点这张卡。
+  await grantPendingStore.markDelivered(larkAppId, chatId, targetIds, nonce);
   logger.info(`[grant:${larkAppId}] owner /grant card for ${targets.length} target(s) in ${chatId}`);
   return true;
 }

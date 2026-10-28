@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText, extractAuthoredMessageText, rawPlaceholderText, resolveMentions } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText, extractAuthoredMessageText, rawPlaceholderText, resolveMentions, resolvePostAtIdentity, extractMentionIdentities } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -2460,5 +2460,49 @@ describe('resolveMentions & card <at id=...> tags', () => {
     const text = '```python\n    def foo():\n        return 42\n```\n<at id=ou_unknown></at>';
     const result = resolveMentions(text, []);
     expect(result).toBe('```python\n    def foo():\n        return 42\n```');
+  });
+});
+
+// ─── post `at` placeholders（@_user_N）─────────────────────────────────────
+// 线上实测：部分客户端发出的富文本，at 节点 user_id 是 `@_user_N` 占位符，真实 id 只在
+// message.mentions 同 key 条目里。所有从 at 节点取身份的入口都必须先解析占位符。
+describe('post at placeholders', () => {
+  const post = (nodes: any[]) => JSON.stringify({ zh_cn: { content: [nodes] } });
+
+  it('resolvePostAtIdentity maps placeholders, keeps raw ids, and drops unknown keys', () => {
+    const mentions = [{ key: '@_user_1', id: { open_id: 'ou_a' } }, { key: '@_user_2', id: 'cli_x', id_type: 'app_id' }];
+    expect(resolvePostAtIdentity('@_user_1', mentions)).toEqual({ openId: 'ou_a' });
+    expect(resolvePostAtIdentity('@_user_2', mentions)).toEqual({ appId: 'cli_x' });
+    expect(resolvePostAtIdentity('@_user_3', mentions)).toBeUndefined();
+    expect(resolvePostAtIdentity('ou_b', [])).toEqual({ openId: 'ou_b' });
+    expect(resolvePostAtIdentity('cli_y', [])).toEqual({ appId: 'cli_y' });
+    expect(resolvePostAtIdentity('', [])).toBeUndefined();
+  });
+
+  it('extractMentionIdentities never reports a placeholder as an open_id', () => {
+    const ids = extractMentionIdentities({
+      content: post([{ tag: 'at', user_id: '@_user_1', user_name: '张三' }, { tag: 'at', user_id: '@_user_9', user_name: '李四' }]),
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_a' }, name: '张三' }],
+    });
+    const openIds = ids.map(i => i.openId).filter(Boolean);
+    expect(openIds).toContain('ou_a');
+    expect(openIds.some(id => id!.startsWith('@_user_'))).toBe(false);
+  });
+
+  it('extractPostAtParticipants resolves placeholders to real open_ids', () => {
+    const out = extractPostAtParticipants({
+      content: post([{ tag: 'at', user_id: '@_user_1', user_name: '张三' }]),
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_a' } }],
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].openId).toBe('ou_a');
+  });
+
+  it('messageMentionsBot detects the bot behind a placeholder at-node', () => {
+    const message = {
+      content: post([{ tag: 'at', user_id: '@_user_1', user_name: 'Bot' }, { tag: 'text', text: ' hi' }]),
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' } }],
+    };
+    expect(messageMentionsBot(message, 'cli_bot', 'ou_bot')).toBe(true);
   });
 });

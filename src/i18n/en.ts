@@ -196,6 +196,7 @@ export const messages: Record<string, string> = {
   'cmd.grant.owner_only': 'Only a bot admin can use /grant.',
   'cmd.grant.usage': 'Usage: @bot /grant @someone [N] (let them talk to me in this chat — you can @ several people/bots at once; with a number, grants an N-message quota) | @bot /grant (let every member of this chat talk). Talk-only; sensitive ops stay governed by allowedUsers.',
   'cmd.grant.bad_quota': '⚠️ Bad quota. Usage: @bot /grant @someone 5 (grant a 5-message quota; must be a positive integer). Omit the number to use the card default.',
+  'cmd.grant.card_failed': '⚠️ The grant card may not have been sent (the send call failed). If no grant card appears above, nothing was granted — retry /grant as plain text, or grant from the Dashboard groups page.',
   'cmd.grant.chat_done': '✅ Everyone in this chat can now talk to me (just @-mention me). Sensitive ops still limited to allowedUsers.',
   'cmd.grant.chat_already': 'ℹ️ This chat is already open to talk; nothing to do.',
   'cmd.grant.chat_failed': '⚠️ Grant failed: {reason}',

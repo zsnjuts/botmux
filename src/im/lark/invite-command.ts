@@ -37,6 +37,7 @@ import type { ChatBotMember } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
 import { parseTargetsAfterCommand, isCommandTargetOnly, stripAllMentions } from './mention-targets.js';
+import type { SessionlessReplyKeys } from './sessionless-reply-keys.js';
 
 const INVITE_CMD_PATTERN = /\/invite\b/i;
 
@@ -116,6 +117,7 @@ async function addBotsResilient(larkAppId: string, chatId: string, ids: string[]
 /** 返回 true 表示已拦截（不再进入路由/spawn）。 */
 export async function tryHandleInviteCommand(
   larkAppId: string, message: any, senderOpenId: string | undefined,
+  replyKeys?: SessionlessReplyKeys,
 ): Promise<boolean> {
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
@@ -128,7 +130,7 @@ export async function tryHandleInviteCommand(
   const chatId = message.chat_id;
   const loc = localeForBot(larkAppId);
   const reply = (key: string, params?: Record<string, string | number>) =>
-    replyMessage(larkAppId, messageId, t(key, params, loc))
+    replyMessage(larkAppId, messageId, t(key, params, loc), 'text', false, replyKeys?.next())
       .catch(err => logger.debug(`invite ${key} reply failed: ${err}`));
 
   // 本 bot 只是作为 /invite 的【目标】被 @（`@OperatorBot /invite @ThisBot`）→ 命令属于
@@ -291,6 +293,7 @@ export async function tryHandleInviteCommand(
   const body = sections.join('\n') || t('cmd.invite.usage', undefined, loc);
   await replyMessage(larkAppId, messageId,
     toInvite.length > 0 || already.length > 0 ? t('cmd.invite.header', undefined, loc) + '\n' + body : body,
+    'text', false, replyKeys?.next(),
   ).catch(err => logger.debug(`invite result reply failed: ${err}`));
   logger.info(
     `[invite:${larkAppId}] chat=${chatId} added=[${added}] already=[${already}] ` +

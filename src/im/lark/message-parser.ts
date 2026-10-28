@@ -121,6 +121,35 @@ export function mentionIdentity(m: {
   return out;
 }
 
+/** Post `at` placeholder such as `@_user_2`: not an id, only a key into `message.mentions`. */
+const POST_AT_PLACEHOLDER_RE = /^@_user_\d+$/;
+
+/**
+ * Resolve a post (rich-text) inline `at` node's `user_id` to real ids.
+ *
+ * Usually the node carries the mentionee's open_id (`ou_`) or, for an
+ * out-of-group bot, its app_id (`cli_`). Some clients instead leave the
+ * `@_user_N` placeholder there and put the real ids on the matching
+ * `message.mentions[]` entry; the placeholder must never be used as an
+ * open_id. Returns undefined when the node cannot be resolved.
+ */
+export function resolvePostAtIdentity(
+  userId: unknown,
+  mentions: readonly any[] | null | undefined,
+): { openId?: string; appId?: string } | undefined {
+  if (typeof userId !== 'string' || !userId) return undefined;
+  if (POST_AT_PLACEHOLDER_RE.test(userId)) {
+    const m = (mentions ?? []).find(x => x?.key === userId);
+    if (!m) return undefined;
+    const { openId } = mentionIdentity(m);
+    const appId = mentionAppId(m);
+    if (!openId && !appId) return undefined;
+    return { ...(openId ? { openId } : {}), ...(appId ? { appId } : {}) };
+  }
+  if (userId.startsWith('cli_')) return { appId: userId };
+  return { openId: userId };
+}
+
 /** id_type across both shapes Lark uses (snake_case REST, camelCase legacy). */
 export function mentionIdType(m: any): string | undefined {
   if (!m || typeof m !== 'object') return undefined;
@@ -169,7 +198,7 @@ export function mentionAppId(m: any): string | undefined {
  * turn counts, including a leading @ of the answering bot (excluded later by
  * self open_id/app_id). Returns [] on non-post shapes / parse errors.
  */
-export function extractPostAtParticipants(message: { content?: string } | null | undefined): LarkMention[] {
+export function extractPostAtParticipants(message: { content?: string; mentions?: any[] } | null | undefined): LarkMention[] {
   const out: LarkMention[] = [];
   let content: any;
   try { content = JSON.parse(message?.content ?? '{}'); } catch { return out; }
@@ -180,15 +209,16 @@ export function extractPostAtParticipants(message: { content?: string } | null |
     if (!Array.isArray(para)) continue;
     for (const node of para) {
       if (node?.tag === 'at') {
-        const uid: string | undefined = typeof node.user_id === 'string' ? node.user_id : undefined;
+        const ident = resolvePostAtIdentity(node.user_id, message?.mentions);
+        const uid: string | undefined = ident?.openId ?? ident?.appId;
         const name: string | undefined = typeof node.user_name === 'string' ? node.user_name : undefined;
-        const isOpenId = !!uid && uid.startsWith('ou_');
-        const isAppId = !!uid && uid.startsWith('cli_');
+        const isOpenId = !!ident?.openId && ident.openId.startsWith('ou_');
+        const isAppId = !isOpenId && !!ident?.appId;
         out.push({
           key: `@_post_at_${seq}`,
           name: name ?? uid ?? '',
-          ...(isOpenId ? { openId: uid } : {}),
-          ...(isAppId ? { appId: uid } : {}),
+          ...(isOpenId ? { openId: ident!.openId } : {}),
+          ...(isAppId ? { appId: ident!.appId } : {}),
           idType: isAppId ? 'app_id' : 'open_id',
         });
       }
@@ -230,7 +260,7 @@ export function messageMentionsBot(
         for (const paragraph of inner.content) {
           if (!Array.isArray(paragraph)) continue;
           for (const node of paragraph) {
-            if (node?.tag === 'at' && node.user_id === botOpenId) return true;
+            if (node?.tag === 'at' && resolvePostAtIdentity(node.user_id, mentions)?.openId === botOpenId) return true;
           }
         }
       }
@@ -262,9 +292,12 @@ export function extractMentionIdentities(message: {
           // node.user_id against botOpenId), NOT a tenant user_id. Map it to
           // openId only — mislabeling it as userId would both miss a userId-only
           // target and pollute the userId leg with an open_id value.
+          const ident = resolvePostAtIdentity(node.user_id, message?.mentions);
+          if (!ident) continue;
           out.push({
             name: node.user_name,
-            openId: node.user_id,
+            ...(ident.openId ? { openId: ident.openId } : {}),
+            ...(ident.appId ? { appId: ident.appId } : {}),
           });
         }
       }

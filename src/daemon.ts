@@ -154,6 +154,10 @@ import {
   recordDurableGroupContextRecall,
 } from './services/durable-group-context-recall.js';
 import {
+  createDurableChatSessionlessStateAccess,
+  setDurableChatSessionlessState,
+} from './services/durable-chat-sessionless-state.js';
+import {
   createDurableConfigCoordinator,
   DURABLE_CONFIG_SCOPES,
   type DurableConfigInspection,
@@ -30095,6 +30099,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ownerId: `group-context-recall:${getDaemonBootId()}`,
       })
     : undefined;
+  // sessionless 命令的跨副本状态（授权卡 pending、代答开关、花名册）：同款 auxiliary_state facade。
+  const durableChatSessionlessFacade = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableGroupContextRecallFacade({
+        store: durableCoordinationRuntime.store,
+        ownerId: `chat-sessionless:${getDaemonBootId()}`,
+      })
+    : undefined;
+  if (durableChatSessionlessFacade && durableCoordinationRuntime) {
+    setDurableChatSessionlessState(createDurableChatSessionlessStateAccess({
+      facade: durableChatSessionlessFacade,
+      store: durableCoordinationRuntime.store,
+    }));
+  }
   const durableConfigCoordinator = durableCoordinationRuntime?.mode === 'primary'
     ? createDurableConfigCoordinator({
         store: durableCoordinationRuntime.store,
@@ -33608,6 +33625,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }
+    setDurableChatSessionlessState(undefined);
+    const durableChatSessionlessStop = await durableChatSessionlessFacade?.stop(durableStopBudget());
+    if (durableChatSessionlessStop?.kind === 'timed_out') {
+      logger.warn(
+        `[durable-chat-sessionless] facade stop timed out `
+        + `(pending=${durableChatSessionlessStop.pendingSessionKeys.length}, `
+        + `unreleased=${durableChatSessionlessStop.unreleasedSessionKeys.length})`,
+      );
+    }
     const durableRecallStop = await durableGroupContextRecallFacade?.stop(durableStopBudget());
     if (durableRecallStop?.kind === 'timed_out') {
       logger.warn(
@@ -33685,6 +33711,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     durableInboxShadowConsumer?.terminate();
     durableSessionFacade?.terminate();
     durableGroupContextRecallFacade?.terminate();
+    durableChatSessionlessFacade?.terminate();
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }

@@ -13,7 +13,7 @@
  * 从 grant-command.ts 提炼泛化（2026-07 /invite 落地时）；grant 的对外导出
  * （parseGrantTargets / isGrantTargetOnly / stripAllMentions）保持原样委托到这里。
  */
-import { mentionIdentity } from './message-parser.js';
+import { mentionIdentity, resolvePostAtIdentity } from './message-parser.js';
 
 /** 命令正则必须带 `\b` 边界、不带 g 标志（exec/index 语义依赖）。 */
 export type CommandPattern = RegExp;
@@ -98,23 +98,28 @@ function parsePostAtMentions(message: any, botOpenId: string | undefined, cmdPat
   if (!Array.isArray(inner?.content)) return out;
   // 先定位命令词文本节点的序号，再只收其后的 at 节点。
   let seq = 0, cmdSeq = -1;
-  const ats: Array<{ id: string; name: string; seq: number }> = [];
+  const ats: Array<{ openId?: string; appId?: string; name: string; seq: number }> = [];
   for (const para of inner.content) {
     if (!Array.isArray(para)) continue;
     for (const node of para) {
       if (cmdSeq < 0 && node?.tag === 'text' && cmdPattern.test(node.text ?? '')) cmdSeq = seq;
-      if (node?.tag === 'at' && node.user_id) ats.push({ id: node.user_id, name: node.user_name ?? node.user_id, seq });
+      if (node?.tag === 'at') {
+        // user_id 可能是 open_id、群外 bot 的 `cli_` app_id，或 `@_user_N` 占位符（真实 id 在
+        // message.mentions 同 key 条目里）；解析不出真实 id 的节点不能当目标，否则 /grant
+        // 会把占位符当 open_id 写进授权卡。
+        const ident = resolvePostAtIdentity(node.user_id, message?.mentions);
+        if (ident) ats.push({ ...ident, name: node.user_name ?? ident.openId ?? ident.appId ?? '', seq });
+      }
       seq++;
     }
   }
   for (const a of ats) {
-    if (a.id === botOpenId || seen.has(a.id)) continue;
+    const dedup = a.openId || a.appId!;
+    if ((a.openId && a.openId === botOpenId) || seen.has(dedup)) continue;
     if (cmdSeq >= 0 && a.seq <= cmdSeq) continue;   // 命令词之前 = 操作 bot 点名，剔除
-    seen.add(a.id);
-    // 群外 bot 的 at 节点 user_id 是 `cli_` 前缀 app_id（open_id 恒为 `ou_`，不冲突）→
-    // 归到 appId 让 /invite 直接拿去拉人；否则按 open_id（/grant、群内 bot）。
-    const isAppId = /^cli_/.test(a.id);
-    out.push(isAppId ? { openId: '', name: a.name, appId: a.id } : { openId: a.id, name: a.name });
+    seen.add(dedup);
+    // 群外 bot 只有 app_id → 归到 appId 让 /invite 直接拿去拉人；否则按 open_id（/grant、群内 bot）。
+    out.push(a.openId ? { openId: a.openId, name: a.name, ...(a.appId ? { appId: a.appId } : {}) } : { openId: '', name: a.name, appId: a.appId });
   }
   return out;
 }
@@ -205,8 +210,11 @@ export function isCommandTargetOnly(
       if (!Array.isArray(para)) continue;
       for (const node of para) {
         if (cmdSeq < 0 && node?.tag === 'text' && cmdPattern.test(node.text ?? '')) cmdSeq = seq;
-        // post at 节点：user_id 可能是本 bot 的 open_id（群内）或 app_id（cli_ 前缀，群外形态）。
-        if (mySeq < 0 && node?.tag === 'at' && node.user_id && (node.user_id === botOpenId || node.user_id === botAppId)) mySeq = seq;
+        // post at 节点：user_id 可能是本 bot 的 open_id（群内）、app_id（cli_ 前缀，群外形态）或 `@_user_N` 占位符。
+        if (mySeq < 0 && node?.tag === 'at') {
+          const ident = resolvePostAtIdentity(node.user_id, message?.mentions);
+          if (ident && ((!!botOpenId && ident.openId === botOpenId) || (!!botAppId && ident.appId === botAppId))) mySeq = seq;
+        }
         seq++;
       }
     }

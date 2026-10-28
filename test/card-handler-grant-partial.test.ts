@@ -38,7 +38,7 @@ vi.mock('../src/services/grant-store.js', async (importOriginal) => {
 const recordObservedMock = vi.fn();
 vi.mock('../src/services/observed-bots-store.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/services/observed-bots-store.js')>();
-  return { ...actual, recordObservedBots: (...a: any[]) => recordObservedMock(...a) };
+  return { ...actual, recordObservedBotsShared: async (...a: any[]) => recordObservedMock(...a) };
 });
 
 const deps = { activeSessions: new Map(), sessionReply: vi.fn(async () => 'mid'), lastRepoScan: new Map() } as any;

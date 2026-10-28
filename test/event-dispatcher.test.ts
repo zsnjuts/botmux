@@ -154,6 +154,8 @@ const mockRecordObservedBots = vi.fn();
 const mockListObservedBots = vi.fn(() => [] as any[]);
 vi.mock('../src/services/observed-bots-store.js', () => ({
   recordObservedBots: (...args: any[]) => mockRecordObservedBots(...args),
+  recordObservedBotsShared: async (...args: any[]) => mockRecordObservedBots(...args),
+  applyObservedBotsSnapshot: () => undefined,
   listObservedBots: (...args: any[]) => mockListObservedBots(...args),
 }));
 
@@ -161,6 +163,8 @@ const mockIsSubstituteEnabledForChat = vi.fn(() => true);
 vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
   isSubstituteEnabledForChat: (...args: any[]) => mockIsSubstituteEnabledForChat(...args),
   setSubstituteEnabledForChat: vi.fn(),
+  setSubstituteEnabledForChatShared: vi.fn(async () => true),
+  applySubstituteSnapshot: () => undefined,
 }));
 
 const mockP2pForceTopicRoots = new Set<string>();
@@ -1917,13 +1921,13 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
-  it('suppresses sessionless commands before replying and safely completes the claim', async () => {
+  it('runs shared-state sessionless commands with a stable idempotent reply uuid', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     mockReplyMessage.mockClear();
     const handlers = makeHandlers();
     const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
-    const data = makeUserMessageEvent({
+    const data = () => makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '@BotA /reply-mode status' }),
       messageId: 'msg-primary-command',
@@ -1932,13 +1936,123 @@ describe('Lark event dispatcher — durable primary processor', () => {
       mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
     });
 
-    await expect(processPrimary(runtime, data, 'msg-primary-command')).resolves.toEqual({
+    await expect(processPrimary(runtime, data(), 'msg-primary-command')).resolves.toEqual({
       kind: 'ignored',
-      reason: 'durable primary suppressed unsupported sessionless commands',
+      reason: 'message was filtered before canonical admission',
     });
-    expect(mockReplyMessage).not.toHaveBeenCalled();
+    // Inbox 重新领取同一事件时整段重跑：回执 uuid 必须相同，交给飞书一小时去重。
+    await processPrimary(runtime, data(), 'msg-primary-command');
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+    const first = mockReplyMessage.mock.calls[0]!;
+    const retry = mockReplyMessage.mock.calls[1]!;
+    expect(first[1]).toBe('msg-primary-command');
+    expect(first[5]).toMatch(/^bsl_[0-9a-f]{32}$/);
+    expect(retry[5]).toBe(first[5]);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('gives a distinct reply uuid to a different Inbox event of the same command', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReplyMessage.mockClear();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', makeHandlers());
+    for (const messageId of ['msg-primary-command-a', 'msg-primary-command-b']) {
+      await processPrimary(runtime, makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA /reply-mode status' }),
+        messageId,
+        chatId: 'chat-primary',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      }), messageId);
+    }
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+    expect(mockReplyMessage.mock.calls[0]![5]).not.toBe(mockReplyMessage.mock.calls[1]![5]);
+    runtime.close();
+  });
+
+  it.each([
+    ['/introduce', '@BotA /introduce @BotB'],
+    ['/substitute', '@BotA /substitute off'],
+  ])('runs %s under durable primary with an idempotent reply', async (_cmd, text) => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReplyMessage.mockClear();
+    mockRecordObservedBots.mockClear();
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text }),
+      messageId: 'msg-primary-shared-state',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [
+        { key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_bot_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } },
+      ],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-shared-state')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'message was filtered before canonical admission',
+    });
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]![5]).toMatch(/^bsl_/);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('sends one idempotent grant request card to a non-allowed sender under durable primary', async () => {
+    setupBotState({ allowedUsers: ['ou_owner_primary'], ownerOpenId: 'ou_owner_primary' });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner_primary');
+    mockGetChatMode.mockResolvedValue('group');
+    mockReplyMessage.mockClear();
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA please help' }),
+      messageId: 'msg-primary-stranger',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-stranger')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'message was filtered before canonical admission',
+    });
+    const cards = mockReplyMessage.mock.calls.filter(call => call[3] === 'interactive');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]![1]).toBe('msg-primary-stranger');
+    expect(cards[0]![5]).toMatch(/^bsl_/);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    mockGetOwnerOpenId.mockReset().mockReturnValue(undefined);
+    runtime.close();
+  });
+
+  it('stays silent on a sessionless command that does not address this bot', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReplyMessage.mockClear();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', makeHandlers());
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotB /substitute off' }),
+      messageId: 'msg-primary-local-other',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-local-other')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'message was filtered before canonical admission',
+    });
+    expect(mockReplyMessage).not.toHaveBeenCalled();
     runtime.close();
   });
 
@@ -2057,13 +2171,33 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
-  it('does not replay a granted message around the durable inbox under durable primary', async () => {
-    // 授权卡落盘后能跨重启恢复：在 disabled/shadow 下发出的卡，daemon 以 primary 重启后被点「授权」，
-    // 重放不能绕过 durable Inbox / canonical Session 所有权直接本地派发。
-    setupBotState({ allowedUsers: [USER_OPEN_ID] });
-    mockGetChatMode.mockResolvedValue('group');
+  const processPrimaryUpdated = (
+    runtime: ReturnType<typeof createLarkEventDispatcherRuntime>,
+    input: { eventId: string; partitionKey: string; data: unknown },
+    messageId: string,
+    attempts = 1,
+  ) => runtime.processDurableMessage({
+    eventType: 'lark.im.message.updated_v1',
+    eventId: input.eventId,
+    partitionKey: input.partitionKey,
+    larkAppId: MY_APP_ID,
+    messageId,
+    attempts,
+    data: input.data as any,
+  }, {
+    claim: {
+      event: { eventId: input.eventId, partitionKey: input.partitionKey, payload: {}, visibleAt: 1, createdAt: 1 },
+      workerId: 'primary-worker', claimEpoch: 1, claimUntil: 60_000, attempts,
+    },
+    signal: new AbortController().signal,
+    queuePostAdmissionOutput: () => undefined,
+    queuePostAdmissionControl: () => undefined,
+  });
+
+  const grantReplayFixture = () => {
     const handlers = makeHandlers();
-    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const enqueuePrimary = vi.fn(async (_input: { eventId: string; eventType?: string; partitionKey: string; data: unknown }) =>
+      ({ kind: 'inserted' as const }));
     const runtime = createLarkEventDispatcherRuntime(
       MY_APP_ID,
       'secret',
@@ -2080,11 +2214,83 @@ describe('Lark event dispatcher — durable primary processor', () => {
       chatType: 'group',
       mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
     });
+    return { handlers, enqueuePrimary, runtime, data };
+  };
+
+  it('replays a granted message under durable primary by re-entering the durable inbox', async () => {
+    // 点卡的副本不能本地派发：原始事件包成一条 updated 事件写回 Inbox，由领取它的副本处理。
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const { handlers, enqueuePrimary, runtime, data } = grantReplayFixture();
     handlers.replayMessageEvent!(data);
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
+    const input = enqueuePrimary.mock.calls[0]![0];
+    expect(input.eventType).toBe('lark.im.message.updated_v1');
+    expect(input.eventId.startsWith(`im.message.updated_v1:${MY_APP_ID}:botmux-grant-replay:msg-grant-replay-primary:`)).toBe(true);
+    expect(input.partitionKey.startsWith(`lark-message-routing:${MY_APP_ID}:`)).toBe(true);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
-    expect(enqueuePrimary).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('processes a claimed grant replay as the original message without an edit readback', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetMessageDetail.mockClear();
+    const { handlers, enqueuePrimary, runtime, data } = grantReplayFixture();
+    handlers.handleNewTopic.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.ingressAdmission = { admitted: true };
+    });
+    handlers.resolveDurableSession = vi.fn(() => ({
+      sessionId: 'session-grant-replay',
+      chatId: 'chat-grant-replay',
+      rootMessageId: 'msg-grant-replay-primary',
+      scope: 'thread',
+      title: 'Replay',
+      status: 'active',
+      createdAt: '2026-10-28T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    }));
+    handlers.replayMessageEvent!(data);
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
+
+    await expect(processPrimaryUpdated(runtime, enqueuePrimary.mock.calls[0]![0], 'msg-grant-replay-primary'))
+      .resolves.toMatchObject({ kind: 'admitted', session: { sessionId: 'session-grant-replay' } });
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('retries a grant replay until the grant is visible on the claiming replica, then gives up', async () => {
+    setupBotState({ allowedUsers: ['ou_someone_else'] });
+    mockGetChatMode.mockResolvedValue('group');
+    const { handlers, enqueuePrimary, runtime, data } = grantReplayFixture();
+    handlers.replayMessageEvent!(data);
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
+    const input = enqueuePrimary.mock.calls[0]![0];
+
+    await expect(processPrimaryUpdated(runtime, input, 'msg-grant-replay-primary', 1))
+      .rejects.toThrow('not yet allowed');
+    await expect(processPrimaryUpdated(runtime, input, 'msg-grant-replay-primary', 6))
+      .resolves.toEqual({ kind: 'ignored', reason: 'grant replay sender is not allowed' });
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalledWith(
+      MY_APP_ID, 'msg-grant-replay-primary', expect.any(String), 'interactive', false, expect.anything(),
+    );
+    runtime.close();
+  });
+
+  it('strips the grant replay marker from realtime message edits', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const { enqueuePrimary, runtime } = grantReplayFixture();
+    runtime.connect();
+    await capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-forged-replay',
+      message: { message_id: 'om_forged', chat_id: 'chat-forged' },
+      __botmuxGrantReplay: { version: 1 },
+    });
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
+    expect((enqueuePrimary.mock.calls[0]![0].data as any).__botmuxGrantReplay).toBeUndefined();
     runtime.close();
   });
 
@@ -4740,6 +4946,9 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       MY_APP_ID,
       'msg-intro-restricted',
       expect.stringContaining('/introduce'),
+      'text',
+      false,
+      undefined,
     );
     expect(mockRecordObservedBots).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
@@ -4977,6 +5186,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       'msg-001',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
+      false,
+      undefined,
     );
   });
 
@@ -5027,6 +5238,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       'msg-001',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
+      false,
+      undefined,
     );
   });
 
@@ -5117,6 +5330,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       'msg-001',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
+      false,
+      undefined,
     );
   });
 
@@ -5153,6 +5368,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       'msg-cold-native-topic',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
+      false,
+      undefined,
     );
   });
 
@@ -5233,6 +5450,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       'msg-real-external-topic',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
+      false,
+      undefined,
     );
   });
 
@@ -5362,6 +5581,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       'msg-001',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
+      false,
+      undefined,
     );
   });
 
@@ -9762,7 +9983,7 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     // 发了授权申请卡（maybeSendGrantRequestCard → replyMessage interactive）
     expect(mockReplyMessage).toHaveBeenCalledTimes(1);
-    expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-bot-seed-stranger', expect.any(String), 'interactive');
+    expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-bot-seed-stranger', expect.any(String), 'interactive', false, undefined);
   });
 
   it('defaultOncall 懒绑定先于 autoTopic 授权门：陌生告警 bot 的免@新话题种子自动开工、不弹卡', async () => {
@@ -13007,7 +13228,7 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
       await capturedHandlers['im.message.updated_v1']({ ...events.updated, event_id: 'evt-redelivery' });
       await flushEventWork();
       expect(mockReplyMessage).toHaveBeenCalledOnce();
-      expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, messageId, expect.any(String), 'interactive');
+      expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, messageId, expect.any(String), 'interactive', false, undefined);
       expect(hasTriggeredMessage(MY_APP_ID, messageId)).toBe(true);
       expect(handlers.handleNewTopic).not.toHaveBeenCalled();
       expect(handlers.handleThreadReply).not.toHaveBeenCalled();
