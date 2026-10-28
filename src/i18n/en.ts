@@ -924,6 +924,7 @@ export const messages: Record<string, string> = {
   'schedule.position_top_level': 'Execution position: group top level (session shape follows the regular-group mode)',
   'schedule.position_topic': 'Execution position: inside the current topic',
   'schedule.silent_note': 'Silent mode: fires post no "started" banner; the model only sends (botmux send) when the alert condition is met, otherwise stays fully silent',
+  'schedule.once_in_past': 'That one-time schedule was already in the past when you sent it, so no task was created. Pick a future time.',
   'schedule.parse_failed': 'Cannot parse schedule. Use a natural-language form:\n\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report\n/schedule hourly check service health\n/schedule every 30 minutes ping the service\n/schedule 1st of each month 9:00 generate monthly report\n\nManagement:\n/schedule list — list all tasks\n/schedule remove <id> — delete a task\n/schedule enable <id> — enable a task\n/schedule disable <id> — disable a task\n/schedule run <id> — run once now',
 
   // ─── /help ───────────────────────────────────────────────────────────────

@@ -6298,6 +6298,30 @@ describe('handleCommand', () => {
       );
     });
 
+    it('passes the message anchor to addTask and explains a one-shot already in the past', async () => {
+      const createTime = '1792907862000';
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        name: '提醒我',
+        prompt: '提醒我',
+        parsed: { kind: 'once', runAt: new Date(Number(createTime) - 60_000).toISOString(), display: 'once' },
+      } as any);
+      vi.mocked(scheduler.addTask).mockImplementationOnce(() => { throw new Error('once_schedule_in_past'); });
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/schedule',
+        ROOT_ID,
+        makeLarkMessage('/schedule 今天 08:00 提醒我', { createTime }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(vi.mocked(scheduler.addTask).mock.calls.at(-1)?.[0]).toMatchObject({ referenceTimeMs: Number(createTime) });
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as string;
+      expect(reply).toBe(t('schedule.once_in_past', undefined, 'zh'));
+    });
+
     it('does not normalize a missing platform create_time to Unix epoch', async () => {
       vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
       const ds = makeDaemonSession();

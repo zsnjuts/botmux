@@ -268,6 +268,20 @@ function recordRuntimeCalendarCheck(
   mutateRuntimeTask(id, task => ({ ...task, lastCalendarCheck: check }));
 }
 
+function expireUnschedulableOnce(id: string): void {
+  const task = runtimeTask(id);
+  if (!task || !task.enabled) return;
+  logger.warn(`[scheduler] One-shot task ${id} run time ${task.parsed.runAt ?? '?'} passed before it could be scheduled; disabling`);
+  mutateRuntimeTask(id, current => ({
+    ...current,
+    enabled: false,
+    disabledReason: 'once_completed',
+    nextRunAt: undefined,
+    lastStatus: 'error',
+    lastError: 'once_schedule_missed: run time passed before the task could be scheduled',
+  }));
+}
+
 function markRuntimeRun(
   id: string,
   success: boolean,
@@ -714,6 +728,29 @@ export function computeNextRun(parsed: ParsedSchedule, lastRunAt?: string): stri
   return null;
 }
 
+/**
+ * First nextRunAt for a task being created. Relative one-shots are anchored to
+ * the source message (`referenceTimeMs`), so a slow model turn or a delayed
+ * inbox can finish creation after the target already passed — beyond the
+ * one-shot grace `computeNextRun` would return null and the task would sit
+ * active but never fire. A target that was still in the future when the user
+ * asked fires once immediately instead; a target already in the past at that
+ * moment (or with no anchor) is rejected rather than stored as a dead task.
+ */
+export function computeInitialNextRun(
+  parsed: ParsedSchedule,
+  referenceTimeMs?: number,
+  nowMs = Date.now(),
+): string | undefined {
+  const next = computeNextRun(parsed);
+  if (next || parsed.kind !== 'once') return next ?? undefined;
+  const runAtMs = parsed.runAt ? Date.parse(parsed.runAt) : Number.NaN;
+  if (Number.isFinite(runAtMs) && referenceTimeMs !== undefined && runAtMs >= referenceTimeMs) {
+    return new Date(nowMs).toISOString();
+  }
+  throw new Error('once_schedule_in_past');
+}
+
 /** Compute grace window (how late a missed run can be and still catch up) */
 function computeGraceSeconds(parsed: ParsedSchedule): number {
   let periodSec: number;
@@ -760,7 +797,12 @@ async function tick(): Promise<void> {
     if (!nextRunAt) {
       // Recover: compute from parsed + lastRunAt
       const recovered = computeNextRun(task.parsed, task.lastRunAt);
-      if (!recovered) continue;
+      if (!recovered) {
+        // A never-run one-shot with no computable run time would otherwise
+        // stay active forever without firing or reporting anything.
+        if (task.parsed.kind === 'once' && !task.lastRunAt) expireUnschedulableOnce(task.id);
+        continue;
+      }
       nextRunAt = recovered;
       mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt }));
     }
@@ -1046,7 +1088,7 @@ export function addTask(params: {
   if (!calendar && dayType === 'restday') throw new Error('calendar_required');
   const calendarDayType = calendar && dayType === 'restday' ? dayType : undefined;
   if (calendar && parsed.kind === 'once') throw new Error('calendar_once_unsupported');
-  const nextRunAt = computeNextRun(parsed) ?? undefined;
+  const nextRunAt = computeInitialNextRun(parsed, params.referenceTimeMs);
   const executionPosition: ScheduleExecutionPosition = params.executionPosition
     ?? (params.deliver === 'new-topic'
       ? 'new-topic'
@@ -1204,7 +1246,7 @@ export function commitDelegatedTask(input: {
     ownerUnionId: undefined,
     enabled: true,
     createdAt,
-    nextRunAt: computeNextRun(parsed) ?? undefined,
+    nextRunAt: computeInitialNextRun(parsed, params.referenceTimeMs),
     repeat: params.repeat,
     deliver: 'origin',
     silent: params.silent === true ? true : undefined,

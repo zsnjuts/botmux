@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/scheduler.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode, extractSilentMode, extractScheduleModifiers, planCronRealign } from '../src/core/scheduler.js';
+import { parseNaturalSchedule, parseSchedule, computeNextRun, computeInitialNextRun, extractDeliveryMode, extractSilentMode, extractScheduleModifiers, planCronRealign } from '../src/core/scheduler.js';
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
@@ -756,7 +756,6 @@ describe('computeNextRun', () => {
     const next = computeNextRun({ kind: 'once', runAt: past, display: 'once' });
     expect(next).toBeNull();
   });
-
   it('cron: next wall-clock occurrence under an explicit pinned schedule timezone', () => {
     // 0 9 * * * — daily at 09:00. computeNextRun uses scheduleTimeZone() (env →
     // config → host). Here we PIN BOTMUX_SCHEDULE_TIMEZONE to the JS runtime host
@@ -778,6 +777,32 @@ describe('computeNextRun', () => {
       if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
       else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
     }
+  });
+});
+
+describe('computeInitialNextRun', () => {
+  const now = Date.parse('2026-10-28T12:10:00Z');
+
+  it('once: keeps a future runAt', () => {
+    const runAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    expect(computeInitialNextRun({ kind: 'once', runAt, display: 'once' }, Date.parse(runAt) - 60_000)).toBe(runAt);
+  });
+
+  it('once: runs immediately when the anchored target passed before the task was created', () => {
+    // 消息 12:00 发出「2 分钟后」，排队到 12:10 才建任务：目标 12:02 已过但晚于锚点。
+    const parsed = { kind: 'once' as const, runAt: '2026-10-28T12:02:00.000Z', display: 'once' };
+    expect(computeInitialNextRun(parsed, Date.parse('2026-10-28T12:00:00Z'), now)).toBe(new Date(now).toISOString());
+  });
+
+  it('once: rejects a target already past when it was requested', () => {
+    const parsed = { kind: 'once' as const, runAt: '2026-10-28T11:00:00.000Z', display: 'once' };
+    expect(() => computeInitialNextRun(parsed, Date.parse('2026-10-28T12:00:00Z'), now)).toThrow('once_schedule_in_past');
+    expect(() => computeInitialNextRun(parsed, undefined, now)).toThrow('once_schedule_in_past');
+  });
+
+  it('interval: unaffected by the anchor', () => {
+    const next = computeInitialNextRun({ kind: 'interval', minutes: 10, display: '每 10 分钟' }, 0, now);
+    expect(next).toBeTruthy();
   });
 });
 
