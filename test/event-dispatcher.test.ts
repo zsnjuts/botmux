@@ -1917,13 +1917,13 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
-  it('suppresses sessionless commands before replying and safely completes the claim', async () => {
+  it('runs shared-state sessionless commands with a stable idempotent reply uuid', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     mockReplyMessage.mockClear();
     const handlers = makeHandlers();
     const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
-    const data = makeUserMessageEvent({
+    const data = () => makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '@BotA /reply-mode status' }),
       messageId: 'msg-primary-command',
@@ -1932,13 +1932,94 @@ describe('Lark event dispatcher — durable primary processor', () => {
       mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
     });
 
-    await expect(processPrimary(runtime, data, 'msg-primary-command')).resolves.toEqual({
+    await expect(processPrimary(runtime, data(), 'msg-primary-command')).resolves.toEqual({
       kind: 'ignored',
-      reason: 'durable primary suppressed unsupported sessionless commands',
+      reason: 'message was filtered before canonical admission',
     });
-    expect(mockReplyMessage).not.toHaveBeenCalled();
+    // Inbox 重新领取同一事件时整段重跑：回执 uuid 必须相同，交给飞书一小时去重。
+    await processPrimary(runtime, data(), 'msg-primary-command');
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+    const first = mockReplyMessage.mock.calls[0]!;
+    const retry = mockReplyMessage.mock.calls[1]!;
+    expect(first[1]).toBe('msg-primary-command');
+    expect(first[5]).toMatch(/^bsl_[0-9a-f]{32}$/);
+    expect(retry[5]).toBe(first[5]);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('gives a distinct reply uuid to a different Inbox event of the same command', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReplyMessage.mockClear();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', makeHandlers());
+    for (const messageId of ['msg-primary-command-a', 'msg-primary-command-b']) {
+      await processPrimary(runtime, makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA /reply-mode status' }),
+        messageId,
+        chatId: 'chat-primary',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      }), messageId);
+    }
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+    expect(mockReplyMessage.mock.calls[0]![5]).not.toBe(mockReplyMessage.mock.calls[1]![5]);
+    runtime.close();
+  });
+
+  it.each([
+    ['/introduce', '@BotA /introduce @BotB'],
+    ['/substitute', '@BotA /substitute off'],
+  ])('answers an addressed %s visibly instead of writing Pod-local state', async (cmd, text) => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReplyMessage.mockClear();
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text }),
+      messageId: 'msg-primary-local-state',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [
+        { key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_bot_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } },
+      ],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-local-state')).resolves.toEqual({
+      kind: 'ignored',
+      reason: `durable primary suppressed unsupported sessionless command ${cmd}`,
+    });
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]![2]).toContain(cmd);
+    expect(mockReplyMessage.mock.calls[0]![5]).toMatch(/^bsl_/);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('stays silent on a Pod-local-state command that does not address this bot', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReplyMessage.mockClear();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', makeHandlers());
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotB /substitute off' }),
+      messageId: 'msg-primary-local-other',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-local-other')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'durable primary suppressed unsupported sessionless command /substitute',
+    });
+    expect(mockReplyMessage).not.toHaveBeenCalled();
     runtime.close();
   });
 
@@ -13007,7 +13088,7 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
       await capturedHandlers['im.message.updated_v1']({ ...events.updated, event_id: 'evt-redelivery' });
       await flushEventWork();
       expect(mockReplyMessage).toHaveBeenCalledOnce();
-      expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, messageId, expect.any(String), 'interactive');
+      expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, messageId, expect.any(String), 'interactive', false, undefined);
       expect(hasTriggeredMessage(MY_APP_ID, messageId)).toBe(true);
       expect(handlers.handleNewTopic).not.toHaveBeenCalled();
       expect(handlers.handleThreadReply).not.toHaveBeenCalled();

@@ -1,5 +1,6 @@
 import { localeForBot } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
+import type { SessionlessReplyKeys } from './sessionless-reply-keys.js';
 import { isBotMentioned, canOperate, extractMessageTextForRouting } from './event-dispatcher.js';
 import { replyMessage } from './client.js';
 import { stripLeadingMentions } from './message-parser.js';
@@ -71,6 +72,7 @@ export async function tryHandleChatTabsCommand(
   message: any,
   senderOpenId: string | undefined,
   canTalk: boolean,
+  replyKeys?: SessionlessReplyKeys,
 ): Promise<boolean> {
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
@@ -86,7 +88,7 @@ export async function tryHandleChatTabsCommand(
   const locale = localeForBot(larkAppId);
   const s = strings(locale);
   const reply = (content: string) => messageId
-    ? replyMessage(larkAppId, messageId, content, 'text', false)
+    ? replyMessage(larkAppId, messageId, content, 'text', false, replyKeys?.next())
         .catch(err => logger.warn(`[chat-tabs] reply failed: ${err?.message ?? err}`))
     : Promise.resolve();
 

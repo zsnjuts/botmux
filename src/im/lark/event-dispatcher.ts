@@ -23,7 +23,7 @@ import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } fro
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
-import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
+import { commandPrecedesMentions } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
@@ -45,7 +45,8 @@ import {
 } from '../../setup/verify-permissions.js';
 import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
-import { isGrantTargetOnly, tryHandleGrantCommand } from './grant-command.js';
+import { hasAnyTargetMention, tryHandleGrantCommand } from './grant-command.js';
+import { createSessionlessReplyKeys } from './sessionless-reply-keys.js';
 import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
@@ -4771,29 +4772,35 @@ export function createLarkEventDispatcherRuntime(
     reason: `durable primary suppressed unsupported ${feature}`,
   });
 
-  const isUnsupportedPrimarySessionlessCommand = (
+  /**
+   * Durable primary 下仍不能执行的 sessionless 命令：它们的状态还落在 Pod 本地
+   * （/introduce 的花名册、/substitute 的群开关），多副本时别的副本读不到。
+   * 返回命令名表示需要拦截；addressed 表示命令点名了本 bot（私聊或被 @），此时要
+   * 给出可见的不支持回执，否则只静默放手（命令不是发给本 bot 的）。
+   * /grant、/revoke、/reply-mode、/mention-mode、/tabs、/invite 的状态在共享的
+   * bots.json（durable config CAS）或飞书侧，primary 下照常执行，回执用
+   * sessionless-reply-keys 去重。
+   */
+  const primaryUnsupportedSessionlessCommand = (
     message: any,
     senderOpenId: string | undefined,
-  ): boolean => {
+  ): { command: string; addressed: boolean } | undefined => {
+    const rawText = extractMessageTextForRouting(message);
+    if (!rawText) return undefined;
+    const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
+    const match = /^\/(introduce|substitute)(?:\s|$)/i.exec(text);
+    if (!match) return undefined;
+    const addressed = message.chat_type === 'p2p' || isBotMentioned(larkAppId, message, senderOpenId);
+    return { command: `/${match[1]!.toLowerCase()}`, addressed };
+  };
+
+  /** 点名授权 `/grant @x`：授权卡 pending 仍是 Pod 本地状态（见 grant-pending.ts）。 */
+  const isPrimaryTargetedGrant = (message: any): boolean => {
     const rawText = extractMessageTextForRouting(message);
     if (!rawText) return false;
     const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-    if (/^\/introduce(?:\s|$)/i.test(text)) return true;
-    const match = /^\/(reply-mode|tabs?|mention-mode|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
-    if (!match) return false;
-    const command = match[1]!.toLowerCase();
-    if (message.chat_type !== 'p2p' && !isBotMentioned(larkAppId, message, senderOpenId)) {
-      return false;
-    }
-    if ((command === 'grant' || command === 'revoke')
-        && isGrantTargetOnly(message, getBotOpenId(larkAppId), larkAppId)) {
-      return false;
-    }
-    if (command === 'invite'
-        && isCommandTargetOnly(message, getBotOpenId(larkAppId), /\/invite\b/i, larkAppId)) {
-      return false;
-    }
-    return true;
+    return /^\/grant(?:\s|$)/i.test(text)
+      && hasAnyTargetMention(message, getBotOpenId(larkAppId));
   };
 
   async function processMessageEvent(
@@ -5164,8 +5171,26 @@ export function createLarkEventDispatcherRuntime(
       const senderOpenId = sender?.sender_id?.open_id as string | undefined;
       // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMember）要用。
       let humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
-      if (primary && isUnsupportedPrimarySessionlessCommand(message, senderOpenId)) {
-        return ignoredUnsupportedPrimarySideEffect('sessionless commands');
+      const sessionlessReplyKeys = primary
+        ? createSessionlessReplyKeys(larkAppId, primary.message.eventId)
+        : undefined;
+      if (primary) {
+        const unsupported = primaryUnsupportedSessionlessCommand(message, senderOpenId);
+        if (unsupported) {
+          if (unsupported.addressed) {
+            await replyMessage(
+              larkAppId,
+              messageId,
+              t('cmd.primary_sessionless_unsupported', { cmd: unsupported.command }, localeForBot(larkAppId)),
+              'text',
+              false,
+              sessionlessReplyKeys?.next(),
+            ).catch(err => logger.warn(
+              `[${larkAppId}] primary unsupported ${unsupported.command} reply failed: ${err}`,
+            ));
+          }
+          return ignoredUnsupportedPrimarySideEffect(`sessionless command ${unsupported.command}`);
+        }
       }
       await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
@@ -5208,15 +5233,15 @@ export function createLarkEventDispatcherRuntime(
         return;
       }
 
-      if (await tryHandleReplyModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+      if (await tryHandleReplyModeCommand(larkAppId, message, senderOpenId, isAllowed, sessionlessReplyKeys)) {
         return;
       }
 
-      if (await tryHandleChatTabsCommand(larkAppId, message, senderOpenId, isAllowed)) {
+      if (await tryHandleChatTabsCommand(larkAppId, message, senderOpenId, isAllowed, sessionlessReplyKeys)) {
         return;
       }
 
-      if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+      if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed, sessionlessReplyKeys)) {
         return;
       }
 
@@ -5226,13 +5251,16 @@ export function createLarkEventDispatcherRuntime(
 
       // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
       // 否则会被当成 prompt 喂给 CLI 会话。
-      if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
+      if (await tryHandleGrantCommand(larkAppId, message, senderOpenId, {
+        replyKeys: sessionlessReplyKeys,
+        targetedGrantUnsupported: primary ? isPrimaryTargetedGrant(message) : false,
+      })) {
         return;
       }
 
       // /invite — 把群外 bot 拉进本群的元命令。与 /grant 同款拦截模型（仅 owner，
       // 需明确 @ 本 bot），防止进路由/spawn，也防多 bot 重复执行拉人。
-      if (await tryHandleInviteCommand(larkAppId, message, senderOpenId)) {
+      if (await tryHandleInviteCommand(larkAppId, message, senderOpenId, sessionlessReplyKeys)) {
         return;
       }
 

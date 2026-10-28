@@ -19,12 +19,14 @@ import { isSessionGroup } from '../../services/session-groups-store.js';
 import { findConfigField, applyConfigField } from '../../services/bot-config-store.js';
 import { getBot } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
+import type { SessionlessReplyKeys } from './sessionless-reply-keys.js';
 
 export async function tryHandleReplyModeCommand(
   larkAppId: string,
   message: any,
   senderOpenId: string | undefined,
   canTalk: boolean,
+  replyKeys?: SessionlessReplyKeys,
 ): Promise<boolean> {
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
@@ -41,7 +43,7 @@ export async function tryHandleReplyModeCommand(
   const messageId: string | undefined = message.message_id;
   const loc = localeForBot(larkAppId);
   const reply = (content: string) => messageId
-    ? replyMessage(larkAppId, messageId, content, 'text', false)
+    ? replyMessage(larkAppId, messageId, content, 'text', false, replyKeys?.next())
         .catch(err => logger.warn(`[reply-mode] reply failed: ${err?.message ?? err}`))
     : Promise.resolve();
   const arg = match[1]?.trim().toLowerCase();
