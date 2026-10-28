@@ -6,7 +6,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { startLarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
@@ -24,7 +24,7 @@ import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions } from './mention-targets.js';
-import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
+import { recordObservedBotsShared, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
@@ -45,8 +45,9 @@ import {
 } from '../../setup/verify-permissions.js';
 import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
-import { hasAnyTargetMention, tryHandleGrantCommand } from './grant-command.js';
-import { createSessionlessReplyKeys } from './sessionless-reply-keys.js';
+import { tryHandleGrantCommand } from './grant-command.js';
+import { createSessionlessReplyKeys, type SessionlessReplyKeys } from './sessionless-reply-keys.js';
+import { hydrateChatSessionlessState } from '../../services/chat-sessionless-sync.js';
 import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
@@ -55,7 +56,7 @@ import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice } from './grant-pending.js';
+import { grantPendingStore, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
 import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
@@ -1088,6 +1089,12 @@ function cardActionMessageId(data: any): string | undefined {
   return data?.context?.open_message_id ?? data?.open_message_id;
 }
 
+/** primary 授权后重放：写回 Inbox 的 updated 事件上的标记字段与事件 id 片段，见 replayMessageEvent。 */
+const GRANT_REPLAY_MARKER = '__botmuxGrantReplay';
+const GRANT_REPLAY_EVENT_TAG = 'botmux-grant-replay';
+/** 等待授权在领取副本上生效的最多领取次数（Inbox 默认每次间隔 5s）。 */
+const GRANT_REPLAY_MAX_ATTEMPTS = 6;
+
 const PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS = new Set([
   'close',
   'restart',
@@ -1582,6 +1589,7 @@ export async function tryHandleIntroduceCommand(
   larkAppId: string,
   message: any,
   senderOpenId: string | undefined,
+  replyKeys?: SessionlessReplyKeys,
 ): Promise<boolean> {
   const text = extractMessageTextForRouting(message);
   if (!text) return false;
@@ -1595,7 +1603,7 @@ export async function tryHandleIntroduceCommand(
     const loc = localeForBot(larkAppId);
     await replyMessage(larkAppId, message.message_id, JSON.stringify({
       text: t('cmd.grant_restricted', { cmd: '/introduce' }, loc),
-    })).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
+    }), 'text', false, replyKeys?.next()).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
     return true;
   }
 
@@ -1622,7 +1630,7 @@ export async function tryHandleIntroduceCommand(
     // Persist to the observer-scoped store: these open_ids are scoped to the
     // receiving app (larkAppId), so they're correct for THIS daemon to use
     // when @-mentioning back.
-    recordObservedBots(config.session.dataDir, larkAppId, chatId, bots, 'introduce');
+    await recordObservedBotsShared(config.session.dataDir, larkAppId, chatId, bots, 'introduce');
   } catch (err) {
     logger.warn(`[${larkAppId}] /introduce: failed to persist observed bots: ${err}`);
   }
@@ -1632,7 +1640,7 @@ export async function tryHandleIntroduceCommand(
     ? `✅ 已认识本群 ${externalBots.length} 个伙伴：${externalBots.map(m => `@${m.name}`).join(' ')}`
     : `ℹ️ 没有可登记的机器人（/introduce 只登记机器人，@ 的若是真人会被忽略）`;
   try {
-    await replyMessage(larkAppId, message.message_id, ackText);
+    await replyMessage(larkAppId, message.message_id, ackText, 'text', false, replyKeys?.next());
   } catch (err) {
     logger.warn(`[${larkAppId}] /introduce ack failed: ${err}`);
   }
@@ -2351,8 +2359,9 @@ export function canRunDaemonCommand(
  */
 export async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined, messageData?: any,
-  opts?: { notifyThrottledRequester?: boolean },
+  opts?: { notifyThrottledRequester?: boolean; replyKeys?: SessionlessReplyKeys },
 ): Promise<void> {
+  const replyKeys = opts?.replyKeys;
   // 黑名单用户静默：不弹授权申请卡、不开 pending、不触发任何回复（P1c）。
   // 必须在 autoGrantRequestCards / owner / 节流等一切判定之前短路。
   if (requesterOpenId && evaluateTalk(larkAppId, chatId, requesterOpenId).reason === 'blocked') return;
@@ -2367,8 +2376,8 @@ export async function maybeSendGrantRequestCard(
     logSilentGrantDrop(larkAppId, chatId, requesterOpenId, 'no resolved admin in allowedUsers');
     return;
   }
-  if (isThrottled(larkAppId, chatId, requesterOpenId)) {
-    if (opts?.notifyThrottledRequester) await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId);
+  if (await grantPendingStore.isThrottled(larkAppId, chatId, requesterOpenId)) {
+    if (opts?.notifyThrottledRequester) await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId, replyKeys);
     return;
   }
   const chatType: 'p2p' | 'group' = message?.chat_type === 'p2p' ? 'p2p' : 'group';
@@ -2398,28 +2407,31 @@ export async function maybeSendGrantRequestCard(
   const botConfig = getBot(larkAppId).config;
   const quota = botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
   const durationMs = botConfig.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS;
-  const nonce = openPending(
+  // primary 下 open 失败（共享记录写不进）直接抛出：Inbox 会重领这条消息再试一次。
+  const nonce = await grantPendingStore.open(
     larkAppId,
     chatId,
-    requesterOpenId,
+    [requesterOpenId],
     quota,
     messageData,
     durationMs,
+    replyKeys?.stable('grant-request-card'),
   );
   const loc = localeForBot(larkAppId);
   if (route?.delivery === 'dm' || chatType === 'p2p') {
     const delivery = chatType === 'p2p' ? 'dm_p2p' : 'dm_group';
     const sentToDm = await sendGrantRequestToApproverDm({
       larkAppId, chatId, requesterOpenId, name: String(name), approver, nonce, quota, durationMs, delivery,
+      uuid: replyKeys?.next(),
     });
     if (sentToDm) {
       // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
-      markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
-      await replyMessage(larkAppId, message.message_id, t('card.grant.request_forwarded', undefined, loc))
+      await grantPendingStore.markDelivered(larkAppId, chatId, [requesterOpenId], nonce);
+      await replyMessage(larkAppId, message.message_id, t('card.grant.request_forwarded', undefined, loc), 'text', false, replyKeys?.next())
         .catch(err => logger.debug(`grant request forwarded ack failed: ${err}`));
       return;
     }
-    clearPending(larkAppId, chatId, requesterOpenId);
+    await grantPendingStore.clear(larkAppId, chatId, requesterOpenId);
     return;
   }
   const card = buildGrantCard(
@@ -2435,16 +2447,16 @@ export async function maybeSendGrantRequestCard(
     loc,
   );
   try {
-    await replyMessage(larkAppId, message.message_id, card, 'interactive');
+    await replyMessage(larkAppId, message.message_id, card, 'interactive', false, replyKeys?.next());
   } catch (err) {
     // 发卡失败必须撤掉刚开的 pending，否则该发送方被节流压死、owner 永远看不到卡片，
     // 只能等 daemon 重启或别的 target 触发全表 prune 才恢复。清掉后下次 @ 会重试发卡。
-    clearPending(larkAppId, chatId, requesterOpenId);
+    await grantPendingStore.clear(larkAppId, chatId, requesterOpenId);
     logger.debug(`grant request card send failed: ${err}`);
     return;
   }
   // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
-  markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
+  await grantPendingStore.markDelivered(larkAppId, chatId, [requesterOpenId], nonce);
 }
 
 function logSilentGrantDrop(
@@ -2455,9 +2467,9 @@ function logSilentGrantDrop(
 
 /** 申请人在申请卡待处理 / 刚被拒绝期间又来找 bot：回一句原因，免得 ta 以为 bot 坏了。 */
 async function replyThrottledRequester(
-  larkAppId: string, message: any, chatId: string, requesterOpenId: string,
+  larkAppId: string, message: any, chatId: string, requesterOpenId: string, replyKeys?: SessionlessReplyKeys,
 ): Promise<void> {
-  const notice = claimThrottleNotice(larkAppId, chatId, requesterOpenId);
+  const notice = await grantPendingStore.claimThrottleNotice(larkAppId, chatId, requesterOpenId);
   if (!notice) return;
   const text = t(
     notice.reason === 'pending' ? 'card.grant.request_still_pending' : 'card.grant.request_recently_denied',
@@ -2465,7 +2477,7 @@ async function replyThrottledRequester(
     localeForBot(larkAppId),
   );
   try {
-    await replyMessage(larkAppId, message.message_id, text);
+    await replyMessage(larkAppId, message.message_id, text, 'text', false, replyKeys?.next());
   } catch (err) {
     notice.release();
     logger.debug(`grant throttle notice failed: ${err}`);
@@ -2483,6 +2495,7 @@ async function sendGrantRequestToApproverDm(o: {
   quota: number | undefined;
   durationMs: number | undefined;
   delivery: 'dm_p2p' | 'dm_group';
+  uuid?: string;
 }): Promise<boolean> {
   const reservedAt = Date.now();
   if (!tryReserveOwnerDmSlot(o.larkAppId, o.approver, reservedAt)) {
@@ -2507,7 +2520,7 @@ async function sendGrantRequestToApproverDm(o: {
     localeForBot(o.larkAppId),
   );
   try {
-    await sendUserMessage(o.larkAppId, o.approver, card, 'interactive');
+    await sendUserMessage(o.larkAppId, o.approver, card, 'interactive', o.uuid);
     logger.info(`[grant:${o.larkAppId}] request card forwarded to approver DM (${o.delivery}) for ${o.requesterOpenId.substring(0, 12)} in ${o.chatId.substring(0, 12)}`);
     return true;
   } catch (err) {
@@ -4772,37 +4785,6 @@ export function createLarkEventDispatcherRuntime(
     reason: `durable primary suppressed unsupported ${feature}`,
   });
 
-  /**
-   * Durable primary 下仍不能执行的 sessionless 命令：它们的状态还落在 Pod 本地
-   * （/introduce 的花名册、/substitute 的群开关），多副本时别的副本读不到。
-   * 返回命令名表示需要拦截；addressed 表示命令点名了本 bot（私聊或被 @），此时要
-   * 给出可见的不支持回执，否则只静默放手（命令不是发给本 bot 的）。
-   * /grant、/revoke、/reply-mode、/mention-mode、/tabs、/invite 的状态在共享的
-   * bots.json（durable config CAS）或飞书侧，primary 下照常执行，回执用
-   * sessionless-reply-keys 去重。
-   */
-  const primaryUnsupportedSessionlessCommand = (
-    message: any,
-    senderOpenId: string | undefined,
-  ): { command: string; addressed: boolean } | undefined => {
-    const rawText = extractMessageTextForRouting(message);
-    if (!rawText) return undefined;
-    const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-    const match = /^\/(introduce|substitute)(?:\s|$)/i.exec(text);
-    if (!match) return undefined;
-    const addressed = message.chat_type === 'p2p' || isBotMentioned(larkAppId, message, senderOpenId);
-    return { command: `/${match[1]!.toLowerCase()}`, addressed };
-  };
-
-  /** 点名授权 `/grant @x`：授权卡 pending 仍是 Pod 本地状态（见 grant-pending.ts）。 */
-  const isPrimaryTargetedGrant = (message: any): boolean => {
-    const rawText = extractMessageTextForRouting(message);
-    if (!rawText) return false;
-    const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-    return /^\/grant(?:\s|$)/i.test(text)
-      && hasAnyTargetMention(message, getBotOpenId(larkAppId));
-  };
-
   async function processMessageEvent(
     data: any,
     seedRoutingGate?: { ready: Promise<void>; complete: () => void },
@@ -5028,13 +5010,13 @@ export function createLarkEventDispatcherRuntime(
               if (!seedBotTalk.allowed) {
                 // 黑名单 bot 静默吞掉：不自动开工、不发授权卡、不做 sibling 自愈。
                 if (seedBotTalk.reason === 'blocked') return;
-                if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
                 logger.info(
                   `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题但未授权（restricted）→ 发授权卡不自动开工 ` +
                   `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
                 );
-                await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data)
-                  .catch(err => logger.error(`Error sending grant card for foreign-bot new topic: ${err}`));
+                await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, {
+                  replyKeys: primary ? createSessionlessReplyKeys(larkAppId, primary.message.eventId) : undefined,
+                }).catch(err => logger.error(`Error sending grant card for foreign-bot new topic: ${err}`));
                 return;
               }
               logger.info(
@@ -5142,8 +5124,9 @@ export function createLarkEventDispatcherRuntime(
             logger.info(`Lazy sibling cross-ref backfill: ${sibling.botName} → ${senderOpenId?.substring(0, 12)} (was cold; skipping /grant)`);
           } else {
             logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
-            if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, {
+              replyKeys: primary ? createSessionlessReplyKeys(larkAppId, primary.message.eventId) : undefined,
+            });
             return;
           }
         }
@@ -5174,24 +5157,6 @@ export function createLarkEventDispatcherRuntime(
       const sessionlessReplyKeys = primary
         ? createSessionlessReplyKeys(larkAppId, primary.message.eventId)
         : undefined;
-      if (primary) {
-        const unsupported = primaryUnsupportedSessionlessCommand(message, senderOpenId);
-        if (unsupported) {
-          if (unsupported.addressed) {
-            await replyMessage(
-              larkAppId,
-              messageId,
-              t('cmd.primary_sessionless_unsupported', { cmd: unsupported.command }, localeForBot(larkAppId)),
-              'text',
-              false,
-              sessionlessReplyKeys?.next(),
-            ).catch(err => logger.warn(
-              `[${larkAppId}] primary unsupported ${unsupported.command} reply failed: ${err}`,
-            ));
-          }
-          return ignoredUnsupportedPrimarySideEffect(`sessionless command ${unsupported.command}`);
-        }
-      }
       await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
       // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
@@ -5229,7 +5194,7 @@ export function createLarkEventDispatcherRuntime(
       // so the command never reaches a CLI session (each @ed bot's daemon
       // independently records the mentions[] open_ids + names). 无需授权：
       // 任何人都能登记花名册（只记 observed，不授予任何权限）。
-      if (await tryHandleIntroduceCommand(larkAppId, message, senderOpenId)) {
+      if (await tryHandleIntroduceCommand(larkAppId, message, senderOpenId, sessionlessReplyKeys)) {
         return;
       }
 
@@ -5245,16 +5210,13 @@ export function createLarkEventDispatcherRuntime(
         return;
       }
 
-      if (await tryHandleSubstituteCommand(larkAppId, message, senderOpenId)) {
+      if (await tryHandleSubstituteCommand(larkAppId, message, senderOpenId, sessionlessReplyKeys)) {
         return;
       }
 
       // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
       // 否则会被当成 prompt 喂给 CLI 会话。
-      if (await tryHandleGrantCommand(larkAppId, message, senderOpenId, {
-        replyKeys: sessionlessReplyKeys,
-        targetedGrantUnsupported: primary ? isPrimaryTargetedGrant(message) : false,
-      })) {
+      if (await tryHandleGrantCommand(larkAppId, message, senderOpenId, { replyKeys: sessionlessReplyKeys })) {
         return;
       }
 
@@ -5759,8 +5721,10 @@ export function createLarkEventDispatcherRuntime(
             // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
             // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
             // 卡已在等处理 / 刚被拒绝时不再发卡，改回申请人一句原因（每张卡一次）。
-            if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, { notifyThrottledRequester: true });
+            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, {
+              notifyThrottledRequester: true,
+              replyKeys: sessionlessReplyKeys,
+            });
             logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId} (grant request card path)`);
             return;
           }
@@ -5801,8 +5765,10 @@ export function createLarkEventDispatcherRuntime(
         // 授权后重放这条消息；blocked / autoGrantRequestCards=false 仍静默，节流中按真人路径
         // 回一句原因（每张卡一次）。
         if (getBot(larkAppId).config.grantRequestToOwnerDm === true) {
-          if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
-          await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, { notifyThrottledRequester: true });
+          await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, {
+            notifyThrottledRequester: true,
+            replyKeys: sessionlessReplyKeys,
+          });
           return;
         }
         logger.debug(`Ignoring p2p message from non-allowed user: ${senderOpenId}`);
@@ -5975,13 +5941,28 @@ export function createLarkEventDispatcherRuntime(
    *  绕过消息去重（原消息在拦截时已 claim 过），直接重新走消息处理流程。
    *  用 setImmediate 异步执行，不阻塞卡片回调。
    *
-   *  durable primary 不重放：primary 下入站消息必须经 durable Inbox + canonical Session 所有权，
-   *  这里没有 primary 上下文，直接重放等于绕开它们本地派发（primary 本身也不发申请卡，见
-   *  ignoredUnsupportedPrimarySideEffect('grant request cards')）。能走到这里的只会是 primary
-   *  之前发出、落盘后跨重启恢复的旧卡：授权照常生效，申请人按授权结果卡的提示再 @ 一次即可。 */
+   *  durable primary 下入站消息必须经 durable Inbox + canonical Session 所有权，不能在点卡的
+   *  副本本地派发：改为把原始事件包成一条 updated 事件重新写入 Inbox（事件 id 带
+   *  GRANT_REPLAY_EVENT_TAG，与真实编辑事件不冲突），由领取它的副本走完整处理链路，
+   *  见 processMessageUpdatedEvent 开头的重放分支。写入失败只记日志：授权已生效，
+   *  申请人按结果卡提示再 @ 一次即可。 */
   function replayMessageEvent(data: any): void {
     if (runtimeOptions.enqueuePrimary) {
-      logger.info(`[grant:${larkAppId}] durable primary: not replaying granted message ${String(data?.message?.message_id ?? '').substring(0, 12)} outside the durable inbox`);
+      const message = data?.message;
+      const messageId = typeof message?.message_id === 'string' ? message.message_id : '';
+      if (!messageId || typeof message?.chat_id !== 'string' || !message.chat_id) {
+        logger.warn(`[grant:${larkAppId}] durable primary: granted message has no identity, not replaying`);
+        return;
+      }
+      const replay = { ...data, [GRANT_REPLAY_MARKER]: { version: 1 } };
+      void enqueuePrimaryInArrivalOrder(() => ({
+        eventId: `im.message.updated_v1:${larkAppId}:${GRANT_REPLAY_EVENT_TAG}:${messageId}:${randomUUID()}`,
+        eventType: 'lark.im.message.updated_v1',
+        partitionKey: rawMessageIngressAnchor(larkAppId, message),
+        data: replay,
+      })).catch(err => logger.warn(
+        `[grant:${larkAppId}] durable primary: replay enqueue failed for ${messageId.substring(0, 12)}: ${err}`,
+      ));
       return;
     }
     setImmediate(() => {
@@ -6014,6 +5995,9 @@ export function createLarkEventDispatcherRuntime(
     rawData: any,
     primary?: PrimaryProcessContext,
   ): Promise<DurableLarkCanonicalHandlerResult | void> {
+    if (primary && rawData?.[GRANT_REPLAY_MARKER]) {
+      return processPrimaryGrantReplay(rawData, primary);
+    }
     try {
       const eventMessage = rawData?.message ?? rawData?.event?.message;
       const messageId: string | undefined = eventMessage?.message_id;
@@ -6121,6 +6105,38 @@ export function createLarkEventDispatcherRuntime(
       logger.error(`Error handling message updated event: ${err}`);
       if (primary) throw err;
     }
+  }
+
+  /**
+   * primary 下授权后重放（replayMessageEvent 写入的 Inbox 事件）：原始 receive 事件原样
+   * 进完整处理链路，不像真实编辑那样回读、也不要求编辑后 @。授权刚由点卡的副本写入
+   * bots.json，本副本的配置 watcher 可能还没应用新 generation：此时申请人仍无对话权，
+   * 直接处理会再弹一张申请卡，所以先确认已能对话，否则让 Inbox 稍后重领；超过次数仍
+   * 不能对话（授权已被撤销等）就放弃。
+   */
+  async function processPrimaryGrantReplay(
+    rawData: any,
+    primary: PrimaryProcessContext,
+  ): Promise<DurableLarkCanonicalHandlerResult | void> {
+    const { [GRANT_REPLAY_MARKER]: _marker, ...data } = rawData;
+    const message = data?.message;
+    const senderOpenId = data?.sender?.sender_id?.open_id as string | undefined;
+    const senderUnionId = data?.sender?.sender_id?.union_id as string | undefined;
+    const chatType = message?.chat_type === 'p2p' ? 'p2p' : undefined;
+    if (!message?.message_id || !senderOpenId) {
+      return { kind: 'ignored', reason: 'grant replay without message identity' };
+    }
+    if (!canTalk(larkAppId, message.chat_id, senderOpenId, undefined, senderUnionId, chatType)) {
+      if (primary.message.attempts < GRANT_REPLAY_MAX_ATTEMPTS) {
+        throw new Error('granted sender is not yet allowed on this replica; retrying grant replay');
+      }
+      logger.info(
+        `[grant:${larkAppId}] durable primary: dropping grant replay for ${String(message.message_id).substring(0, 12)}, `
+        + `sender still not allowed after ${primary.message.attempts} attempts`,
+      );
+      return { kind: 'ignored', reason: 'grant replay sender is not allowed' };
+    }
+    return await processMessageEvent(data, undefined, primary);
   }
 
   interface PrimaryRecoveryState {
@@ -6462,6 +6478,8 @@ export function createLarkEventDispatcherRuntime(
       ingestGroupContextRecall(larkAppId, { chatId, messageId, recallTime });
     },
     'im.message.updated_v1': async (data: any) => {
+      // 重放标记只能由本进程写入 Inbox（replayMessageEvent）；外部事件一律剥掉。
+      if (data && typeof data === 'object') delete data[GRANT_REPLAY_MARKER];
       const eventMessage = data?.message ?? data?.event?.message;
       const eventKey = `im.message.updated_v1:${larkAppId}:${eventIdForKey(data) ?? eventMessage?.message_id ?? unkeyableEventKey()}`;
       if (runtimeOptions.enqueuePrimary) {
@@ -6823,6 +6841,10 @@ export function createLarkEventDispatcherRuntime(
               && runtimeOptions.readPrimaryGroupContextRecalls) {
             const recalls = await runtimeOptions.readPrimaryGroupContextRecalls({ larkAppId, chatId });
             for (const recall of recalls) ingestGroupContextRecall(larkAppId, { chatId, ...recall });
+          }
+          // 代答开关、花名册在 primary 下以共享记录为准，处理前同步到本副本的本地缓存。
+          if (rawMessage?.chat_type !== 'p2p' && typeof chatId === 'string' && chatId) {
+            await hydrateChatSessionlessState(larkAppId, chatId);
           }
           return message.eventType === 'lark.im.message.updated_v1'
             ? processMessageUpdatedEvent(message.data, primary)

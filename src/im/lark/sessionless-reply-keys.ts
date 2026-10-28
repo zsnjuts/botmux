@@ -15,6 +15,9 @@ import { createHash } from 'node:crypto';
 export interface SessionlessReplyKeys {
   /** 下一条回执的 uuid。调用顺序必须是确定的（同一代码路径上第几条回执）。 */
   next(): string;
+  /** 本事件内按用途派生的稳定 id（如授权卡 nonce）：重跑同一事件时拿到同一个值，
+   *  与被飞书去重后留下的那张卡保持一致。 */
+  stable(purpose: string): string;
 }
 
 export function createSessionlessReplyKeys(larkAppId: string, eventId: string): SessionlessReplyKeys {
@@ -24,6 +27,10 @@ export function createSessionlessReplyKeys(larkAppId: string, eventId: string): 
       const n = seq++;
       // 飞书 uuid 上限 50 字符：前缀 + 32 位 hex = 36。
       return `bsl_${createHash('sha256').update(`${larkAppId}\0${eventId}\0${n}`).digest('hex').slice(0, 32)}`;
+    },
+    stable(purpose) {
+      const hex = createHash('sha256').update(`${larkAppId}\0${eventId}\0stable\0${purpose}`).digest('hex');
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
     },
   };
 }

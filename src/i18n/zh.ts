@@ -199,8 +199,6 @@ export const messages: Record<string, string> = {
   'cmd.grant.usage': '用法：@机器人 /grant @某人 [条数]（授权 ta 在本群与我对话，可一次 @ 多人/多 bot；带数字则给 N 条消息额度）｜@机器人 /grant（授权本群所有成员对话）。仅授对话权，敏感操作仍由 allowedUsers 控制。',
   'cmd.grant.bad_quota': '⚠️ 额度格式不对。用法：@机器人 /grant @某人 5（给 5 条消息额度，须为正整数）；不带数字则使用卡片默认额度。',
   'cmd.grant.card_failed': '⚠️ 授权卡可能没有发出（发送接口报错）。如果上方没有出现授权卡，本次授权未生效，请用纯文本消息重试 /grant，或改用 Dashboard 的群组授权。',
-  'cmd.grant.primary_targeted_unsupported': '⚠️ 多副本持久模式暂不支持点名授权（/grant @某人），本次未授权。可以改用 @机器人 /grant 授权本群所有成员对话，或在 Dashboard 的群组页授权。',
-  'cmd.primary_sessionless_unsupported': '⚠️ 多副本持久模式暂不支持 {cmd}，本次未执行。',
   'cmd.grant.chat_done': '✅ 已授权本群所有成员与我对话（@ 我即可）。敏感操作仍仅限 allowedUsers。',
   'cmd.grant.chat_already': 'ℹ️ 本群已是授权状态，无需重复授权。',
   'cmd.grant.chat_failed': '⚠️ 授权失败：{reason}',

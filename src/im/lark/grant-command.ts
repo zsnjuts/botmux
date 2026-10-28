@@ -9,7 +9,7 @@ import { isBotAdmin } from './grant-owner.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
-import { markPendingDelivered, openPendingMulti } from './grant-pending.js';
+import { grantPendingStore } from './grant-pending.js';
 import { revokeGrant, addAllowedChatGroup, removeAllowedChatGroup } from '../../services/grant-store.js';
 import { replyMessage } from './client.js';
 import type { SessionlessReplyKeys } from './sessionless-reply-keys.js';
@@ -104,9 +104,6 @@ export function isGrantTargetOnly(message: any, botOpenId: string | undefined, b
 export interface GrantCommandOptions {
   /** durable primary 下的回执去重键（见 sessionless-reply-keys.ts）；其他模式不传。 */
   replyKeys?: SessionlessReplyKeys;
-  /** 点名授权（`/grant @x`）依赖的授权卡 pending 仍是 Pod 本地状态，多副本下点卡的
-   *  副本可能读不到；为 true 时回明确的不支持提示，不发卡、不改授权。 */
-  targetedGrantUnsupported?: boolean;
 }
 
 /** 返回 true 表示已拦截（不再进入路由/spawn）。 */
@@ -228,12 +225,6 @@ export async function tryHandleGrantCommand(
     return true;
   }
 
-  if (opts.targetedGrantUnsupported) {
-    await send(t('cmd.grant.primary_targeted_unsupported', undefined, loc))
-      .catch(err => logger.warn(`[grant:${larkAppId}] targeted grant unsupported reply failed: ${err}`));
-    return true;
-  }
-
   // 解析可选额度：`/grant @x 5`（多目标时对每人各 N 条）。显式数字恒生效；
   // 无数字优先取 per-bot 覆盖值，未配置时使用卡片内置 3 条。
   const pq = parseGrantQuota(text, message?.mentions ?? []);
@@ -250,14 +241,24 @@ export async function tryHandleGrantCommand(
 
   // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。额度（若有）对每个目标各自挂在 pending 上。
   const targetIds = targets.map(tgt => tgt.openId);
-  const nonce = openPendingMulti(
-    larkAppId,
-    chatId,
-    targetIds,
-    quota,
-    undefined,
-    durationMs,
-  );
+  let nonce: string;
+  try {
+    nonce = await grantPendingStore.open(
+      larkAppId,
+      chatId,
+      targetIds,
+      quota,
+      undefined,
+      durationMs,
+      opts.replyKeys?.stable('grant-card'),
+    );
+  } catch (err) {
+    // 只有 primary 的共享记录写不进才会走到这里：卡还没发，明确告诉 owner 本次未生效。
+    logger.warn(`[grant:${larkAppId}] owner /grant pending open failed in ${chatId}: ${err}`);
+    await send(t('cmd.grant.card_failed', undefined, loc))
+      .catch(replyErr => logger.warn(`[grant:${larkAppId}] grant pending failure notice failed: ${replyErr}`));
+    return true;
+  }
   const card = buildGrantCard(
     {
       ownerOpenId: senderOpenId ?? owner!,
@@ -282,7 +283,7 @@ export async function tryHandleGrantCommand(
     return true;
   }
   // 卡已送达才落盘：daemon 重启后 owner 照样能点这张卡。
-  markPendingDelivered(larkAppId, chatId, targetIds, nonce);
+  await grantPendingStore.markDelivered(larkAppId, chatId, targetIds, nonce);
   logger.info(`[grant:${larkAppId}] owner /grant card for ${targets.length} target(s) in ${chatId}`);
   return true;
 }

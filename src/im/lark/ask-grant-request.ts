@@ -28,7 +28,7 @@ import { listObservedBots } from '../../services/observed-bots-store.js';
 import { logger } from '../../utils/logger.js';
 import { buildGrantCard } from './card-builder.js';
 import { getUserProfile, replyMessage, sendMessage } from './client.js';
-import { clearPending, markPendingDelivered, openPending, throttleReason } from './grant-pending.js';
+import { grantPendingStore } from './grant-pending.js';
 import { resolveGrantApprover } from './grant-owner.js';
 import { evaluateTalk } from './event-dispatcher.js';
 
@@ -57,10 +57,13 @@ export interface AskGrantRequestTarget {
 
 export interface AskGrantRequestDeps {
   getOwnerOpenId?: typeof getOwnerOpenId;
-  throttleReason?: typeof throttleReason;
-  openPending?: typeof openPending;
-  clearPending?: typeof clearPending;
-  markPendingDelivered?: typeof markPendingDelivered;
+  throttleReason?: (larkAppId: string, chatId: string, target: string) =>
+    Promise<'pending' | 'denied' | null> | 'pending' | 'denied' | null;
+  openPending?: (
+    larkAppId: string, chatId: string, target: string, quota?: number, messageData?: any, durationMs?: number,
+  ) => Promise<string> | string;
+  clearPending?: (larkAppId: string, chatId: string, target: string) => Promise<boolean> | boolean;
+  markPendingDelivered?: (larkAppId: string, chatId: string, targets: string[], nonce: string) => Promise<void> | void;
   /** 读 bot 配置（额度/有效期默认值 + autoGrantRequestCards 开关）。 */
   getBotConfig?: (larkAppId: string) => {
     autoGrantRequestCards?: boolean;
@@ -83,21 +86,23 @@ export interface AskGrantRequestDeps {
 }
 
 /**
- * 同步决定要不要为这个点击者申请授权，并（若要）在后台把授权卡发出去。
+ * 决定要不要为这个点击者申请授权，并（若要）在后台把授权卡发出去。判定只做本地读取，
+ * durable primary 下另有一次共享 pending 记录的读写（毫秒级，仍在 ACK 预算内）。
  *
- * 返回值只反映**同步**判定；发卡失败会在后台 clearPending，让点击者下次再点能重试
+ * 返回值只反映 ACK 前的判定；发卡失败会在后台 clearPending，让点击者下次再点能重试
  * （与对话路径发卡失败的处理一致，避免被节流永久压死、owner 永远看不到卡）。
  */
-export function requestGrantForAskClicker(
+export async function requestGrantForAskClicker(
   ask: AskGrantRequestTarget,
   clickerOpenId: string,
   deps: AskGrantRequestDeps = {},
-): AskGrantRequestOutcome {
+): Promise<AskGrantRequestOutcome> {
   const ownerOf = deps.getOwnerOpenId ?? getOwnerOpenId;
-  const reasonOf = deps.throttleReason ?? throttleReason;
-  const open = deps.openPending ?? openPending;
-  const clear = deps.clearPending ?? clearPending;
-  const markDelivered = deps.markPendingDelivered ?? markPendingDelivered;
+  const reasonOf = deps.throttleReason ?? grantPendingStore.throttleReason;
+  const open = deps.openPending ?? ((appId: string, chat: string, target: string, quota?: number, messageData?: any, durationMs?: number) =>
+    grantPendingStore.open(appId, chat, [target], quota, messageData, durationMs));
+  const clear = deps.clearPending ?? grantPendingStore.clear;
+  const markDelivered = deps.markPendingDelivered ?? grantPendingStore.markDelivered;
   const readConfig = deps.getBotConfig ?? ((appId: string) => getBot(appId).config);
   const resolveName = deps.resolveTargetName ?? defaultResolveTargetName;
   const deliver = deps.deliverCard ?? defaultDeliverCard;
@@ -124,13 +129,13 @@ export function requestGrantForAskClicker(
     }
     if (blocked) return 'unavailable';
     // 节流原因要如实透出：owner 已拒绝（denied 冷却）不能说成「等 owner 处理」。
-    const throttled = reasonOf(larkAppId, chatId, clickerOpenId);
+    const throttled = await reasonOf(larkAppId, chatId, clickerOpenId);
     if (throttled) return throttled;
 
     const quota = botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
     const durationMs = botConfig.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS;
     // 第 5 个参数 messageData 故意留空：授权通过后不重放，用户再点一次按钮即可（见文件头）。
-    const nonce = open(larkAppId, chatId, clickerOpenId, quota, undefined, durationMs);
+    const nonce = await open(larkAppId, chatId, clickerOpenId, quota, undefined, durationMs);
 
     // 取名字 + 发卡都不在 ACK 路径上：失败只回滚 pending，不影响本次 toast。
     void (async () => {
@@ -153,11 +158,11 @@ export function requestGrantForAskClicker(
         );
         await deliver(ask, cardJson);
       } catch (err) {
-        clear(larkAppId, chatId, clickerOpenId);
+        await clear(larkAppId, chatId, clickerOpenId);
         logger.debug(`ask grant request card send failed: ${err}`);
         return;
       }
-      markDelivered(larkAppId, chatId, [clickerOpenId], nonce);
+      await markDelivered(larkAppId, chatId, [clickerOpenId], nonce);
     })();
 
     return 'sent';

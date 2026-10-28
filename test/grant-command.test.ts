@@ -302,28 +302,6 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     expect(pending.getPendingGrantLimits('b1', 'oc_1', 'ou_z')?.durationMs).toBe(60 * 60 * 1000);
   });
 
-  it('targeted grant unsupported: tells the owner, sends no card and opens no pending', async () => {
-    const keys = { next: vi.fn(() => 'bsl_fixed') };
-    const handled = await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner', {
-      replyKeys: keys,
-      targetedGrantUnsupported: true,
-    });
-    expect(handled).toBe(true);
-    expect(replyMock).toHaveBeenCalledOnce();
-    const [, messageId, , msgType, , uuid] = replyMock.mock.calls[0]!;
-    expect(messageId).toBe('om_x');
-    expect(msgType).toBe('text');
-    expect(uuid).toBe('bsl_fixed');
-    expect(pending.getPendingGrantLimits('b1', 'oc_1', 'ou_z')).toBeUndefined();
-    expect(hasTriggeredMessage('b1', 'om_x')).toBe(false);
-  });
-
-  it('targeted grant unsupported still answers a non-admin with owner_only first', async () => {
-    await tryHandleGrantCommand('b1', grantMessage(), 'ou_stranger', { targetedGrantUnsupported: true });
-    expect(replyMock).toHaveBeenCalledOnce();
-    expect(replyMock.mock.calls[0]![2]).toBe('仅 Bot 管理员可使用 /grant。');
-  });
-
   it('uses the configured finite duration for both the /grant card and pending limits', async () => {
     getBot('b1').config.grantDefaultDurationMs = 8 * 60 * 60 * 1000;
 
@@ -364,7 +342,7 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     replyMock.mockImplementationOnce(() => new Promise<string>(resolve => { finishSend = resolve; }));
     const first = tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
     try {
-      expect(replyMock).toHaveBeenCalledOnce();
+      await vi.waitFor(() => expect(replyMock).toHaveBeenCalledOnce());
       const value = findCardCallbackValue(JSON.parse(replyMock.mock.calls[0][2]), 'grant_chat');
       expect(await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner')).toBe(true);
       expect(replyMock).toHaveBeenCalledOnce();

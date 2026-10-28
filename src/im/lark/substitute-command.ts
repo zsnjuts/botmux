@@ -1,15 +1,17 @@
 import { canOperate, canTalk, extractMessageTextForRouting, isBotMentioned } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { getChatMode, replyMessage } from './client.js';
-import { isSubstituteEnabledForChat, setSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
+import { isSubstituteEnabledForChat, setSubstituteEnabledForChatShared } from '../../services/substitute-chat-toggle-store.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
 import { getBot } from '../../bot-registry.js';
+import type { SessionlessReplyKeys } from './sessionless-reply-keys.js';
 
 export async function tryHandleSubstituteCommand(
   larkAppId: string,
   message: any,
   senderOpenId: string | undefined,
+  replyKeys?: SessionlessReplyKeys,
 ): Promise<boolean> {
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
@@ -24,7 +26,7 @@ export async function tryHandleSubstituteCommand(
   const messageId: string | undefined = message.message_id;
   const loc = localeForBot(larkAppId);
   const reply = (content: string) => messageId
-    ? replyMessage(larkAppId, messageId, content, 'text', false)
+    ? replyMessage(larkAppId, messageId, content, 'text', false, replyKeys?.next())
         .catch(err => logger.warn(`[substitute] reply failed: ${err?.message ?? err}`))
     : Promise.resolve();
 
@@ -67,7 +69,7 @@ export async function tryHandleSubstituteCommand(
     await reply(t('cmd.substitute.owner_only', undefined, loc));
     return true;
   }
-  setSubstituteEnabledForChat(larkAppId, chatId, enable);
+  await setSubstituteEnabledForChatShared(larkAppId, chatId, enable);
   await reply(t(enable ? 'cmd.substitute.updated_on' : 'cmd.substitute.updated_off', undefined, loc));
   return true;
 }
