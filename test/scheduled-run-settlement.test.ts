@@ -165,10 +165,13 @@ describe('scheduled run settlement', () => {
       larkAppId: 'cli_b',
       requireFinalDelivery: true,
     });
-    const firstRejected = expect(first.settled).rejects.toThrow('schedule authority was revoked');
+    // Capture the rejection instead of arming `expect(pending).rejects`: on
+    // `bun test` that matcher, created before the promise settles, spins the
+    // event loop after the case finishes and the file never exits.
+    const firstError = first.settled.then(() => undefined, (error: Error) => error);
 
     expect(revokeScheduledRunSettlements('deadbeef', 'cli_a')).toBe(1);
-    await firstRejected;
+    expect((await firstError)?.message).toContain('schedule authority was revoked');
     expect(observeScheduledRunProviderReadbackDelivery(other.turnId, 'om_other')).toBe(true);
     await expect(other.settled).resolves.toEqual({ messageId: 'om_other' });
   });
