@@ -1033,6 +1033,44 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({ admitted: true });
   });
 
+  it('ends the restart silence when a durable refork is accepted but its submit receipt times out', async () => {
+    const anchor = 'om_thread_primary_refork_receipt_timeout';
+    const turnId = 'om_primary_refork_receipt_timeout';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.suppressRecoveryCard = true;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 2,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, _resume: any, options: any) => {
+      target.worker = { killed: false, send: vi.fn() };
+      options.onAdmission?.('accepted');
+      return true;
+    });
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const handled = handleThreadReply(makeEventData(turnId, 'continue after restart', anchor), ctx);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await handled;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(ctx.ingressAdmission).toMatchObject({
+      retryReason: 'provider submit receipt is still pending after worker refork',
+    });
+    // The worker may still die before ready; its startup failure must reach the user.
+    expect(ds.suppressRecoveryCard).toBeUndefined();
+  });
+
   it('submits a dead-worker /retry with durable metadata and reuses its exact receipt', async () => {
     const anchor = 'om_thread_primary_retry_dead_worker';
     const turnId = 'om_primary_retry_command';

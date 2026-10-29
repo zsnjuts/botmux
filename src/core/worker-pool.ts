@@ -737,6 +737,7 @@ import {
   isDocNativeSession,
   isHttpVirtualSession,
   larkTransportEnabled,
+  claimRemoteCloseNotice,
   remoteRetirementAdmissionPhase,
   type DaemonSession,
 } from './types.js';
@@ -7847,6 +7848,7 @@ export function __testOnly_setRemoteRunnerExplicitCloseWake(
 async function prepareRemoteRunnerExplicitClose(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
+  opts: { explicitClose?: boolean } = {},
 ): Promise<RemoteClosePreparation> {
   const session = ds?.session ?? stored;
   if (!session || session.status === 'closed') return { ok: true };
@@ -7915,6 +7917,24 @@ async function prepareRemoteRunnerExplicitClose(
         retryable: true,
       };
     }
+  }
+  if (opts.explicitClose
+      && ds.remoteCloseState?.phase === 'uncertain'
+      && !ds.remoteShutdownState
+      && !isSessionTransferring(ds)) {
+    // An uncertain cancel used to be terminal while its provider stayed alive:
+    // the fence is process-local and only a provider exit cleared it, so /close,
+    // idle close and every inbound turn were refused until a daemon restart.
+    // The provider's cancel reconciles against the remote control plane and is
+    // safe to repeat, so a user's explicit /close re-runs it on this same live,
+    // ready worker (the fence would have been cleared had the provider exited).
+    // A failed retry latches `uncertain` again. Background closes keep refusing,
+    // so the idle sweeper never turns this into a once-a-minute remote retry.
+    logger.warn(
+      `[${tag(ds)}] explicit close takes over an uncertain Remote Runner close `
+      + `(${ds.remoteCloseState.requestId}); re-running the cancel through the live worker`,
+    );
+    ds.remoteCloseState = undefined;
   }
   return prepareLiveRemoteWorkerClose(ds, 'remote-runner');
 }
@@ -9456,7 +9476,7 @@ export async function closeSession(
     : isOwnedMojoClose
       ? await prepareMojoExplicitClose(ds, stored)
       : isOwnedRemoteRunnerClose && !opts?.remoteOrphanProof
-        ? await prepareRemoteRunnerExplicitClose(ds, stored)
+        ? await prepareRemoteRunnerExplicitClose(ds, stored, { explicitClose: opts?.explicitClose === true })
         : { ok: true };
   if (!prepared.ok) {
     return { ...prepared, alreadyClosed: false };
@@ -12622,13 +12642,18 @@ export function sendWorkerInput(
 ): boolean {
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
-    const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
+    const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    const remoteBackend = backendType === 'mojo'
       ? 'Mojo'
-      : 'Riff';
+      : backendType === 'remote-runner'
+        ? 'Remote Runner'
+        : 'Riff';
+    const notify = opts.notifyRejection !== false && claimRemoteCloseNotice(ds, turnId);
     logger.warn(
-      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`,
+      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`
+      + (notify ? '' : ' (already notified)'),
     );
-    if (opts.notifyRejection !== false) void callbacks?.sessionReply(
+    if (notify) void callbacks?.sessionReply(
       sessionAnchorId(ds),
       tr('worker.remote_close_in_progress', { backend: remoteBackend }, localeForBot(ds.larkAppId)),
       'text',

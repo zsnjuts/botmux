@@ -327,6 +327,7 @@ describe('durable inbox primary consumer', () => {
       retried,
     });
     const commits: DurableInboxPrimaryDispatchResult[] = [];
+    const dropped: Array<[string, number]> = [];
     const errors: unknown[] = [];
     const consumer = startDurableInboxPrimaryConsumer({
       store,
@@ -339,10 +340,12 @@ describe('durable inbox primary consumer', () => {
         return committed(message);
       },
       onCommitted: ({ result }) => commits.push(result),
+      onExhausted: ({ message, attempts }) => { dropped.push([message.messageId, attempts]); },
       onError: error => errors.push(error),
     });
     await consumer.ready;
 
+    expect(dropped).toEqual([['om_exhausted', 3]]);
     expect(completed.map(item => item.event.eventId)).toEqual([
       'im.message.receive_v1:cli_test:om_exhausted',
       'im.message.receive_v1:cli_test:om_after_exhausted',

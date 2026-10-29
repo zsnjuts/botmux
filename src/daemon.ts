@@ -169,6 +169,7 @@ import {
   type DurableConfigReloadWatcherStatus,
 } from './services/durable-config-reload-watcher.js';
 import {
+  enqueueDurableInboxExhaustedNotice,
   enqueueDurableInboxRetryNotice,
   MESSAGE_QUOTA_INFRASTRUCTURE_RETRY,
 } from './services/durable-inbox-retry-notice.js';
@@ -28454,6 +28455,12 @@ async function handleThreadReplyAdmitted(
       return;
     }
     markIngressAdmitted(ctx);
+    // An accepted user turn ends the post-restart recovery silence here, not at
+    // rememberLastCliInput below: a durable-primary wait for the submit receipt
+    // can time out and return first, and a worker that then dies before ready
+    // (e.g. its remote binding expired) would be muted by notifyStartupFailure,
+    // leaving the user's message without any reply.
+    ds.suppressRecoveryCard = undefined;
     if (reforkAccepted && threadTrustedCaller) {
       setActiveInteractiveTurn(
         ds,
@@ -32143,6 +32150,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 logger.warn(
                   `[durable-primary:${message.larkAppId}] retry notice failed for `
                   + `${message.messageId.substring(0, 12)}: `
+                  + `${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            },
+            onInboxExhausted: async ({ message, attempts }) => {
+              try {
+                await enqueueDurableInboxExhaustedNotice({
+                  store: durableCoordinationRuntime.store,
+                  message,
+                  ownerId: `retry-notice:${getDaemonBootId()}`,
+                });
+              } catch (error) {
+                logger.warn(
+                  `[durable-primary:${message.larkAppId}] dropped-message notice failed for `
+                  + `${message.messageId.substring(0, 12)} after ${attempts} attempts: `
                   + `${error instanceof Error ? error.message : String(error)}`,
                 );
               }

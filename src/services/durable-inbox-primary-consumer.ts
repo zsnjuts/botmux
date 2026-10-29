@@ -33,6 +33,11 @@ export interface DurableInboxPrimaryRetry {
   result: Extract<DurableInboxPrimaryDispatchResult, { kind: 'retry' }>;
 }
 
+export interface DurableInboxPrimaryExhausted {
+  message: DurableLarkMessageClaim;
+  attempts: number;
+}
+
 export interface DurableInboxPrimaryStopResult {
   kind: 'stopped' | 'timed_out';
   inFlight: number;
@@ -67,6 +72,9 @@ export interface DurableInboxPrimaryConsumerOptions {
   /** Runs only after the claim is durably returned to queued.  Failures are
    * observational: they never complete or poison the retained Inbox row. */
   onRetried?: (retry: DurableInboxPrimaryRetry) => void | Promise<void>;
+  /** Runs after a failing row was completed at the retry limit, i.e. dropped.
+   * Observational like onRetried: it cannot reopen the completed row. */
+  onExhausted?: (exhausted: DurableInboxPrimaryExhausted) => void | Promise<void>;
   onError?: (error: unknown) => void;
 }
 
@@ -252,6 +260,14 @@ export function startDurableInboxPrimaryConsumer(
           `durable inbox primary retry limit reached for ${claim.event.eventId} after ${claim.attempts} attempts`,
         ));
         if (message) {
+          try {
+            await options.onExhausted?.({ message, attempts: claim.attempts });
+          } catch (observerError) {
+            reportError(new Error(
+              `durable inbox primary exhausted observer failed for ${claim.event.eventId}: `
+              + `${observerError instanceof Error ? observerError.message : String(observerError)}`,
+            ));
+          }
           try {
             options.onCommitted?.({
               message,

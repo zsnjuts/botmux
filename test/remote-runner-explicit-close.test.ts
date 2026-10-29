@@ -352,6 +352,51 @@ describe('remote runner explicit close', () => {
     expect(wake).toHaveBeenCalledOnce();
   });
 
+  it('lets an explicit /close re-run an uncertain cancel on the same live provider', async () => {
+    const { ds, worker } = createFixture(true);
+    const defaultSend = worker!.send.getMockImplementation()!;
+    let failNextClose = true;
+    worker!.send.mockImplementation((message: { type: string; requestId?: string }) => {
+      if (message.type === 'close' && message.requestId && failNextClose) {
+        failNextClose = false;
+        queueMicrotask(() => worker!.emit('message', {
+          type: 'close_result',
+          requestId: message.requestId,
+          ok: false,
+          error: 'tae_close_uncertain',
+          recovery: 'uncertain',
+        }));
+        return;
+      }
+      defaultSend(message);
+    });
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: false,
+      error: 'remote_runner_close_reconciliation_required',
+    });
+    expect(ds.remoteCloseState?.phase).toBe('uncertain');
+
+    // Background (idle) closes keep refusing without touching the provider.
+    const closesBefore = worker!.send.mock.calls.filter(([m]) => m.type === 'close').length;
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: false,
+      error: 'remote_runner_close_reconciliation_required',
+    });
+    expect(worker!.send.mock.calls.filter(([m]) => m.type === 'close')).toHaveLength(closesBefore);
+
+    await expect(closeSession(ds.session.sessionId, { explicitClose: true })).resolves.toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    const closeRequests = worker!.send.mock.calls
+      .filter(([m]) => m.type === 'close')
+      .map(([m]) => m.requestId);
+    expect(closeRequests).toHaveLength(2);
+    expect(closeRequests[0]).not.toBe(closeRequests[1]);
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
+  });
+
   it('does not relatch uncertainty when the provider exits while close is preparing', async () => {
     const { ds, worker } = createFixture(true);
     worker!.send.mockImplementation((message: { type: string; requestId?: string }) => {
