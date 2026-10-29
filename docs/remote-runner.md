@@ -82,11 +82,11 @@ Remote Runner 的 reasoning 选择使用 BotMux 通用的 `low|medium|high|xhigh
 
 ### 可选 active turn steer
 
-部署的 `requiredCapabilities` 与 provider hello 同时声明 `turn_steer` 后，同一可信 principal 的普通真人追加可以进入当前 active execution，而不是长期停在 durable Inbox。BotMux 发送 `turn_steer`，其中 `turnId` 是仍拥有最终回复的原 turn，`steerId` 是本条追加消息的精确 ingress id，另携带当前 `generation`、正文、可选 `dispatchAttempt` 和可信调用者。provider 只有在追加已经取得自己的 durable/pending fence 后才能用同一 `requestId` 返回 `status: busy`。
+BotMux 在 hello 的 `optionalCapabilities` 里列出 `turn_steer` 和 `terminal_input`（不进 `requiredCapabilities`，部署配置无需预置；旧 provider 忽略该字段）。provider hello 声明 `turn_steer` 后，同一可信 principal 的普通真人追加可以进入当前 active execution，而不是长期停在 durable Inbox。BotMux 发送 `turn_steer`，其中 `turnId` 是仍拥有最终回复的原 turn，`steerId` 是本条追加消息的精确 ingress id，另携带当前 `generation`、正文、可选 `dispatchAttempt` 和可信调用者。provider 只有在追加已经取得自己的 durable/pending fence 后才能用同一 `requestId` 返回 `status: busy`。
 
-steer 成功只提交 `steerId` 的输入收据，不创建第二个 final owner；后续 `progress`、`final` 和终态 failure 仍使用原 `turnId`。provider 明确证明正文未进入远端时返回 `status: failed` 的关联 failure，BotMux 保持该 ingress 待重试；提交结果不明时返回 `status: ambiguous`，双方冻结当前 generation，不能自动重放。能力未双边协商、调用者不匹配、特殊入口或跨 principal 消息继续使用既有串行/隔离语义。
+steer 成功只提交 `steerId` 的输入收据，不创建第二个 final owner；后续 `progress`、`final` 和终态 failure 仍使用原 `turnId`。provider 明确证明正文未进入远端时返回 `status: failed` 的关联 failure，BotMux 保持该 ingress 待重试；提交结果不明时返回 `status: ambiguous`，双方冻结当前 generation，不能自动重放。provider 未声明能力、调用者不匹配、特殊入口或跨 principal 消息继续使用既有串行/隔离语义。
 
-用户显式 `/queue <正文>` 永远作为当前 turn 之后的独立新轮，不设置 `activeTurnSteer`；用户显式 `/stop` 仍走终端控制通道。需要 Remote Runner 支持 `/stop` 的部署必须同时要求 `terminal_input`，provider 可以把该能力收窄为只接受当前 generation active turn 的 Ctrl-C。provider 确认该轮因用户中断而结束时应发送 `status: cancelled` 的关联 `failure`；Host 只用它结算 turn 生命周期，不把其中的诊断文案再次投递成 `final_output`，停止命令或控制卡的原回执继续负责用户可见反馈。
+用户显式 `/queue <正文>` 永远作为当前 turn 之后的独立新轮，不设置 `activeTurnSteer`；用户显式 `/stop` 仍走终端控制通道。provider 声明 `terminal_input` 后 Remote Runner 才支持 `/stop`，否则回复不支持；provider 可以把该能力收窄为只接受当前 generation active turn 的 Ctrl-C。provider 确认该轮因用户中断而结束时应发送 `status: cancelled` 的关联 `failure`；Host 只用它结算 turn 生命周期，不把其中的诊断文案再次投递成 `final_output`，停止命令或控制卡的原回执继续负责用户可见反馈。
 
 ### 可选远端终端
 
