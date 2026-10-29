@@ -2,13 +2,14 @@
  * ByteCloud JWT verification for the person-authenticated admin API.
  *
  * ByteCloud signs user JWTs with RS256 and publishes the key set at
- * `/auth/api/v1/jwks` (cn and boe serve the same key). The tokens carry no
+ * `<ByteCloud origin>/auth/api/v1/jwks`; the deployment injects that URL
+ * (`BOTMUX_ADMIN_JWKS_URL`) because private hostnames stay out of the public
+ * source. The tokens carry no
  * `aud`, so a token is a full ByteCloud credential for its lifetime: never log
  * or persist it — only the verified identity leaves this module.
  */
 import { createPublicKey, verify as verifySignature, type JsonWebKey, type KeyObject } from 'node:crypto';
 
-export const BYTECLOUD_JWKS_URL = 'https://cloud.bytedance.net/auth/api/v1/jwks';
 export const BYTECLOUD_JWT_ISSUER = 'paas.passport.auth_oauth2';
 
 const KEYS_TTL_MS = 60 * 60_000;
@@ -37,6 +38,7 @@ export type JwtVerifyError =
 export type JwtVerifyResult = { ok: true; identity: ByteCloudIdentity } | { ok: false; error: JwtVerifyError };
 
 export interface ByteCloudJwtVerifierOptions {
+  /** Required unless `fetchJwks` is supplied. */
   jwksUrl?: string;
   issuer?: string;
   /** Returns the parsed JWKS document; defaults to an HTTPS GET of `jwksUrl`. */
@@ -68,10 +70,11 @@ function rsaKeys(doc: unknown): KeyObject[] {
 }
 
 export function createByteCloudJwtVerifier(options: ByteCloudJwtVerifierOptions = {}): (token: string) => Promise<JwtVerifyResult> {
-  const jwksUrl = options.jwksUrl ?? BYTECLOUD_JWKS_URL;
+  const jwksUrl = options.jwksUrl;
   const issuer = options.issuer ?? BYTECLOUD_JWT_ISSUER;
   const now = options.now ?? Date.now;
   const fetchJwks = options.fetchJwks ?? (async () => {
+    if (!jwksUrl) throw new Error('jwks_url_unset');
     const response = await fetch(jwksUrl, { signal: AbortSignal.timeout(5_000) });
     if (!response.ok) throw new Error(`jwks_http_${response.status}`);
     return response.json();

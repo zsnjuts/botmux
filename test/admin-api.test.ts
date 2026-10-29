@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ADMIN_API_PREFIX, handleAdminApi, type AdminApiDeps } from '../src/dashboard/admin-api.js';
+import { ADMIN_API_PREFIX, adminApiEnabledFromEnv, handleAdminApi, type AdminApiDeps } from '../src/dashboard/admin-api.js';
 import type { JwtVerifyResult } from '../src/dashboard/bytecloud-jwt.js';
 import {
   authorizeAdmin,
@@ -58,6 +58,13 @@ async function start(overrides: Partial<AdminApiDeps> & { daemon?: (call: Daemon
 }
 
 describe('admin API (dashboard layer)', () => {
+  it('needs both the opt-in flag and an https key-set URL from the deployment', () => {
+    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_API: 'on' })).toBe(false);
+    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_API: 'on', BOTMUX_ADMIN_JWKS_URL: 'http://keys.example/jwks' })).toBe(false);
+    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_API: 'on', BOTMUX_ADMIN_JWKS_URL: 'https://keys.example/jwks' })).toBe(true);
+    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_JWKS_URL: 'https://keys.example/jwks' })).toBe(false);
+  });
+
   it('is invisible until the deployment opts in', async () => {
     const { request, calls } = await start({ enabled: () => false });
     await expect(request('whoami')).resolves.toEqual({ status: 404, body: { ok: false, error: 'admin_api_disabled' } });

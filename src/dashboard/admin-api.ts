@@ -5,7 +5,8 @@
  * presents a ByteCloud JWT (`X-Jwt-Token`); this layer verifies it and forwards
  * only the verified identity to the owning daemon over the trusted-host IPC,
  * where admin membership (`allowedUsers`) is decided. Off unless
- * `BOTMUX_ADMIN_API=on`, so deployments opt in explicitly.
+ * `BOTMUX_ADMIN_API=on` and `BOTMUX_ADMIN_JWKS_URL` names the ByteCloud key
+ * set, so deployments opt in explicitly.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ByteCloudIdentity, JwtVerifyResult } from './bytecloud-jwt.js';
@@ -26,7 +27,8 @@ export interface AdminApiDeps {
 }
 
 export function adminApiEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|on|true|yes)$/i.test(env.BOTMUX_ADMIN_API?.trim() ?? '');
+  return /^(1|on|true|yes)$/i.test(env.BOTMUX_ADMIN_API?.trim() ?? '')
+    && /^https:\/\/\S+$/.test(env.BOTMUX_ADMIN_JWKS_URL?.trim() ?? '');
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
