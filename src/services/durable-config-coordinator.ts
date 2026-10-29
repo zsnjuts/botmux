@@ -64,16 +64,49 @@ type ParsedDurableConfigCasValue = LegacyDurableConfigCasValue | DurableConfigCa
 
 type DurableConfigStore = DurableSessionLeaseStore & DurableAuxiliaryStateStore;
 
+/** The person a config write is made on behalf of, e.g. `{ via: 'botconfig', id: 'ou_…' }`. */
+export interface ConfigActor {
+  /** Entry point that carried the change: `botconfig`, `infrabuddy`, `config-repair`, … */
+  via: string;
+  /** Stable identity within that entry point: open_id, corporate email, … */
+  id: string;
+}
+
+export interface DurableConfigAuditView {
+  operationId: string;
+  writerId: string;
+  /** Parsed from `writerId` when the write was attributed; absent for anonymous writers. */
+  actor?: ConfigActor;
+  outcome: ConfigAuditEntry['outcome'];
+  baseSha256: string;
+  contentSha256: string;
+  changedPaths: string[];
+  committedAt: number;
+}
+
+export interface DurableConfigHistory {
+  scope: DurableConfigScope;
+  recordRevision?: number;
+  phase?: 'prepared' | 'committed';
+  committedSha256?: string;
+  /** Oldest first, capped at the record's audit ring size. */
+  audit: DurableConfigAuditView[];
+}
+
 export interface DurableConfigCoordinator {
   inspect(input: {
     scope: DurableConfigScope;
     path: string;
   }): Promise<DurableConfigInspection>;
+  history(input: {
+    scope: DurableConfigScope;
+  }): Promise<DurableConfigHistory>;
   reconcile(input: {
     scope: DurableConfigScope;
     path: string;
     expectedCommittedSha256: string;
     expectedFileSha256: string;
+    actor?: ConfigActor;
   }): Promise<DurableConfigInspection>;
   rebindPath(input: {
     scope: DurableConfigScope;
@@ -89,6 +122,7 @@ export interface DurableConfigCoordinator {
     scope: DurableConfigScope;
     path: string;
     mutation: () => Promise<T>;
+    actor?: ConfigActor;
   }): Promise<T>;
 }
 
@@ -309,6 +343,33 @@ function stateKey(scope: DurableConfigScope): string {
   return `auxiliary::config-cas::${scope}`;
 }
 
+const ACTOR_SEPARATOR = ' via=';
+const ACTOR_ID_SEPARATOR = ' actor=';
+const ACTOR_TOKEN = /^[A-Za-z0-9_.@:+-]{1,128}$/;
+
+/**
+ * Fold the actor into the audit `writerId`.
+ *
+ * Every daemon version validates `writerId` only as a bounded string, so the
+ * suffix round-trips through older daemons that re-append the audit ring,
+ * while a new structured field would be silently dropped by them.
+ */
+export function attributedWriterId(ownerId: string, actor: ConfigActor | undefined): string {
+  if (!actor || !ACTOR_TOKEN.test(actor.via) || !ACTOR_TOKEN.test(actor.id)) return ownerId;
+  const suffix = `${ACTOR_SEPARATOR}${actor.via}${ACTOR_ID_SEPARATOR}${actor.id}`;
+  return `${ownerId.slice(0, 256 - suffix.length)}${suffix}`;
+}
+
+export function parseAttributedWriterId(writerId: string): { ownerId: string; actor?: ConfigActor } {
+  const viaAt = writerId.lastIndexOf(ACTOR_SEPARATOR);
+  const idAt = writerId.lastIndexOf(ACTOR_ID_SEPARATOR);
+  if (viaAt < 0 || idAt < viaAt) return { ownerId: writerId };
+  const via = writerId.slice(viaAt + ACTOR_SEPARATOR.length, idAt);
+  const id = writerId.slice(idAt + ACTOR_ID_SEPARATOR.length);
+  if (!ACTOR_TOKEN.test(via) || !ACTOR_TOKEN.test(id)) return { ownerId: writerId };
+  return { ownerId: writerId.slice(0, viaAt), actor: { via, id } };
+}
+
 function appendAudit(value: ParsedDurableConfigCasValue, entry: ConfigAuditEntry): ConfigAuditEntry[] {
   return [...value.audit, entry].slice(-MAX_AUDIT_ENTRIES);
 }
@@ -379,11 +440,37 @@ export function createDurableConfigCoordinator(input: {
       return inspection(scope, file.sha256, record, current, pathSha256);
     },
 
+    async history({ scope }): Promise<DurableConfigHistory> {
+      const record = await input.store.readAuxiliaryState(stateKey(scope));
+      if (!record) return { scope, audit: [] };
+      const current = parseRecord(record, scope);
+      return {
+        scope,
+        recordRevision: record.revision,
+        phase: current.phase,
+        committedSha256: current.contentSha256,
+        audit: current.audit.map(entry => {
+          const { actor } = parseAttributedWriterId(entry.writerId);
+          return {
+            operationId: entry.operationId,
+            writerId: entry.writerId,
+            ...(actor ? { actor } : {}),
+            outcome: entry.outcome,
+            baseSha256: entry.baseSha256,
+            contentSha256: entry.contentSha256,
+            changedPaths: [...entry.changedPaths],
+            committedAt: entry.committedAt,
+          };
+        }),
+      };
+    },
+
     async reconcile({
       scope,
       path,
       expectedCommittedSha256,
       expectedFileSha256,
+      actor,
     }): Promise<DurableConfigInspection> {
       digest(expectedCommittedSha256, 'expectedCommittedSha256');
       digest(expectedFileSha256, 'expectedFileSha256');
@@ -433,7 +520,7 @@ export function createDurableConfigCoordinator(input: {
             updatedAt: committedAt,
             audit: appendAudit(current, {
               operationId,
-              writerId: ownerId,
+              writerId: attributedWriterId(ownerId, actor),
               outcome: 'reconciled_external',
               baseSha256: current.contentSha256,
               contentSha256: file.sha256,
@@ -627,10 +714,11 @@ export function createDurableConfigCoordinator(input: {
       }
     },
 
-    async run<T>({ scope, path, mutation }: {
+    async run<T>({ scope, path, mutation, actor }: {
       scope: DurableConfigScope;
       path: string;
       mutation: () => Promise<T>;
+      actor?: ConfigActor;
     }): Promise<T> {
       const { pathSha256, lexicalPathSha256 } = await configPathIdentity(path);
       const previous = localTails.get(scope) ?? Promise.resolve();
@@ -753,7 +841,7 @@ export function createDurableConfigCoordinator(input: {
             updatedAt: committedAt,
             audit: appendAudit(prepared, {
               operationId,
-              writerId: ownerId,
+              writerId: attributedWriterId(ownerId, actor),
               outcome: failure
                 ? didChange ? 'failed_changed' : 'failed_unchanged'
                 : 'committed',

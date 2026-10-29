@@ -3,6 +3,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
+import { withConfigActor } from '../services/durable-config-mutation.js';
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -3944,7 +3945,11 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc));
           break;
         }
-        await handleConfigCommand(message, rootId, appId, deps);
+        // Record who issued the change in the durable config CAS audit.
+        await withConfigActor(
+          message.senderId ? { via: 'botconfig', id: message.senderId } : undefined,
+          () => handleConfigCommand(message, rootId, appId, deps),
+        );
         logger.info(`[${logTag}] Config command handled`);
         break;
       }
