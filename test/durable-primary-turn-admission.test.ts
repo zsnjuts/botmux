@@ -58,6 +58,8 @@ describe('durable primary existing-turn admission', () => {
       }),
       'om_next',
     )).toBe('ready');
+    // A topic opened with a prompt reports its first prompt_ready only after
+    // that opening turn ends; an authorized steer must not wait for it.
     expect(durablePrimaryExistingTurnDisposition(
       state({
         cliReady: false,
@@ -65,7 +67,7 @@ describe('durable primary existing-turn admission', () => {
         allowActiveTurnSteer: true,
       }),
       'om_next',
-    )).toBe('retry');
+    )).toBe('ready');
   });
 
   it('reuses a provider-submit marker before considering runtime busy state', () => {

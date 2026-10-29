@@ -23537,6 +23537,17 @@ function hasDurablePrimaryInputCommit(ds: DaemonSession, turnId: string): boolea
   return ds.session.durablePrimaryInputCommits?.some(item => item.turnId === turnId) === true;
 }
 
+/** The active turn reached the provider in this worker lifetime. A topic's
+ * opening turn rides the worker init and is acknowledged only through its
+ * dispatch input receipt, never as a durable primary input commit. */
+function activeTurnInputCommitted(ds: DaemonSession, turnId: string): boolean {
+  if (hasDurablePrimaryInputCommit(ds, turnId)) return true;
+  const receipt = ds.session.dispatchInputReceipts?.[turnId];
+  return !!receipt
+    && Number.isSafeInteger(ds.session.workerGeneration)
+    && receipt.workerGeneration === ds.session.workerGeneration;
+}
+
 function durablePrimaryTurnDisposition(
   ds: DaemonSession,
   turnId: string,
@@ -23582,7 +23593,7 @@ function durablePrimaryActiveTurnSteerAuthorized(
     && ds.activeTurnControls.steer
     && callerRequestedSteer
     && !!active
-    && hasDurablePrimaryInputCommit(ds, active.turnId)
+    && activeTurnInputCommitted(ds, active.turnId)
     && (sameTrustedPrincipal(active.caller, caller)
       || sameTrustedPrincipal(active.controller, caller));
 }

@@ -1204,6 +1204,63 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }));
   });
 
+  it('steers into the opening turn, which is acknowledged only by its dispatch receipt', async () => {
+    const anchor = 'om_thread_primary_opening_steer';
+    const turnId = 'om_primary_opening_steer_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller, anchor);
+    // The opening turn rode the worker init: no durable primary input commit,
+    // no prompt_ready yet, only the dispatch receipt of this worker lifetime.
+    ds.session.durablePrimaryInputCommits = [];
+    ds.cliReady = false;
+    ds.session.dispatchInputReceipts = {
+      [anchor]: { rootMessageId: anchor, committedAt: NOW, workerGeneration: 12 },
+    };
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 2, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'add this constraint now', anchor), ctx);
+
+    expect(workerSend.mock.calls.map(([message]) => message)
+      .find(message => message.type === 'message')).toMatchObject({
+      turnId,
+      activeTurnSteer: true,
+    });
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(ds.currentTurnId).toBe(anchor);
+  });
+
+  it('does not steer into an opening turn whose receipt belongs to an earlier worker', async () => {
+    const anchor = 'om_thread_primary_opening_stale_receipt';
+    const turnId = 'om_primary_opening_stale_receipt_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller, anchor);
+    ds.session.durablePrimaryInputCommits = [];
+    ds.session.dispatchInputReceipts = {
+      [anchor]: { rootMessageId: anchor, committedAt: NOW, workerGeneration: 11 },
+    };
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 2, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'add this constraint now', anchor), ctx);
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
   it('keeps a same-principal follow-up waiting when the live provider did not negotiate steer', async () => {
     const anchor = 'om_thread_primary_active_no_steer';
     const turnId = 'om_primary_active_no_steer_follow_up';
