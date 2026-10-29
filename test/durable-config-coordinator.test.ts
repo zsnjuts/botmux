@@ -14,11 +14,17 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createDurableConfigCoordinator } from '../src/services/durable-config-coordinator.js';
+import {
+  attributedWriterId,
+  createDurableConfigCoordinator,
+  parseAttributedWriterId,
+} from '../src/services/durable-config-coordinator.js';
 import {
   assertDurableConfigMutationAllowed,
+  inspectDurableConfigHistory,
   runDurableConfigMutation,
   setDurableConfigCoordinator,
+  withConfigActor,
 } from '../src/services/durable-config-mutation.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import { invalidateGlobalConfigCache, mergeGlobalConfig } from '../src/global-config.js';
@@ -904,5 +910,53 @@ describe('durable config coordinator', () => {
     invalidateGlobalConfigCache();
     expect(JSON.parse(readFileSync(path, 'utf8')).repoPickerMode).toBe('repos');
     await store.close();
+  });
+});
+
+describe('durable config actor attribution', () => {
+  it('records the person behind a mutation and exposes it through history', async () => {
+    const { path, store, coordinator } = fixture();
+    setDurableConfigCoordinator(coordinator);
+    const mutate = (value: boolean) => runDurableConfigMutation({
+      scope: 'global',
+      path,
+      mutation: async () => {
+        const config = JSON.parse(readFileSync(path, 'utf8'));
+        config.dashboard.publicReadOnly = value;
+        writeFileSync(path, JSON.stringify(config) + '\n');
+      },
+    });
+    await withConfigActor({ via: 'infrabuddy', id: 'alice@example.com' }, () => mutate(true));
+    await mutate(false);
+
+    const history = await inspectDurableConfigHistory({ scope: 'global' });
+    expect(history).toMatchObject({ scope: 'global', phase: 'committed', committedSha256: contentSha256(path) });
+    expect(history.audit).toHaveLength(2);
+    expect(history.audit[0]).toMatchObject({
+      outcome: 'committed',
+      actor: { via: 'infrabuddy', id: 'alice@example.com' },
+      changedPaths: ['dashboard'],
+    });
+    expect(history.audit[1].actor).toBeUndefined();
+    expect(history.audit[1].writerId).toBe('config-test');
+    await store.close();
+  });
+
+  it('keeps the attribution inside writerId so older daemons round-trip it', () => {
+    const writerId = attributedWriterId('config-daemon:boot-1', { via: 'botconfig', id: 'ou_abc' });
+    expect(writerId.length).toBeLessThanOrEqual(256);
+    expect(parseAttributedWriterId(writerId)).toEqual({
+      ownerId: 'config-daemon:boot-1',
+      actor: { via: 'botconfig', id: 'ou_abc' },
+    });
+    const long = attributedWriterId('x'.repeat(300), { via: 'infrabuddy', id: 'bob@example.com' });
+    expect(long.length).toBeLessThanOrEqual(256);
+    expect(parseAttributedWriterId(long).actor).toEqual({ via: 'infrabuddy', id: 'bob@example.com' });
+  });
+
+  it('drops actors that could forge or break the writerId encoding', () => {
+    expect(attributedWriterId('owner', { via: 'botconfig', id: 'ou_x actor=evil' })).toBe('owner');
+    expect(attributedWriterId('owner', { via: '', id: 'ou_x' })).toBe('owner');
+    expect(parseAttributedWriterId('config-dashboard:12:ab')).toEqual({ ownerId: 'config-dashboard:12:ab' });
   });
 });

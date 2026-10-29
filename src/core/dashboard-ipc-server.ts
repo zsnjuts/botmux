@@ -141,6 +141,7 @@ import type {
   OpenPlatformDescriptionReadResult,
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
+import { adminConfigCas, adminConfigSet, adminConfigSnapshot, adminConfigUnset, authorizeAdmin, createEmailOpenIdCache, parseAdminIdentity, parseConfigScope } from '../services/admin-api.js';
 import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
@@ -515,7 +516,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type BotState, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
@@ -836,6 +837,68 @@ ipcRoute('POST', '/api/durable-config-cas/rebind-path', requireBoundBot(async (r
     jsonRes(res, durableConfigErrorStatus(detail), { ok: false, error: detail });
   }
 }));
+
+// ─── Person-authenticated admin API (infrabuddy) ───────────────────────────
+// The Dashboard verifies the ByteCloud JWT and forwards only the verified
+// identity; this side re-derives the authority from the bot's own allowedUsers.
+const resolveAdminOpenId = createEmailOpenIdCache(async (larkAppId, email) => {
+  const result = await resolveAllowedUsersWithMap(larkAppId, [email]);
+  return result.map.get(email);
+});
+
+ipcRoute('POST', '/api/admin/v1/:op', requireBoundBot(async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'admin_api_requires_host' });
+  }
+  const body = await readJsonBodyOrBadJson<Record<string, unknown>>(req, res);
+  if (body === BAD_JSON) return;
+  const larkAppId = cachedLarkAppId!;
+  let bot: BotState;
+  try { bot = getBot(larkAppId); } catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_registered' }); }
+  const identity = parseAdminIdentity(body.identity);
+  const authz = await authorizeAdmin(
+    { larkAppId, resolvedAllowedUsers: bot.resolvedAllowedUsers },
+    identity,
+    resolveAdminOpenId,
+  ).catch(() => ({ ok: false, status: 503, error: 'identity_unresolved' } as const));
+  if (!authz.ok) return jsonRes(res, authz.status, { ok: false, error: authz.error });
+  const botView = { larkAppId, name: bot.config.displayName ?? bot.config.name ?? null };
+  try {
+    switch (params.op) {
+      case 'whoami':
+        return jsonRes(res, 200, { ok: true, identity, openId: authz.openId, admin: true, bot: botView });
+      case 'config-get': {
+        const snapshot = adminConfigSnapshot(larkAppId);
+        return jsonRes(res, snapshot.ok ? 200 : 404, { ...snapshot, bot: botView });
+      }
+      case 'config-set':
+      case 'config-unset': {
+        const result = params.op === 'config-set'
+          ? await adminConfigSet({
+              larkAppId, actorOpenId: authz.openId, identity: identity!,
+              field: body.field, value: body.value, confirm: body.confirm,
+            })
+          : await adminConfigUnset({ larkAppId, identity: identity!, field: body.field });
+        logger.info(`[admin-api:${larkAppId}] ${params.op} ${String(body.field)} by ${identity!.email}: ${result.ok ? 'ok' : result.error}`);
+        if (!result.ok) {
+          const { status, ...rest } = result;
+          return jsonRes(res, status, rest);
+        }
+        return jsonRes(res, 200, result);
+      }
+      case 'config-cas': {
+        const scope = parseConfigScope(body.scope);
+        if (!scope) return jsonRes(res, 400, { ok: false, error: 'invalid_scope' });
+        return jsonRes(res, 200, { ok: true, ...await adminConfigCas(scope, durableConfigPath(scope)) });
+      }
+      default:
+        return jsonRes(res, 404, { ok: false, error: 'unknown_admin_op' });
+    }
+  } catch (error) {
+    const detail = ipcErrorText(error);
+    return jsonRes(res, durableConfigErrorStatus(detail), { ok: false, error: detail });
+  }
+}, NOT_BOUND_BODY.okFalse));
 
 ipcRoute('POST', '/api/durable-config-cas/rebind-and-reconcile', requireBoundBot(async (req, res) => {
   if (!isTrustedHostIpcRequest(req)) {
