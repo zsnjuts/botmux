@@ -23651,6 +23651,25 @@ function rejectDurablePrimaryInputCommitWaiters(ds: DaemonSession, turnId: strin
   for (const waiter of [...waiters]) waiter.reject(error);
 }
 
+/** The worker handed a steer back: it never reached the provider. Fail the
+ * waiting durable attempt now (not after the receipt timeout) so the Inbox
+ * retries it, admitted as the next turn once the target turn is gone. */
+function handleWorkerTurnInputRejected(
+  ds: DaemonSession,
+  rejection: Extract<WorkerToDaemon, { type: 'turn_input_rejected' }>,
+  workerGeneration: number,
+): void {
+  if (ds.session.workerGeneration !== workerGeneration) return;
+  if (rejection.reason !== 'active_turn_steer_target_ended') return;
+  rejectDurablePrimaryInputCommitWaiters(
+    ds,
+    rejection.turnId,
+    new Error('active turn steer was handed back by the worker'),
+  );
+}
+
+export const __testOnly_handleWorkerTurnInputRejected = handleWorkerTurnInputRejected;
+
 /** Idempotent (stable providerUuid) acceptance notice for a steered follow-up,
  * @-mentioning the sender so the topic shows whose guidance joined the turn. */
 function queueTurnSteerAcceptedNotice(
@@ -28082,7 +28101,10 @@ async function handleThreadReplyAdmitted(
       // and wrongly `--resume` a CLI that never took a real turn.
       if (accepted) {
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
-        markIngressAdmitted(ctx);
+        // steer 例外：它可能被退回（目标轮次已结束），只有提交回执才算接收，
+        // 否则重投会被当成已接收的重复消息而丢掉。重发同一 steer 是安全的：
+        // worker 按 turnId 去重，provider 按 steerId 幂等。
+        if (!durablePrimaryActiveTurnSteer) markIngressAdmitted(ctx);
         if (!durablePrimaryActiveTurnSteer) beginNewTurn(ds, parsed.content, parsed.messageId);
         if (threadTrustedCaller && !durablePrimaryActiveTurnSteer) {
           setActiveInteractiveTurn(
@@ -28110,6 +28132,7 @@ async function handleThreadReplyAdmitted(
             );
             return;
           }
+          if (durablePrimaryActiveTurnSteer) markIngressAdmitted(ctx);
           queueTurnSteerAcceptedNotice(ds, ctx, parsed.messageId, threadTrustedCaller);
         }
       }
@@ -30908,17 +30931,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onQueuedActivationSubmitted,
     async onOrdinaryImInputRejected(ds, context) {
-      if (context.rejectedBeforeAdmission && context.reason === 'active_turn_steer_target_ended') {
-        // The steer never reached the provider and its target turn is gone.
-        // Fail the waiting durable attempt now (not after the receipt timeout)
-        // so the Inbox retries it, this time admitted as the next turn.
-        rejectDurablePrimaryInputCommitWaiters(
-          ds,
-          context.turnId,
-          new Error('active turn ended before the steer reached it'),
-        );
-        return true;
-      }
       if (!context.rejectedBeforeAdmission
         || context.reason !== 'cross_principal_requires_owner_confirmation') return false;
       // Experimental XPI switch off ⇒ never stage. Only reachable on a config
@@ -30962,6 +30974,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         proposer,
         message: envelope,
       });
+    },
+    onTurnInputRejected(ds, rejection, context) {
+      handleWorkerTurnInputRejected(ds, rejection, context.workerGeneration);
     },
     onTurnInputCommitted(ds, receipt, context) {
       // A recovered Remote Runner turn can conservatively classify an
