@@ -1,0 +1,380 @@
+import { createHash } from 'node:crypto';
+import {
+  canonicalReplyCardFooterPurpose,
+  projectGroupContextCard,
+} from '../im/lark/group-context-card.js';
+import {
+  containsReplyCardFooterElementId,
+  countReplyCardFooterElementIds,
+  findReplyCardFooterComponent,
+  REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER,
+} from '../im/lark/reply-card-footer-signature.js';
+import { isConfirmedLarkMessageId } from './scheduled-run-settlement.js';
+import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
+import type { FrozenSessionReplyTarget } from '../types.js';
+
+const PROOF_PREFIX = 'bmxsfr_';
+const PROOF_PATTERN = /^bmxsfr_[0-9a-f]{13}$/;
+const PROOF_LINK_BASE = 'https://github.com/deepcoldy/bot%6Dux#';
+const MARKDOWN_LINK_PATTERN = /\[([^\]]*)\]\(([^)\s]+)\)/gu;
+
+export const SCHEDULED_FINAL_RECEIPT_DOMAIN = 'botmux.scheduled-final-receipt.v1';
+
+export interface ScheduledFinalReceiptEnvelope {
+  domain: typeof SCHEDULED_FINAL_RECEIPT_DOMAIN;
+  trusted: true;
+  messageId: string;
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+  proof: string;
+}
+
+export interface ScheduledFinalDeliveryIdentity {
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+}
+
+export function deriveScheduledFinalDeliveryProof(
+  input: ScheduledFinalDeliveryIdentity,
+): string | undefined {
+  if (parseScheduledTurnId(input.turnId) === null
+      || !Number.isSafeInteger(input.workerGeneration)
+      || input.workerGeneration < 1
+      || (input.dispatchAttempt !== undefined
+        && (!Number.isSafeInteger(input.dispatchAttempt) || input.dispatchAttempt < 1))) {
+    return undefined;
+  }
+  const digest = createHash('sha256')
+    .update('botmux.scheduled-final-delivery.v1\0', 'utf8')
+    .update(input.turnId, 'utf8')
+    .update('\0', 'utf8')
+    .update(String(input.workerGeneration), 'utf8')
+    .update('\0', 'utf8')
+    .update(input.dispatchAttempt === undefined ? '-' : String(input.dispatchAttempt), 'utf8')
+    .digest('hex')
+    .slice(0, 13);
+  return `${PROOF_PREFIX}${digest}`;
+}
+
+export function isScheduledFinalDeliveryProof(value: unknown): value is string {
+  return typeof value === 'string' && PROOF_PATTERN.test(value);
+}
+
+export function scheduledFinalReceiptEnvelope(input: {
+  messageId: string;
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+  proof: string;
+}): ScheduledFinalReceiptEnvelope {
+  return {
+    domain: SCHEDULED_FINAL_RECEIPT_DOMAIN,
+    trusted: true,
+    messageId: input.messageId,
+    turnId: input.turnId,
+    workerGeneration: input.workerGeneration,
+    ...(input.dispatchAttempt !== undefined
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+    proof: input.proof,
+  };
+}
+
+export function matchesScheduledFinalReceiptEnvelope(
+  value: unknown,
+  expected: ScheduledFinalReceiptEnvelope,
+): value is ScheduledFinalReceiptEnvelope {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const actual = value as Record<string, unknown>;
+  return actual.domain === expected.domain
+    && actual.trusted === true
+    && actual.messageId === expected.messageId
+    && actual.turnId === expected.turnId
+    && actual.workerGeneration === expected.workerGeneration
+    && actual.dispatchAttempt === expected.dispatchAttempt
+    && actual.proof === expected.proof;
+}
+
+/** Parse a daemon-issued immutable receipt without substituting the caller's
+ * current worker generation. Used only for Host-persisted cleanup replay; the
+ * authority store later exact-compares its own copy before deletion. */
+export function parseScheduledFinalReceiptEnvelope(
+  value: unknown,
+): ScheduledFinalReceiptEnvelope | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  if (input.domain !== SCHEDULED_FINAL_RECEIPT_DOMAIN
+      || input.trusted !== true
+      || !isConfirmedLarkMessageId(input.messageId)
+      || typeof input.turnId !== 'string'
+      || parseScheduledTurnId(input.turnId) === null
+      || !Number.isSafeInteger(input.workerGeneration)
+      || Number(input.workerGeneration) < 1
+      || (input.dispatchAttempt !== undefined
+        && (!Number.isSafeInteger(input.dispatchAttempt)
+          || Number(input.dispatchAttempt) < 1))
+      || typeof input.proof !== 'string') return undefined;
+  const expectedProof = deriveScheduledFinalDeliveryProof({
+    turnId: input.turnId,
+    workerGeneration: Number(input.workerGeneration),
+    ...(typeof input.dispatchAttempt === 'number'
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+  });
+  if (!expectedProof || input.proof !== expectedProof) return undefined;
+  return scheduledFinalReceiptEnvelope({
+    messageId: input.messageId,
+    turnId: input.turnId,
+    workerGeneration: Number(input.workerGeneration),
+    ...(typeof input.dispatchAttempt === 'number'
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+    proof: expectedProof,
+  });
+}
+
+function proofUrl(proof: string): string {
+  return `${PROOF_LINK_BASE}${proof}`;
+}
+
+function isProofUrl(value: unknown, expectedProof?: string): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    const proof = url.hash.slice(1);
+    return url.protocol === 'https:'
+      && url.hostname === 'github.com'
+      && url.port === ''
+      && url.username === ''
+      && url.password === ''
+      && url.search === ''
+      && decodeURIComponent(url.pathname) === '/deepcoldy/botmux'
+      && isScheduledFinalDeliveryProof(proof)
+      && (expectedProof === undefined || proof === expectedProof);
+  } catch {
+    return false;
+  }
+}
+
+function footerContentWithProof(content: string, proof: string): string {
+  // The historical visible-dot marker is known to survive Lark readback. Put
+  // the proof in that dot's target, keeping the rendered separator unchanged.
+  const carrier = `[·](${proofUrl(proof)})`;
+  let replaced = false;
+  let stamped = content.replace(MARKDOWN_LINK_PATTERN, (link, text, href) => {
+    if ((text === '·' || text === REPLY_CARD_FOOTER_MARKER) && isProofUrl(href)) {
+      if (replaced) return '';
+      replaced = true;
+      return carrier;
+    }
+    return link;
+  });
+  if (!replaced) {
+    const separator = `·${REPLY_CARD_FOOTER_MARKER}`;
+    if (stamped.includes(separator)) {
+      stamped = stamped.replace(separator, `${carrier}${REPLY_CARD_FOOTER_MARKER}`);
+    } else if (/<\/font>\s*$/i.test(stamped.trimEnd())) {
+      stamped = stamped.trimEnd().replace(/<\/font>\s*$/i, ` ${carrier}${REPLY_CARD_FOOTER_MARKER}</font>`);
+    } else {
+      stamped = stamped.trimEnd();
+      stamped = stamped ? `${stamped} ${carrier}${REPLY_CARD_FOOTER_MARKER}`
+        : `<font color='grey'>${carrier}${REPLY_CARD_FOOTER_MARKER}</font>`;
+    }
+  }
+  if (!stamped.includes(REPLY_CARD_FOOTER_MARKER)) {
+    stamped = stamped.replace(carrier, `${carrier}${REPLY_CARD_FOOTER_MARKER}`);
+  }
+  return stamped;
+}
+
+/** Bind the turn-specific proof to the canonical top-level reply footer.
+ *
+ * Lark rewrites caller-supplied `hr.element_id` values, while preserving the
+ * canonical `botmux_reply_footer` markdown component and its link target. The
+ * proof therefore lives in the target fragment of a footer separator link:
+ * visible answer content is unchanged, long-answer overflow already retains
+ * the footer, and provider readback can validate a real component instead of
+ * scanning arbitrary callback or business JSON.
+ *
+ * If footer chrome is disabled, append a minimal receipt-only footer. A
+ * malformed caller-owned footer collision is left untouched so delivery fails
+ * closed instead of creating duplicate Card 2.0 element ids. */
+export function stampScheduledFinalDeliveryProof<T extends Record<string, any>>(
+  card: T,
+  proof: string,
+): T {
+  if (!isScheduledFinalDeliveryProof(proof)
+      || !Array.isArray(card.body?.elements)) return card;
+  const elements = card.body.elements as Array<Record<string, unknown>>;
+  const reserved = findReplyCardFooterComponent(elements);
+  if (reserved) {
+    if (reserved.tag !== 'markdown' || typeof reserved.content !== 'string') return card;
+    reserved.content = footerContentWithProof(reserved.content, proof);
+    return card;
+  }
+  if (containsReplyCardFooterElementId(elements)) return card;
+  elements.push({
+    tag: 'markdown',
+    element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
+    text_size: 'notation',
+    content: footerContentWithProof('', proof),
+  });
+  return card;
+}
+
+function providerCardRoot(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const root = value as Record<string, unknown>;
+  if (typeof root.user_dsl !== 'string') return root;
+  try {
+    const inner = JSON.parse(root.user_dsl) as unknown;
+    return inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? inner as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function footerHasUniqueExactProofLink(content: string, proof: string): boolean {
+  const carriers = [...content.matchAll(MARKDOWN_LINK_PATTERN)]
+    .filter(match => isProofUrl(match[2]));
+  return carriers.length === 1
+    && carriers[0]?.[1] === '·'
+    && isProofUrl(carriers[0]?.[2], proof);
+}
+
+/** Require every Provider sender identity field that is present to agree.
+ * Lark surfaces may omit either the sender kind or id kind, but contradictory
+ * metadata cannot prove that the exact App produced the visible message. */
+export function providerMessageHasExactAppSender(
+  sender: unknown,
+  larkAppId: string,
+): boolean {
+  if (!sender || typeof sender !== 'object' || Array.isArray(sender)) return false;
+  const record = sender as Record<string, unknown>;
+  if (record.id !== larkAppId) return false;
+  const senderType = record.sender_type;
+  if (senderType !== undefined && senderType !== 'app' && senderType !== 'bot') return false;
+  const idType = record.id_type;
+  const senderIdType = record.sender_id_type;
+  if (idType !== undefined && idType !== 'app_id') return false;
+  if (senderIdType !== undefined && senderIdType !== 'app_id') return false;
+  return senderType === 'app'
+    || senderType === 'bot'
+    || idType === 'app_id'
+    || senderIdType === 'app_id';
+}
+
+/** Match only the canonical top-level footer markdown and its exact proof link.
+ * Body text, nested callback values, URLs and arbitrary business objects are
+ * data, not delivery-proof components. */
+function hasProviderFooterProof(value: unknown, proof: string): boolean {
+  const root = providerCardRoot(value);
+  if (root?.schema !== '2.0') return false;
+  const body = root?.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const elements = (body as Record<string, unknown>).elements;
+  if (countReplyCardFooterElementIds(elements) !== 1) return false;
+  const footer = findReplyCardFooterComponent(elements);
+  return footer?.tag === 'markdown'
+    && footer.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
+    && typeof footer.content === 'string'
+    && footerHasUniqueExactProofLink(footer.content, proof);
+}
+
+export function scheduledFinalCardHasExactProof(
+  value: unknown,
+  proof: string,
+): boolean {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value) as unknown; }
+    catch { return false; }
+  }
+  if (!hasProviderFooterProof(parsed, proof)) return false;
+  const root = providerCardRoot(parsed);
+  const purpose = root ? canonicalReplyCardFooterPurpose(root) : undefined;
+  if (purpose !== 'message' && purpose !== 'turn-message') return false;
+  return projectGroupContextCard(JSON.stringify(parsed), { botmuxSender: true })?.kind === 'conversation';
+}
+
+export type ScheduledFinalDeliveryReadback =
+  | { ok: true }
+  | { ok: false; error: string };
+
+function nonemptyProviderId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/** Match the visible Provider destination selected by the daemon for this
+ * exact turn. A chat id alone is insufficient: two topics in the same group
+ * share it, while quote replies and in-thread replies are distinct surfaces. */
+export function providerMessageHasExpectedTarget(
+  item: Record<string, unknown>,
+  expected: FrozenSessionReplyTarget,
+): boolean {
+  const rootId = nonemptyProviderId(item.root_id);
+  const parentId = nonemptyProviderId(item.parent_id);
+  const threadId = nonemptyProviderId(item.thread_id);
+  if (expected.mode === 'plain') {
+    // A native topic root may already carry its own thread_id, so top-level is
+    // proven by the absence of reply ancestry rather than thread_id alone.
+    return item.chat_id === expected.chatId
+      && rootId === undefined && parentId === undefined;
+  }
+  if (expected.mode === 'thread') {
+    return rootId === expected.rootMessageId && threadId?.startsWith('omt_') === true;
+  }
+  return parentId === expected.rootMessageId && threadId === undefined;
+}
+
+/** Verify the authoritative provider readback before scheduler settlement. */
+export function verifyScheduledFinalDeliveryReadback(input: {
+  detail: unknown;
+  messageId: string;
+  larkAppId: string;
+  chatId: string;
+  expectedTarget: FrozenSessionReplyTarget;
+  proof: string;
+}): ScheduledFinalDeliveryReadback {
+  if (!isConfirmedLarkMessageId(input.messageId)) {
+    return { ok: false, error: 'invalid_message_id' };
+  }
+  const detail = input.detail as any;
+  const item = detail?.items?.[0] ?? detail?.message ?? detail;
+  if (!item || typeof item !== 'object' || item.message_id !== input.messageId) {
+    return { ok: false, error: 'provider_message_not_found' };
+  }
+  if (item.deleted !== false) return { ok: false, error: 'provider_message_deleted' };
+  if (item.chat_id !== input.chatId) return { ok: false, error: 'provider_chat_mismatch' };
+  if (!providerMessageHasExpectedTarget(item, input.expectedTarget)) {
+    return { ok: false, error: 'provider_target_mismatch' };
+  }
+  if (item.msg_type !== 'interactive') {
+    return { ok: false, error: 'provider_message_type_mismatch' };
+  }
+  if (!providerMessageHasExactAppSender(item.sender, input.larkAppId)) {
+    return { ok: false, error: 'provider_sender_mismatch' };
+  }
+  const content = item.body?.content ?? item.content;
+  if (typeof content !== 'string') return { ok: false, error: 'provider_content_missing' };
+  let card: unknown;
+  try { card = JSON.parse(content); } catch { return { ok: false, error: 'provider_content_invalid' }; }
+  if (!hasProviderFooterProof(card, input.proof)) {
+    return { ok: false, error: 'provider_turn_proof_missing' };
+  }
+  const root = providerCardRoot(card);
+  const purpose = root ? canonicalReplyCardFooterPurpose(root) : undefined;
+  if (purpose !== 'message' && purpose !== 'turn-message') {
+    return { ok: false, error: 'provider_final_not_confirmed' };
+  }
+  const projection = projectGroupContextCard(content, { botmuxSender: true });
+  if (projection?.kind !== 'conversation') {
+    return { ok: false, error: 'provider_final_not_confirmed' };
+  }
+  return { ok: true };
+}

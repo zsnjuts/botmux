@@ -69,7 +69,10 @@ import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, Codex
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
-import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import {
+  hasProtectedSessionMutationOwnership,
+  protectedSessionMutationReasons,
+} from './session-mutation-guard.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import {
@@ -94,6 +97,7 @@ import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
+import { observeScheduledRunTerminal } from './scheduled-run-settlement.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
@@ -4269,6 +4273,28 @@ export function buildSilentScheduleHint(taskName: string, locale?: Locale): stri
   ].join('\n');
 }
 
+/** Trusted prompt preamble for every non-silent scheduled fire. The scheduler
+ * records success only after the host observes a concrete Lark message id, so
+ * the model must not intentionally finish with a private/terminal-only answer. */
+export function buildScheduledDeliveryHint(taskName: string, locale?: Locale): string {
+  if (locale === 'en') {
+    return [
+      '<botmux_scheduled_delivery trusted="true">',
+      `This is a NON-SILENT run of scheduled task "${taskName}". The run succeeds only after BotMux receives a concrete Lark delivery receipt for the final user-visible message.`,
+      '- Before ending the turn, send exactly one complete result with `botmux send --response-kind final --no-mention` (or the explicitly required mention option).',
+      '- After that send succeeds, do not send another final message. Do not intentionally finish with terminal-only prose or BOTMUX_NOTHING_TO_SEND before the send.',
+      '</botmux_scheduled_delivery>',
+    ].join('\n');
+  }
+  return [
+    '<botmux_scheduled_delivery trusted="true">',
+    `本次是非静默定时任务「${taskName}」。只有 BotMux 拿到最终用户可见消息的真实飞书投递回执，本次执行才算成功。`,
+    '- 结束本轮前，必须用 `botmux send --response-kind final --no-mention` 发送且只发送一条完整结果；确有明确收件人要求时改用对应的 mention 参数。',
+    '- 该发送成功后不要再发第二条 final；发送前不得只在终端输出结论，也不得先用 BOTMUX_NOTHING_TO_SEND 静默结束。',
+    '</botmux_scheduled_delivery>',
+  ].join('\n');
+}
+
 /**
  * Resolve the durable execution position of a scheduled task.
  *
@@ -4336,6 +4362,8 @@ async function buildScheduledTargetNotice(params: {
     params.locale,
   );
 }
+
+const scheduledFreshAdmissionEpochs = new WeakMap<DaemonSession, object>();
 
 export async function executeScheduledTask(
   task: ScheduledTask,
@@ -4415,6 +4443,41 @@ export async function executeScheduledTask(
     throw new Error(`scheduled turn ${suppliedTurnId} does not belong to task ${task.id}`);
   }
   const scheduledTurnId = suppliedTurnId ?? `schedule:${task.id}:${randomUUID()}`;
+  const forkScheduledWorker = (
+    target: DaemonSession,
+    input: string | CliTurnPayload,
+    resumeOrTurnId: Parameters<typeof forkWorker>[2],
+    onAsynchronousAdmission?: (
+      admission: import('./worker-pool.js').WorkerForkAdmission,
+    ) => void,
+  ): import('./worker-pool.js').WorkerForkAdmission | undefined => {
+    let synchronousAdmission: import('./worker-pool.js').WorkerForkAdmission | undefined;
+    let inForkCall = true;
+    let admissionFinalized = false;
+    forkWorker(target, input, resumeOrTurnId, {
+      onAdmission(admission) {
+        if (admission !== 'deferred') {
+          if (admissionFinalized) return;
+          admissionFinalized = true;
+        }
+        if (inForkCall) synchronousAdmission = admission;
+        if (admission === 'rejected') {
+          if (silent) disarmSilentScheduledTurn(target, scheduledTurnId);
+          observeScheduledRunTerminal({
+            turnId: scheduledTurnId,
+            status: 'failed',
+            errorCode: 'worker_admission_rejected',
+          });
+        }
+        if (!inForkCall) onAsynchronousAdmission?.(admission);
+      },
+    });
+    inForkCall = false;
+    if (synchronousAdmission === 'rejected') {
+      throw new Error(`scheduled task ${task.id} worker admission was rejected`);
+    }
+    return synchronousAdmission;
+  };
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -4682,9 +4745,10 @@ export async function executeScheduledTask(
   const effectivePrompt = additionalPrompt === undefined
     ? task.prompt
     : `${task.prompt}\n\n${additionalPrompt}`;
-  const firePrompt = silent
-    ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
-    : effectivePrompt;
+  const scheduleHint = silent
+    ? buildSilentScheduleHint(task.name, localeForBot(larkAppId))
+    : buildScheduledDeliveryHint(task.name, localeForBot(larkAppId));
+  const firePrompt = `${scheduleHint}\n\n${effectivePrompt}`;
   // Per-task model / effort, resolved against the bot that is about to run it.
   // Stale intent is dropped with a warning rather than failing the run.
   const modelOverride = resolveScheduleModelOverride(task, bot.config);
@@ -4885,7 +4949,7 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
-          forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
+          forkScheduledWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
           throw err;
@@ -5005,14 +5069,81 @@ export async function executeScheduledTask(
     }
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
-    try {
-      forkWorker(ds, prompt, scheduledTurnId);
-    } catch (err) {
+    const admissionEpoch = {};
+    const admissionPrompt = ds.lastCliInput;
+    scheduledFreshAdmissionEpochs.set(ds, admissionEpoch);
+    const ownsFreshAdmission = (): boolean =>
+      scheduledFreshAdmissionEpochs.get(ds) === admissionEpoch
+      && ds.initialStartPending === true
+      && ds.pendingPrompt === firePrompt
+      && ds.lastCliInput === admissionPrompt;
+    const settleFreshAdmission = (
+      admission: import('./worker-pool.js').WorkerForkAdmission,
+    ): void => {
+      if (admission === 'deferred' || !ownsFreshAdmission()) return;
+      scheduledFreshAdmissionEpochs.delete(ds);
+      if (activeSessions.get(key) !== ds || ds.session.status !== 'active') return;
+      if (admission === 'accepted') {
+        ds.initialStartPending = false;
+        ds.pendingPrompt = undefined;
+        return;
+      }
+      // If this exact admission acquired durable ownership before reporting a
+      // rejection, keep the row and let that owner recover it. The immutable
+      // epoch still prevents a later callback from acting on a new admission.
+      if ((ds.worker && !ds.worker.killed)
+          || protectedSessionMutationReasons(ds).some(reason => reason !== 'initial_start')) {
+        ds.initialStartPending = false;
+        ds.pendingPrompt = undefined;
+        return;
+      }
+      activeSessions.delete(key);
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+      ds.initialStartPending = false;
+      ds.pendingPrompt = undefined;
+      ds.lastUserPrompt = undefined;
+      ds.lastCliInput = undefined;
+      ds.lastCodexAppInput = undefined;
+      ds.session.lastUserPrompt = undefined;
+      ds.session.lastCliInput = undefined;
+      ds.session.lastCodexAppInput = undefined;
+      sessionStore.updateSession(ds.session);
+      sessionStore.closeSession(session.sessionId);
+    };
+    try {
+      const admission = forkScheduledWorker(
+        ds,
+        prompt,
+        scheduledTurnId,
+        settleFreshAdmission,
+      );
+      // Real forkWorker always reports synchronously. Preserve the historical
+      // accepted default for narrow test doubles that omit the callback.
+      settleFreshAdmission(admission ?? 'accepted');
+    } catch (err) {
+      if (scheduledFreshAdmissionEpochs.get(ds) === admissionEpoch) {
+        scheduledFreshAdmissionEpochs.delete(ds);
+      }
+      if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+      // A fresh candidate is registered immediately before fork so no rival
+      // can claim the anchor.  Synchronous admission rejection happens before
+      // any worker/activation journal exists; retaining that candidate would
+      // leave initialStartPending permanently occupying the route.  Remove
+      // only our exact owner, close only its exact durable row, then let a later
+      // fire create a clean candidate.
+      if (activeSessions.get(key) === ds) activeSessions.delete(key);
+      ds.initialStartPending = false;
+      ds.pendingPrompt = undefined;
+      ds.lastUserPrompt = undefined;
+      ds.lastCliInput = undefined;
+      ds.lastCodexAppInput = undefined;
+      ds.session.lastUserPrompt = undefined;
+      ds.session.lastCliInput = undefined;
+      ds.session.lastCodexAppInput = undefined;
+      sessionStore.updateSession(ds.session);
+      sessionStore.closeSession(session.sessionId);
       throw err;
     }
-    ds.initialStartPending = false;
-    ds.pendingPrompt = undefined;
 
     logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
   });

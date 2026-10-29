@@ -1711,6 +1711,16 @@ export function buildRelayHostEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
+  // The host child must resolve the persisted daemon session and bot registry,
+  // never rebuild the remote pane's env-only Riff session. In particular,
+  // riffModeSession treats APP_ID + APP_SECRET + SESSION_ID + CHAT_ID as a
+  // complete synthetic identity. Remote Runner workers can inherit that secret
+  // even though this re-exec runs on the trusted host; carrying it across would
+  // shadow the persisted row (including workerGeneration) and make scheduled
+  // final delivery fail its receipt-identity gate. Keep the host-refrozen
+  // app/chat hints for exact daemon lookup, but remove the one credential that
+  // enables env-only session construction.
+  delete env.BOTMUX_LARK_APP_SECRET;
   delete env.BOTMUX_LINK_REFS_MODE;
   delete env.BOTMUX_LINK_REF_TURN_MODE;
   // This channel locates the pane's read-isolation proof, not the host

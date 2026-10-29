@@ -5,6 +5,12 @@ import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.j
 import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
+import {
+  deriveScheduledFinalDeliveryProof,
+  matchesScheduledFinalReceiptEnvelope,
+  scheduledFinalReceiptEnvelope,
+} from '../src/core/scheduled-final-delivery-proof.js';
+import { isConfirmedLarkMessageId } from '../src/core/scheduled-run-settlement.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const route = source.statements.find(node => ts.isExpressionStatement(node)
@@ -22,7 +28,7 @@ const handler = ${handler.getText(source)}`, {
 function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group',
-    session: { sessionId: 's1' }, workerGeneration: 7,
+    session: { sessionId: 's1', workerGeneration: 7 }, workerGeneration: 7,
     managedTurnOrigin: { capability: 'c'.repeat(64), turnId },
     activeInteractiveTurn: { turnId, caller: {
       senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_admin',
@@ -30,6 +36,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   };
   const scheduler = {
     updateTask: vi.fn(() => ({ ok: true })), removeTask: vi.fn(() => true),
+    removeTaskAfterVerifiedFinal: vi.fn(() => ({ replay: false })),
     disableTask: vi.fn(() => true), enableTask: vi.fn(() => true), runTaskNow: vi.fn(() => true),
   };
   const record: any = { kind: 'delegated', state: 'active', selfManage: false,
@@ -48,6 +55,10 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     resolveUnionIdFromOpenId: async () => 'on_admin',
     resolveTargetAppOpenId: async () => ({ status: 'resolved', openId: 'ou_admin' }),
     listChatMemberOpenIds: async () => ['ou_admin'],
+    deriveScheduledFinalDeliveryProof,
+    scheduledFinalReceiptEnvelope,
+    matchesScheduledFinalReceiptEnvelope,
+    isConfirmedLarkMessageId,
     scheduleAuthorityStore: { getRecord: () => record },
     scheduler,
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
@@ -279,6 +290,119 @@ describe('managed schedule mutation route', () => {
     h.record.state = 'revoked';
     expect(await h.run()).toMatchObject({ status: 200, value: { ok: true, replay: true } });
     expect(h.authorizeScheduleSelfManage).not.toHaveBeenCalled();
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'requires the exact versioned final receipt for cleanup (revoked=%s)',
+    async revoked => {
+      const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+      const h = harness('remove-after-final', turnId, 'self');
+      h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+      h.record.kind = 'direct';
+      h.record.state = revoked ? 'revoked' : 'active';
+      const proof = deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 7 })!;
+      const trustedFinalReceipt = scheduledFinalReceiptEnvelope({
+        messageId: 'om_cleanup_final',
+        turnId,
+        workerGeneration: 7,
+        proof,
+      });
+      h.scope.readJsonBody = async () => ({
+        sessionId: 's1',
+        originCapability: 'c'.repeat(64),
+        originTurnId: turnId,
+        action: 'remove-after-final',
+        id: 'self',
+        trustedFinalReceipt,
+      });
+      h.scheduler.removeTaskAfterVerifiedFinal.mockReturnValue({ replay: revoked });
+
+      expect(await h.run()).toMatchObject({
+        status: 200,
+        value: { ok: true, ...(revoked ? { replay: true } : {}) },
+      });
+      expect(h.scheduler.removeTaskAfterVerifiedFinal).toHaveBeenCalledWith({
+        appId: 'cli_target',
+        taskId: 'a1b2c3d4',
+        turnId,
+        workerGeneration: 7,
+        proof,
+        messageId: 'om_cleanup_final',
+      });
+      expect(h.authorizeScheduleSelfManage).toHaveBeenCalledTimes(revoked ? 0 : 1);
+      expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+    },
+  );
+
+  it('replays exact revoked cleanup after the original managed origin is gone', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('remove-after-final', 'turn-after-restart', 'a1b2c3d4');
+    h.ds.managedTurnOrigin = undefined;
+    h.ds.activeInteractiveTurn = undefined;
+    h.record.kind = 'direct';
+    h.record.state = 'revoked';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    const proof = deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 7 })!;
+    const trustedFinalReceipt = scheduledFinalReceiptEnvelope({
+      messageId: 'om_cleanup_final', turnId, workerGeneration: 7, proof,
+    });
+    h.scope.readJsonBody = async () => ({
+      sessionId: 's1',
+      action: 'remove-after-final',
+      id: 'a1b2c3d4',
+      trustedFinalReceipt,
+    });
+    h.scheduler.removeTaskAfterVerifiedFinal.mockReturnValue({ replay: true });
+
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true, replay: true } });
+    expect(h.scheduler.removeTaskAfterVerifiedFinal).toHaveBeenCalledWith({
+      appId: 'cli_target',
+      taskId: 'a1b2c3d4',
+      turnId,
+      workerGeneration: 7,
+      proof,
+      messageId: 'om_cleanup_final',
+    });
+  });
+
+  it.each([
+    ['missing receipt', undefined],
+    ['wrong message', { messageId: 'om_wrong' }],
+    ['wrong generation', { workerGeneration: 8 }],
+    ['legacy response', { domain: undefined, trusted: undefined }],
+  ])('rejects final cleanup with %s', async (_label, receiptPatch) => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('remove-after-final', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.record.kind = 'direct';
+    const proof = deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 7 })!;
+    const receipt = scheduledFinalReceiptEnvelope({
+      messageId: 'om_cleanup_final', turnId, workerGeneration: 7, proof,
+    });
+    h.scope.readJsonBody = async () => ({
+      sessionId: 's1',
+      originCapability: 'c'.repeat(64),
+      originTurnId: turnId,
+      action: 'remove-after-final',
+      id: 'self',
+      ...(receiptPatch === undefined
+        ? {}
+        : { trustedFinalReceipt: { ...receipt, ...receiptPatch } }),
+    });
+    h.scheduler.removeTaskAfterVerifiedFinal.mockImplementation((candidate: any) => {
+      if (candidate.messageId !== 'om_cleanup_final') {
+        throw new Error('schedule_self_cleanup_receipt_mismatch');
+      }
+      return { replay: false };
+    });
+
+    expect((await h.run()).status).toBe(409);
+    if (_label === 'wrong message') {
+      expect(h.scheduler.removeTaskAfterVerifiedFinal).toHaveBeenCalledOnce();
+    } else {
+      expect(h.scheduler.removeTaskAfterVerifiedFinal).not.toHaveBeenCalled();
+    }
     expect(h.scheduler.removeTask).not.toHaveBeenCalled();
   });
 

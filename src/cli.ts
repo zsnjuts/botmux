@@ -32,6 +32,15 @@ import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
 import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
+import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
+import {
+  deriveScheduledFinalDeliveryProof,
+  matchesScheduledFinalReceiptEnvelope,
+  parseScheduledFinalReceiptEnvelope,
+  scheduledFinalReceiptEnvelope,
+  stampScheduledFinalDeliveryProof,
+  type ScheduledFinalReceiptEnvelope,
+} from './core/scheduled-final-delivery-proof.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
@@ -10289,11 +10298,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   // The env marker is not authority by itself. A genuine host relay CLI is a
   // direct child of the session's durably recorded worker pid; sandboxed or
   // semi-trusted descendants cannot satisfy that parent binding.
-  const trustedRelayCtx = trustedRelayCandidate && isTrustedVcMeetingHostRelayParent(
+  const trustedRelayParentMatches = !!trustedRelayCandidate && isTrustedVcMeetingHostRelayParent(
     trustedHostRelay,
     trustedRelaySession?.pid,
     process.ppid,
-  )
+  );
+  const trustedRelayCtx = trustedRelayParentMatches
     ? trustedRelayCandidate
     : undefined;
   // Keep origin authority independent from the requested destination.  In
@@ -10797,7 +10807,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     replay?: boolean;
     error?: string;
   } | undefined;
-  const removeScheduleSelfAfterFinal = async (): Promise<typeof scheduleSelfCleanup> => {
+  const removeScheduleSelfAfterFinal = async (
+    trustedFinalReceipt: ScheduledFinalReceiptEnvelope,
+  ): Promise<typeof scheduleSelfCleanup> => {
     if (!scheduleRemoveSelfTaskId) return undefined;
     if (scheduleSelfCleanup) return scheduleSelfCleanup;
     try {
@@ -10805,7 +10817,11 @@ async function cmdSend(rest: string[]): Promise<void> {
         path: SCHEDULE_MANAGED_MUTATE_ROUTE,
         sessionId: sid,
         larkAppId: s.larkAppId!,
-        body: { action: 'remove', id: scheduleRemoveSelfTaskId },
+        body: {
+          action: 'remove-after-final',
+          id: scheduleRemoveSelfTaskId,
+          trustedFinalReceipt,
+        },
       });
       const body = await response.json().catch(() => ({})) as {
         ok?: boolean;
@@ -11463,6 +11479,185 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
+  const receiptTargetChatId = overrideChatId ?? s.chatId;
+  const scheduledTurn = !!currentTurnId && parseScheduledTurnId(currentTurnId) !== null;
+  const scheduledFinalDeliveryIdentity = scheduledTurn && currentTurnId
+    && typeof s.workerGeneration === 'number'
+    ? {
+        turnId: currentTurnId,
+        workerGeneration: s.workerGeneration,
+        ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
+      }
+    : undefined;
+  const scheduledFinalDeliveryProof = scheduledFinalDeliveryIdentity
+    ? deriveScheduledFinalDeliveryProof(scheduledFinalDeliveryIdentity)
+    : undefined;
+  let daemonOwnedFinalDeliveryReceipt: ScheduledFinalReceiptEnvelope | undefined;
+  let relayedTurnDeliveryReport: Promise<{
+    ok: true;
+    trustedFinalReceipt?: unknown;
+  } | undefined> | undefined;
+  let trustedFinalDeliveryReport: Promise<ScheduledFinalReceiptEnvelope | undefined> | undefined;
+  /** Index any final through the daemon when the short-lived CLI cannot open
+   * the feedback store. Scheduled callers add identity fields and separately
+   * validate the returned trusted envelope. */
+  const reportRelayedTurnDelivery = async (
+    messageId: string,
+    sentContent: string,
+  ): Promise<{ ok: true; trustedFinalReceipt?: unknown } | undefined> => {
+    if (effectiveResponseKind !== 'final'
+        || !currentTurnId
+        || receiptTargetChatId !== s.chatId) return undefined;
+    relayedTurnDeliveryReport ??= (async () => {
+      let discoveredPort: number | undefined;
+      try { discoveredPort = findDaemon(appId)?.ipcPort; } catch { /* isolated CLI */ }
+      const deliveryIpcPort = resolveDaemonIpcPort(
+        discoveredPort,
+        process.env.BOTMUX_DAEMON_IPC_PORT,
+      );
+      if (!deliveryIpcPort) return undefined;
+      try {
+        const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', {
+          messageId,
+          content: sentContent,
+          responseKind: 'final',
+          ...(scheduledFinalDeliveryIdentity && scheduledFinalDeliveryProof
+            ? {
+                receiptTurnId: scheduledFinalDeliveryIdentity.turnId,
+                receiptWorkerGeneration: scheduledFinalDeliveryIdentity.workerGeneration,
+                ...(scheduledFinalDeliveryIdentity.dispatchAttempt !== undefined
+                  ? { receiptDispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
+                  : {}),
+                receiptProof: scheduledFinalDeliveryProof,
+                ...(scheduleRemoveSelfTaskId
+                  ? { receiptScheduleSelfCleanup: true }
+                  : {}),
+              }
+            : {}),
+        });
+        const detail = await res.json().catch(() => undefined) as {
+          ok?: boolean;
+          error?: string;
+          trustedFinalReceipt?: unknown;
+        } | undefined;
+        if (!res.ok || detail?.ok !== true) {
+          throw new Error(detail?.error ?? `HTTP ${res.status}`);
+        }
+        return { ok: true as const, trustedFinalReceipt: detail.trustedFinalReceipt };
+      } catch (error) {
+        console.error(
+          `botmux send: daemon turn delivery report failed after delivery: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return undefined;
+      }
+    })();
+    return relayedTurnDeliveryReport;
+  };
+  /** Establish a trusted final receipt. A primary daemon-owned Provider write
+   * returns its own settled receipt; every CLI-reported write instead requires
+   * the daemon to read back the exact turn/generation proof from Lark. */
+  const reportTrustedFinalDelivery = async (
+    messageId: string,
+    sentContent: string,
+  ): Promise<ScheduledFinalReceiptEnvelope | undefined> => {
+    if (effectiveResponseKind !== 'final'
+        || !currentTurnId
+        || receiptTargetChatId !== s.chatId) return undefined;
+    if (!scheduledTurn || !scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof) {
+      console.error('botmux send: scheduled trusted final identity is unavailable');
+      return undefined;
+    }
+    const cachedReceipt = turnSendKey
+      ? turnSendLedger.read(turnSendKey)?.final?.trustedFinalReceipt
+      : undefined;
+    if (scheduleRemoveSelfTaskId
+        && cachedReceipt?.messageId === messageId
+        && cachedReceipt.turnId === currentTurnId) {
+      return cachedReceipt;
+    }
+    if (daemonOwnedFinalDeliveryReceipt?.messageId === messageId) {
+      return daemonOwnedFinalDeliveryReceipt;
+    }
+    trustedFinalDeliveryReport ??= (async () => {
+      try {
+        const detail = await reportRelayedTurnDelivery(messageId, sentContent);
+        if (!detail) {
+          console.error('botmux send: trusted final delivery receipt unavailable after delivery: daemon IPC unavailable');
+          return undefined;
+        }
+        const expected = scheduledFinalReceiptEnvelope({
+          messageId,
+          turnId: scheduledFinalDeliveryIdentity.turnId,
+          workerGeneration: scheduledFinalDeliveryIdentity.workerGeneration,
+          ...(scheduledFinalDeliveryIdentity.dispatchAttempt !== undefined
+            ? { dispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
+            : {}),
+          proof: scheduledFinalDeliveryProof,
+        });
+        if (matchesScheduledFinalReceiptEnvelope(detail.trustedFinalReceipt, expected)) {
+          return expected;
+        }
+        const persisted = parseScheduledFinalReceiptEnvelope(detail.trustedFinalReceipt);
+        if (scheduleRemoveSelfTaskId
+            && persisted?.messageId === messageId
+            && persisted.turnId === scheduledFinalDeliveryIdentity.turnId) {
+          return persisted;
+        }
+        throw new Error('scheduled trusted final receipt envelope mismatch');
+      } catch (error) {
+        console.error(
+          `botmux send: trusted final delivery receipt failed after delivery: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return undefined;
+      }
+    })();
+    return trustedFinalDeliveryReport;
+  };
+  const removeScheduleSelfAfterVerifiedFinal = async (
+    messageId: string,
+    sentContent: string,
+  ): Promise<void> => {
+    if (!scheduleRemoveSelfTaskId) return;
+    const trustedFinalReceipt = await reportTrustedFinalDelivery(messageId, sentContent);
+    if (!trustedFinalReceipt) {
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: false,
+        error: 'trusted_final_delivery_unverified',
+      };
+      console.error(
+        `⚠️ 最终答复已发送，但可信飞书回执未验证；当前 turn 已保留，`
+        + `定时任务 ${scheduleRemoveSelfTaskId} 未删除；`
+        + '请原样重试同一 botmux send 命令完成验证与自删除',
+      );
+      return;
+    }
+    if (!turnSendKey) {
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: false,
+        error: 'turn_send_ledger_unavailable',
+      };
+      return;
+    }
+    try {
+      await turnSendLedger.recordTrustedFinalReceipt(turnSendKey, trustedFinalReceipt);
+    } catch (error) {
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      console.error(`⚠️ 可信回执无法持久化；定时任务 ${scheduleRemoveSelfTaskId} 未删除`);
+      return;
+    }
+    await removeScheduleSelfAfterFinal(trustedFinalReceipt);
+  };
   const turnSendKey = currentTurnId
     ? {
         larkAppId: originSession?.larkAppId ?? appId,
@@ -11577,7 +11772,16 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   if (existingTurnPrimary) {
-    await removeScheduleSelfAfterFinal();
+    if (scheduledTurn && !scheduleRemoveSelfTaskId) {
+      await reportTrustedFinalDelivery(
+        existingTurnPrimary.messageId,
+        expectedLinkRenderedContent,
+      );
+    }
+    await removeScheduleSelfAfterVerifiedFinal(
+      existingTurnPrimary.messageId,
+      expectedLinkRenderedContent,
+    );
     if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
       advanceAncestorSessionTurn(
         sendDataDir,
@@ -11595,6 +11799,26 @@ async function cmdSend(rest: string[]): Promise<void> {
       ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
     }));
     return;
+  }
+  if (scheduledTurn && effectiveResponseKind === 'final'
+      && (!scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof)) {
+    console.error(
+      '[botmux send diagnostic] scheduled_final_identity_missing'
+      + ` remoteRunnerOutbound=${remoteRunnerOutbound ? 'yes' : 'no'}`
+      + ` hostRelay=${trustedHostRelay ? 'present' : 'absent'}`
+      + ` relayCandidateSession=${!trustedRelayCandidate ? 'missing'
+        : trustedRelayCandidate.sessionId === sid ? 'match' : 'mismatch'}`
+      + ` relayCandidateTurn=${trustedRelayCandidate?.turnId ? 'present' : 'missing'}`
+      + ` relaySession=${trustedRelaySession ? 'found' : 'missing'}`
+      + ` relaySessionPid=${Number.isInteger(trustedRelaySession?.pid) ? 'present' : 'missing'}`
+      + ` parentBinding=${trustedRelayParentMatches ? 'match' : 'mismatch'}`
+      + ` liveMarker=${liveMarkerCtx?.turnId ? 'turn' : liveMarkerCtx?.sessionId ? 'session' : 'missing'}`
+      + ` originTurn=${currentTurnId ? 'present' : 'missing'}`
+      + ` generation=${typeof s.workerGeneration !== 'number' ? 'missing'
+        : Number.isSafeInteger(s.workerGeneration) && s.workerGeneration > 0 ? 'valid' : 'invalid'}`,
+    );
+    console.error('botmux send refused: scheduled final requires a trusted receipt identity');
+    process.exit(2);
   }
   // Register bots so the downstream Lark client works. registerBot is
   // idempotent, so all send paths reuse these same clients.
@@ -12520,7 +12744,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       if (!durableIpcPort) {
         throw new Error('durable primary send requires the owning daemon IPC port');
       }
-      const messageId = await dispatchDurableSessionMessage({
+      if (scheduledTurn && effectiveResponseKind === 'final'
+          && (!scheduledFinalDeliveryIdentity || !scheduledFinalDeliveryProof)) {
+        throw new Error('durable primary scheduled final requires a trusted receipt identity');
+      }
+      const delivery = await dispatchDurableSessionMessage({
         post: (sessionId, route, payload) => postSessionCliIpc(
           durableIpcPort,
           sessionId,
@@ -12533,6 +12761,19 @@ async function cmdSend(rest: string[]): Promise<void> {
         target: durableTarget,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
+        responseKind: effectiveResponseKind,
+        ...(scheduledTurn && effectiveResponseKind === 'final'
+          && scheduledFinalDeliveryIdentity && scheduledFinalDeliveryProof
+          ? { expectedReceipt: {
+              turnId: scheduledFinalDeliveryIdentity.turnId,
+              workerGeneration: scheduledFinalDeliveryIdentity.workerGeneration,
+              ...(scheduledFinalDeliveryIdentity.dispatchAttempt !== undefined
+                ? { dispatchAttempt: scheduledFinalDeliveryIdentity.dispatchAttempt }
+                : {}),
+              proof: scheduledFinalDeliveryProof,
+            } }
+          : {}),
+        ...(scheduleRemoveSelfTaskId ? { scheduleSelfCleanup: true } : {}),
         providerUuid: effectiveResponseKind === 'final'
           ? durablePrimaryFinalProviderUuid({
               larkAppId: appId,
@@ -12543,8 +12784,11 @@ async function cmdSend(rest: string[]): Promise<void> {
           : uuid ?? `dms_${randomUUID().replace(/-/g, '')}`,
         hookContext,
       });
+      if (delivery.trustedFinalReceipt) {
+        daemonOwnedFinalDeliveryReceipt = delivery.trustedFinalReceipt;
+      }
       primaryQuotedId = canonicalOutput.quoteTargetId ?? null;
-      return messageId;
+      return delivery.messageId;
     }
     if (prepared?.outputMismatch) {
       console.error(
@@ -13053,6 +13297,9 @@ async function cmdSend(rest: string[]): Promise<void> {
             : {}),
           ...(feedbackPolicy ? { feedback: buildFeedbackElement(feedbackPolicy) } : {}),
         });
+        if (scheduledFinalDeliveryProof) {
+          stampScheduledFinalDeliveryProof(canonicalCard, scheduledFinalDeliveryProof);
+        }
       }
       if (feedbackPolicy && effectiveResponseKind === 'final') {
 
@@ -13173,7 +13420,10 @@ async function cmdSend(rest: string[]): Promise<void> {
             : 'standard_reply_card',
         );
       }
-      await removeScheduleSelfAfterFinal();
+      if (scheduledTurn && !scheduleRemoveSelfTaskId) {
+        await reportTrustedFinalDelivery(messageId, text);
+      }
+      await removeScheduleSelfAfterVerifiedFinal(messageId, text);
       if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
           sendDataDir,
@@ -13246,33 +13496,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       } catch (error) {
         indexError = error;
       }
-      if (indexError !== undefined) {
-        // An isolated CLI (bwrap relay / macOS read isolation) cannot open the
-        // shared feedback store — it holds every bot's rows — so hand the row
-        // to the daemon, which derives it from the live session. Same test as
-        // postSessionCliIpc: a relay env or no readable host secret.
-        let isolated = !!process.env.BOTMUX_SEND_RELAY;
-        if (!isolated) {
-          try { loadDaemonIpcSecret(); } catch { isolated = true; }
-        }
-        const deliveryIpcPort = isolated
-          ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
-          : undefined;
-        // The daemon binds the row to the capability's turn and the session's
-        // own chat; an unbound turn or a cross-chat publish has nothing there
-        // to correlate against.
-        if (deliveryIpcPort && currentTurnId && targetChatId === s.chatId) {
-          try {
-            const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text });
-            if (!res.ok) {
-              const detail = await res.json().catch(() => undefined) as { error?: string } | undefined;
-              throw new Error(detail?.error ?? `HTTP ${res.status}`);
-            }
-            indexError = undefined;
-          } catch (error) {
-            indexError = error;
-          }
-        }
+      if (indexError !== undefined || scheduledTurn) {
+        const reported = scheduledTurn
+          ? !!await reportTrustedFinalDelivery(messageId, text)
+          : !!await reportRelayedTurnDelivery(messageId, text);
+        if (reported) indexError = undefined;
       }
       if (indexError !== undefined) {
         console.error(
@@ -13313,7 +13541,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           : 'non_patchable',
       );
     }
-    await removeScheduleSelfAfterFinal();
+    await removeScheduleSelfAfterVerifiedFinal(messageId, text);
     let advancedNextTurnId: string | undefined;
     if (effectiveResponseKind === 'final'
       && (!scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true)

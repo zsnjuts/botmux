@@ -22,6 +22,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { beginScheduledRunSettlement } from '../src/core/scheduled-run-settlement.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -296,6 +297,58 @@ describe('retained-topic scheduled send policy', () => {
 });
 
 describe('executeScheduledTask — silent thread fire', () => {
+  it('rejects a synchronous worker-admission refusal instead of reporting dispatch', async () => {
+    forkWorkerMock.mockImplementationOnce((...args: any[]) => {
+      args[3]?.onAdmission?.('rejected');
+      return true;
+    });
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread' }),
+      active,
+      refreshCliVersion,
+    )).rejects.toThrow('worker admission was rejected');
+
+    const rejected = [...store.values()].find(session => session.status === 'closed');
+    expect(rejected).toBeDefined();
+    expect(active.size).toBe(0);
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith(rejected!.sessionId);
+
+    // A transient refusal must not strand initial_start_pending on the anchor.
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread' }),
+      active,
+      refreshCliVersion,
+    )).resolves.toBeUndefined();
+    expect(active.size).toBe(1);
+    expect([...active.values()][0]!.session.sessionId).not.toBe(rejected!.sessionId);
+  });
+
+  it('settles a deferred worker-admission rejection after dispatch returned', async () => {
+    const turnId = 'schedule:task0001:00000000-0000-4000-8000-000000000099';
+    const settlement = beginScheduledRunSettlement({
+      turnId,
+      taskId: 'task0001',
+      requireFinalDelivery: true,
+    });
+    let reportAdmission!: (status: 'accepted' | 'deferred' | 'rejected') => void;
+    forkWorkerMock.mockImplementationOnce((...args: any[]) => {
+      reportAdmission = args[3].onAdmission;
+      reportAdmission('deferred');
+      return true;
+    });
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread' }),
+      new Map<string, DaemonSession>(),
+      refreshCliVersion,
+      undefined,
+      { scheduledTurnId: turnId },
+    );
+    reportAdmission('rejected');
+    await expect(settlement.settled).rejects.toThrow('worker_admission_rejected');
+  });
+
   it('prepares an exact scheduled-turn identity before the worker is forked', async () => {
     const active = new Map<string, DaemonSession>();
     let prepared = false;
@@ -376,7 +429,7 @@ describe('executeScheduledTask — silent thread fire', () => {
     expect(forkedPayload().trustedCaller).toBeUndefined();
   });
 
-  it('loud fire (control): banner reply posted in-thread, no silent flag, no hint', async () => {
+  it('loud fire requires one receipt-backed final while keeping the silent hint absent', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion);
 
@@ -385,6 +438,9 @@ describe('executeScheduledTask — silent thread fire', () => {
     expect(ds.silentScheduledTurns).toBeUndefined();
     expect(forkedTurnId()).toMatch(/^schedule:task0001:/);
     expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
+    expect(forkedCliInput()).toContain('<botmux_scheduled_delivery trusted="true">');
+    expect(forkedCliInput()).toContain('botmux send --response-kind final --no-mention');
+    expect(forkedCliInput()).toContain('真实飞书投递回执');
     // Unit-level check: dispatch receipts require a live worker generation.
     ds.session.workerGeneration = 1;
     expect(recordDispatchInputCommit(ds.session, forkedTurnId(), 1)).toBe(true);
@@ -400,6 +456,7 @@ describe('executeScheduledTask — silent thread fire', () => {
     const ds = active.get(sessionKey(ROOT, APP))!;
     expect(forkedCliInput()).toContain(effectivePrompt);
     expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
+    expect(forkedCliInput()).toContain('<botmux_scheduled_delivery trusted="true">');
     expect(ds.lastUserPrompt).toBe(task.prompt);
     expect(ds.session.lastUserPrompt).toBe(task.prompt);
     expect(ds.lastCliInput).toContain(effectivePrompt);

@@ -42,6 +42,16 @@ export interface ScheduleAuthorityRecord {
   targetGeneration?: number;
 }
 
+export interface ScheduleSelfCleanupReceipt {
+  appId: string;
+  taskId: string;
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+  proof: string;
+  messageId: string;
+}
+
 export type CommitDelegatedScheduleResult =
   | { ok: true; task: ScheduledTask; replay: boolean }
   | { ok: false; error: 'grant_conflict' | 'grant_task_limit' | 'task_id_conflict' };
@@ -57,6 +67,33 @@ export function __setScheduleAuthorityBeforeCommitTestHook(hook?: () => void): v
 
 function taskHash(task: ScheduledTask): string {
   return computeInputHash(canonicalScheduleInput(task));
+}
+
+function sameSelfCleanupReceipt(
+  left: ScheduleSelfCleanupReceipt,
+  right: ScheduleSelfCleanupReceipt,
+): boolean {
+  return left.appId === right.appId
+    && left.taskId === right.taskId
+    && left.turnId === right.turnId
+    && left.workerGeneration === right.workerGeneration
+    && left.dispatchAttempt === right.dispatchAttempt
+    && left.proof === right.proof
+    && left.messageId === right.messageId;
+}
+
+function assertSelfCleanupReceipt(input: ScheduleSelfCleanupReceipt): void {
+  if (!/^cli_[A-Za-z0-9_-]{1,200}$/.test(input.appId)
+      || !/^[0-9a-z_]{1,50}$/.test(input.taskId)
+      || !/^schedule:[0-9a-z_]{1,50}:[A-Za-z0-9_-]{1,128}$/.test(input.turnId)
+      || !Number.isSafeInteger(input.workerGeneration)
+      || input.workerGeneration < 1
+      || (input.dispatchAttempt !== undefined
+        && (!Number.isSafeInteger(input.dispatchAttempt) || input.dispatchAttempt < 1))
+      || !/^bmxsfr_[0-9a-f]{13}$/.test(input.proof)
+      || !/^om_[A-Za-z0-9_-]{1,128}$/.test(input.messageId)) {
+    throw new Error('schedule_self_cleanup_receipt_invalid');
+  }
 }
 
 function stateFor(task: ScheduledTask): ScheduleAuthorityState {
@@ -163,7 +200,20 @@ export class ScheduleAuthorityStore {
           app_id TEXT PRIMARY KEY,
           initialized_at TEXT NOT NULL
         );
-      ` + createAuthorityTasksTableSql('schedule_authority_tasks', true));
+      ` + createAuthorityTasksTableSql('schedule_authority_tasks', true) + `
+        CREATE TABLE IF NOT EXISTS schedule_self_cleanup_receipts (
+          schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+          app_id TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          worker_generation INTEGER NOT NULL,
+          dispatch_attempt INTEGER,
+          proof TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (app_id, task_id, turn_id)
+        );
+      `);
       const columns = new Set((db.prepare('PRAGMA table_info(schedule_authority_tasks)').all() as Array<{
         name?: unknown;
       }>).flatMap(row => typeof row.name === 'string' ? [row.name] : []));
@@ -282,6 +332,108 @@ export class ScheduleAuthorityStore {
       ...(typeof row.target_turn_id === 'string' ? { targetTurnId: row.target_turn_id } : {}),
       ...(typeof row.target_generation === 'number' ? { targetGeneration: row.target_generation } : {}),
     };
+  }
+
+  getSelfCleanupReceipt(
+    appId: string,
+    taskId: string,
+    turnId: string,
+  ): ScheduleSelfCleanupReceipt | undefined {
+    const row = this.db.prepare(`
+      SELECT schema_version, worker_generation, dispatch_attempt, proof, message_id
+      FROM schedule_self_cleanup_receipts
+      WHERE app_id = ? AND task_id = ? AND turn_id = ?
+    `).get(appId, taskId, turnId) as Record<string, unknown> | undefined;
+    if (!row) return;
+    if (row.schema_version !== 1
+        || !Number.isSafeInteger(row.worker_generation)
+        || Number(row.worker_generation) < 1
+        || (row.dispatch_attempt !== null
+          && (!Number.isSafeInteger(row.dispatch_attempt) || Number(row.dispatch_attempt) < 1))
+        || typeof row.proof !== 'string'
+        || typeof row.message_id !== 'string') {
+      throw new Error('schedule_self_cleanup_receipt_corrupt');
+    }
+    const receipt: ScheduleSelfCleanupReceipt = {
+      appId,
+      taskId,
+      turnId,
+      workerGeneration: Number(row.worker_generation),
+      ...(row.dispatch_attempt !== null
+        ? { dispatchAttempt: Number(row.dispatch_attempt) }
+        : {}),
+      proof: row.proof,
+      messageId: row.message_id,
+    };
+    try { assertSelfCleanupReceipt(receipt); }
+    catch { throw new Error('schedule_self_cleanup_receipt_corrupt'); }
+    return receipt;
+  }
+
+  recordSelfCleanupReceipt(input: ScheduleSelfCleanupReceipt): { replay: boolean } {
+    assertSelfCleanupReceipt(input);
+    const authority = this.getRecord(input.appId, input.taskId);
+    if (!authority || authority.state === 'revoked') {
+      throw new Error('schedule_self_cleanup_authority_unavailable');
+    }
+    const previous = this.getSelfCleanupReceipt(input.appId, input.taskId, input.turnId);
+    if (previous) {
+      if (!sameSelfCleanupReceipt(previous, input)) {
+        throw new Error('schedule_self_cleanup_receipt_conflict');
+      }
+      return { replay: true };
+    }
+    this.db.prepare(`
+      INSERT INTO schedule_self_cleanup_receipts
+        (schema_version, app_id, task_id, turn_id, worker_generation,
+         dispatch_attempt, proof, message_id, created_at)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.appId,
+      input.taskId,
+      input.turnId,
+      input.workerGeneration,
+      input.dispatchAttempt ?? null,
+      input.proof,
+      input.messageId,
+      new Date().toISOString(),
+    );
+    return { replay: false };
+  }
+
+  /** Compare the exact verified final credential and revoke its task under one
+   * SQLite write lock. A revoked row is an idempotent success only for the same
+   * persisted credential; ordinary remove/pause authority never enters here. */
+  revokeWithSelfCleanupReceipt(input: ScheduleSelfCleanupReceipt): {
+    task: ScheduledTask;
+    replay: boolean;
+  } {
+    assertSelfCleanupReceipt(input);
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const persisted = this.getSelfCleanupReceipt(input.appId, input.taskId, input.turnId);
+      if (!persisted || !sameSelfCleanupReceipt(persisted, input)) {
+        throw new Error('schedule_self_cleanup_receipt_mismatch');
+      }
+      const authority = this.getRecord(input.appId, input.taskId);
+      if (!authority) throw new Error('schedule_self_cleanup_authority_unavailable');
+      if (authority.state === 'revoked') {
+        this.db.exec('COMMIT;');
+        return { task: authority.task, replay: true };
+      }
+      const result = this.db.prepare(`
+        UPDATE schedule_authority_tasks SET state = 'revoked', updated_at = ?
+        WHERE app_id = ? AND task_id = ? AND state != 'revoked'
+      `).run(new Date().toISOString(), input.appId, input.taskId);
+      if (Number(result.changes) !== 1) {
+        throw new Error('schedule_self_cleanup_revoke_failed');
+      }
+      this.db.exec('COMMIT;');
+      return { task: authority.task, replay: false };
+    } catch (error) {
+      try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
+      throw error;
+    }
   }
 
   createDirect(task: ScheduledTask): ScheduledTask {
@@ -429,5 +581,28 @@ export class ScheduleAuthorityStore {
       WHERE app_id = ? AND task_id = ? AND kind = 'direct' AND grant_id IS NULL
     `).run(appId, taskId);
     return Number(result.changes) > 0;
+  }
+}
+
+export type ScheduleSelfCleanupReceiptPersistence =
+  | { recorded: true }
+  | { recorded: false; error: string };
+
+/** Provider delivery is already authoritative when this helper runs. Convert
+ * receipt-store failures into data so callers can preserve the delivered
+ * message while withholding the credential that would authorize deletion. */
+export function recordScheduleSelfCleanupReceiptAfterDelivery(
+  store: Pick<ScheduleAuthorityStore, 'recordSelfCleanupReceipt'> | undefined,
+  receipt: ScheduleSelfCleanupReceipt,
+): ScheduleSelfCleanupReceiptPersistence {
+  try {
+    if (!store) return { recorded: false, error: 'schedule self-cleanup receipt store is unavailable' };
+    store.recordSelfCleanupReceipt(receipt);
+    return { recorded: true };
+  } catch (error) {
+    return {
+      recorded: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }

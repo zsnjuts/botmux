@@ -1,5 +1,6 @@
 import type { DaemonSession } from './types.js';
 import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import { normalizeScheduleSourceMessageCreateTime } from './schedule-reference-time.js';
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -389,7 +390,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; sourceMessageCreateTime?: string | number },
 ): void {
   if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
@@ -403,12 +404,18 @@ export function beginReplyTargetTurn(
     quoteOnly: opts?.quoteOnly,
   });
   const exactContexts = { ...(ds.session.turnReplyContexts ?? {}) };
+  const sourceMessageCreateTime = normalizeScheduleSourceMessageCreateTime(
+    opts?.sourceMessageCreateTime,
+  );
   // Re-insertion keeps the newest turn at the end for deterministic bounding.
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
     ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
       ? { sourceMessageId: opts.sourceMessageId } : {}),
+    ...(sourceMessageCreateTime !== undefined
+      ? { sourceMessageCreateTime }
+      : {}),
     ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
     ...(ds.session.quoteTargetSenderOpenId
       ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
@@ -632,6 +639,9 @@ export function rehomeReplyTargetState(ds: DaemonSession): void {
           : {}),
         ...(context.replyTargetSenderIsBot !== undefined
           ? { replyTargetSenderIsBot: context.replyTargetSenderIsBot }
+          : {}),
+        ...(context.sourceMessageCreateTime !== undefined
+          ? { sourceMessageCreateTime: context.sourceMessageCreateTime }
           : {}),
         // `inThread` is deliberately NOT carried over: it describes the shape of
         // the inbound message in the SOURCE chat, which says nothing about the

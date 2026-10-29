@@ -511,8 +511,16 @@ describe('target daemon consumes signed message authority', () => {
     bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
     let execute: (task: any, context: any) => Promise<void>;
     let dispatches = 0;
+    const settlements: Array<{ input: any; dispatchesBefore: number }> = [];
     h.installSchedulerCallback({
       cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      // Behavior-equivalent to the production rendezvous minus the wait for a
+      // Provider receipt, which this harness never produces.
+      executeScheduledRunAwaitingSettlement: async (input: any, dispatch: () => Promise<void>) => {
+        settlements.push({ input, dispatchesBefore: dispatches });
+        await dispatch();
+        return {};
+      },
       executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
         await run(); return 'executed';
       },
@@ -534,6 +542,13 @@ describe('target daemon consumes signed message authority', () => {
     });
     for (let i = 0; i < 2; i++) await execute!(task, { runId: 'test-run', trigger: 'scheduler', startedAt: new Date().toISOString() });
     expect(dispatches).toBe(2);
+    // Every ordinary run enters trusted settlement before its dispatch.
+    expect(settlements.map(s => s.dispatchesBefore)).toEqual([0, 1]);
+    for (const { input } of settlements) {
+      expect(input).toMatchObject({
+        turnId: `schedule:${task.id}:test-run`, taskId: task.id, larkAppId: APP, requireFinalDelivery: true,
+      });
+    }
   });
 
   it.each([

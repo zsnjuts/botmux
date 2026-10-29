@@ -13,6 +13,16 @@ export interface TurnSendLedgerKey {
   dispatchAttempt?: number;
 }
 
+export interface TurnSendTrustedFinalReceipt {
+  domain: 'botmux.scheduled-final-receipt.v1';
+  trusted: true;
+  messageId: string;
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+  proof: string;
+}
+
 export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
   version: 1;
   nonIdempotentSequence?: {
@@ -26,6 +36,9 @@ export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
     fingerprint: string;
     messageId: string;
     deliveredAtMs: number;
+    /** Recovery cache only. The daemon authority store remains the deletion
+     * authority and compares this complete tuple before any mutation. */
+    trustedFinalReceipt?: TurnSendTrustedFinalReceipt;
   };
 }
 
@@ -135,6 +148,19 @@ export class TurnSendLedger {
     if (record.final && (!record.final.fingerprint || !record.final.messageId
       || !Number.isFinite(record.final.deliveredAtMs))) {
       throw new Error('Invalid turn-send final record');
+    }
+    const receipt = record.final?.trustedFinalReceipt;
+    if (receipt && (receipt.domain !== 'botmux.scheduled-final-receipt.v1'
+      || receipt.trusted !== true
+      || receipt.messageId !== record.final?.messageId
+      || receipt.turnId !== record.turnId
+      || receipt.dispatchAttempt !== record.dispatchAttempt
+      || !Number.isSafeInteger(receipt.workerGeneration)
+      || receipt.workerGeneration < 1
+      || (receipt.dispatchAttempt !== undefined
+        && (!Number.isSafeInteger(receipt.dispatchAttempt) || receipt.dispatchAttempt < 1))
+      || !/^bmxsfr_[0-9a-f]{13}$/.test(receipt.proof))) {
+      throw new Error('Invalid turn-send trusted final receipt');
     }
     const sequence = record.nonIdempotentSequence;
     if (sequence && (
@@ -434,6 +460,30 @@ export class TurnSendLedger {
         this.write(key, record);
       }
       return { messageId, replayed: false };
+    }, { maxWaitMs: 60_000 });
+  }
+
+  /** Persist the daemon-issued cleanup envelope beside the already-fenced
+   * final. A later CLI generation may carry it back, but cannot authorize a
+   * delete by itself: the Host authority store exact-compares its own copy. */
+  async recordTrustedFinalReceipt(
+    key: TurnSendLedgerKey,
+    receipt: TurnSendTrustedFinalReceipt,
+  ): Promise<void> {
+    this.ensureSessionDirectory(key);
+    await withFileLock(this.recordPath(key), async () => {
+      const record = this.read(key);
+      if (!record?.final || record.final.messageId !== receipt.messageId
+          || record.turnId !== receipt.turnId) {
+        throw new Error('Turn-send final receipt does not match the delivered final');
+      }
+      const previous = record.final.trustedFinalReceipt;
+      if (previous && JSON.stringify(previous) !== JSON.stringify(receipt)) {
+        throw new Error('Turn-send trusted final receipt conflict');
+      }
+      record.final.trustedFinalReceipt = receipt;
+      this.validateRecord(record, this.id(key));
+      this.write(key, record);
     }, { maxWaitMs: 60_000 });
   }
 

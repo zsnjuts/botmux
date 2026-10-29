@@ -30,7 +30,7 @@
 
 未配置 `cliPathOverride` 时，BotMux 从 `PATH` 查找 `botmux-remote-runner`。`remoteRunner` 只保存协议预期，不应包含 token、cookie 或账号凭据；provider 凭据应通过受限权限文件或部署环境注入。
 
-`handshakeTimeoutMs` 同时约束 `hello` 和后续 `start` / `resume` 到 `ready` 的等待窗口。若 `resumeMode: "rebuild"` 会同步创建并初始化远端资源，部署方应按该路径的实际耗时显式放宽这个有界配置（允许范围 100–300000 ms）；超时会 fail closed，BotMux 不会把未 ready 的 provider 当成已恢复。
+`handshakeTimeoutMs` 同时约束 `hello` 和后续 `start` / `resume` 到 `ready` 的等待窗口，允许范围为 100–300000 ms。`operationTimeoutMs` 约束 turn 的 durable `busy` 回执以及 status/cancel/detach 等操作，允许范围为 100–1200000 ms；首次 turn 若要先创建远端 compute、准备 workspace 与 Actor，再持久化输入后回 `busy`，部署方必须按该完整路径的实测上界留出预算。显式关闭的 control-worker 唤醒会分别保留 `hello` 与 `resume` 两段 handshake 预算，`close_result` 外层等待保留完整 operation 预算。Graceful shutdown 另可用 `BOTMUX_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS` 把 detach/reattach 控制操作限制在 100–1200000 ms；默认仍等于公共 operation 上限，显式缩短时 worker 和 provider 都使用该上限，daemon/fleet supervisor 也按同一个值派生外层预算。该设置不改变 turn admission、status、cancel 或显式 close 的 `operationTimeoutMs`。所有超时都会 fail closed，BotMux 不会把未 ready 的 provider、尚未 durable admission 的 turn 或未确认恢复的 shutdown fence 当成成功。
 
 `envPolicy.mode: "strict"` 不支持 `remote-runner`：BotMux 可以收窄本机 provider 子进程的环境，但无法证明 provider 背后的远端进程同样满足 strict 环境契约，因此启动会 fail closed。
 
@@ -147,7 +147,7 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 }
 ```
 
-结果为 `delivered|rejected|unknown`。请求 scheduled self-cleanup 时，`delivered` 还会携带 `scheduleSelfCleanup`；只有 `removed=true` 才证明当前任务已经删除，`removed=false` 时调用方可原样重试同一 final，宿主 turn-send ledger 会复用已投递消息并只补做删除。Host 从受信 `schedule:<taskId>:<uuid>` turn ID 解析 expected task ID，并用它校验 CLI 回执；final 消息已取得确定 message ID、但 cleanup 回执缺失、非法或 task ID 不匹配时仍保留 `delivered` 以抑制 transcript 重复投递，同时返回该 expected task ID 与 `removed=false`，不能把 cleanup 失败降格成会重发 final 的消息 unknown。`unknown` 表示消息平台是否接受本身无法证明，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
+结果为 `delivered|rejected|unknown`。请求 scheduled self-cleanup 时，`delivered` 还会携带 `scheduleSelfCleanup`；只有 `removed=true` 才证明当前任务已经删除，`removed=false` 时调用方可原样重试同一 final，宿主 turn-send ledger 会复用已投递消息并只补做删除。Host 从受信 `schedule:<taskId>:<uuid>` turn ID 解析 expected task ID，并用它校验 CLI 回执；在首次删除前还会持久化 exact turn、generation、attempt、proof 与 Provider message ID 组成的 cleanup 凭据，CLI 的 turn-send ledger 同时缓存原始 envelope 作为跨进程回送材料，但它自身不构成删除授权。删除使用独立的版本化 `remove-after-final` mutation 原样携带该 envelope，由 Host authority store 在同一事务中比对持久凭据并 revoke；active 首删和 revoked 回放都必须 exact match。daemon/worker 换代后复用 Host 已持久化的原 envelope，不按新 generation 重签。因此删除已经成功但 HTTP 响应丢失时，重试只能回读同一 revoked task 的幂等结果，不会重新结算或复活 scheduler authority。final 消息已取得确定 message ID、但 cleanup 回执缺失、非法或 task ID 不匹配时仍保留 `delivered` 以抑制 transcript 重复投递，同时返回该 expected task ID 与 `removed=false`，不能把 cleanup 失败降格成会重发 final 的消息 unknown。`unknown` 表示消息平台是否接受本身无法证明，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
 
 `progress|auxiliary` 写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`；协商后的 `final` 写入终态发送标记，用于抑制同一 turn 随后的 transcript 重复回复。上述 capability 都不属于默认必需集合，只有显式配置它们的部署才会在握手时要求 provider 支持。
 成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 和 `session_tool_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
@@ -278,6 +278,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 
 - 显式关闭使用两阶段流程：BotMux 先发送 `cancel`，收到 `status: closed` 后持久化关闭，再提交本地 worker 退出。取消结果未知时会保持会话和写入门禁，不会伪装成已关闭。
 - `BOTMUX_REMOTE_SHUTDOWN_MODE` 默认是 `drain`。该模式下 Daemon 正常退出使用 `detach`：provider 应等待当前 turn 收敛并返回 `status: detached`，不得取消可恢复的远端状态。
+- `BOTMUX_REMOTE_RUNNER_SHUTDOWN_PROVIDER_TIMEOUT_MS` 只限制 graceful shutdown 的 detach/reattach 控制请求；默认 `1200000`，允许范围为 100–1200000 ms。受更短进程终止窗口约束的部署必须同时缩短该值并保留 abort、final delivery、lineage persistence 与 worker exit 的外层余量；它不会缩短普通 turn 的 durable `busy` 等待。
 - `handoff` 模式只允许与 durable coordination `primary` 及 `turn_recovery` capability 同时使用。Daemon 先停止新准入，为每个 Remote Runner Session 持久化一个受信 handoff control，再停止本副本的 control consumer、detach 本地 worker/observer 并释放 canonical Session route lease。继任副本通过 control lane 主动取得 lease 并 reattach 同一 remote generation，不需要等待下一条用户消息；它在 `recoveredTurn` 和 worker readiness 都成立后才结算 handoff 并恢复输出。该模式不取消远端 turn，也不等待其完成，适合多副本滚动替换；缺少任一 fencing/recovery 前提时启动失败，而不是退回可能丢 turn 的快速退出。
 - `drain` 模式默认最多等待 active remote turn 12 秒。运行长任务的部署可以设置 provider-neutral 的 `BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS`（12,000 到 86,400,000 毫秒）；BotMux 会把同一 drain deadline 传给 Remote Runner backend，并同步派生 daemon、fleet supervisor 和 CLI 的外层等待预算，避免普通 provider operation timeout 或任一外层 supervisor 提前截断 active turn。provider 发出 `final` 只表示模型执行完成，daemon 还会在提交 detach 前等待对应的用户可见最终回复完成投递；这段固定 20 秒的 delivery drain 预算同样包含在全部外层预算中，避免 worker 退出后首个发送尝试才发现原 generation 已失效。该配置只控制 `drain` 的 active-turn 等待时间，不改变 turn 自身超时，也不会把取消作为超时后的兜底行为。进程编排层的 termination grace 必须大于派生出的 fleet hard-stop 预算。
 - 如果 shutdown 在持久化阶段失败，BotMux 使用 `reattach` 回滚已经确认的 `detach`；回滚没有得到

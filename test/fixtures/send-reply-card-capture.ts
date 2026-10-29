@@ -7,6 +7,7 @@ import {
   writeManagedOriginAttestationProof,
 } from '../../src/core/managed-origin-attestation.js';
 import { findExecutableLinkRefs } from '../../src/services/link-ref-resolver.js';
+import { deriveScheduledFinalDeliveryProof } from '../../src/core/scheduled-final-delivery-proof.js';
 
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
@@ -150,10 +151,71 @@ if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK
       path: target.pathname,
       body,
     }));
+    if (target.pathname.endsWith('/turn-delivery')) {
+      if (process.env.BOTMUX_TEST_TURN_DELIVERY_FAIL === '1') {
+        return new Response(JSON.stringify({ ok: false, error: 'receipt unavailable' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (process.env.BOTMUX_TEST_LEGACY_TURN_DELIVERY === '1') {
+        return new Response(JSON.stringify({ ok: true, deliveryId: 'legacy', duplicate: false }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (typeof body?.receiptTurnId === 'string'
+          && typeof body?.receiptWorkerGeneration === 'number'
+          && typeof body?.receiptProof === 'string') {
+        const persistedGeneration = Number(process.env.BOTMUX_TEST_PERSISTED_RECEIPT_GENERATION);
+        const replayGeneration = Number.isSafeInteger(persistedGeneration) && persistedGeneration > 0
+          ? persistedGeneration
+          : body.receiptWorkerGeneration;
+        const replayProof = deriveScheduledFinalDeliveryProof({
+          turnId: body.receiptTurnId,
+          workerGeneration: replayGeneration,
+          ...(typeof body.receiptDispatchAttempt === 'number'
+            ? { dispatchAttempt: body.receiptDispatchAttempt }
+            : {}),
+        }) ?? body.receiptProof;
+        return new Response(JSON.stringify({
+          ok: true,
+          deliveryId: 'current',
+          duplicate: false,
+          trustedFinalReceipt: {
+            domain: 'botmux.scheduled-final-receipt.v1',
+            trusted: true,
+            messageId: body.messageId,
+            turnId: body.receiptTurnId,
+            workerGeneration: replayGeneration,
+            ...(typeof body.receiptDispatchAttempt === 'number'
+              ? { dispatchAttempt: body.receiptDispatchAttempt }
+              : {}),
+            proof: replayProof,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+    }
+    const scheduledProof = body?.responseKind === 'final'
+      && typeof body?.turnId === 'string'
+      && body.turnId.startsWith('schedule:')
+      && typeof body?.content === 'string'
+      ? body.content.match(/#(bmxsfr_[0-9a-f]{13})/)?.[1]
+      : undefined;
     return new Response(JSON.stringify({
       ok: true,
       kind: 'delivered',
       messageId: 'om_durable_message',
+      ...(scheduledProof
+        ? { trustedFinalReceipt: {
+            domain: 'botmux.scheduled-final-receipt.v1',
+            trusted: true,
+            messageId: 'om_durable_message',
+            turnId: body.turnId,
+            workerGeneration: 7,
+            proof: scheduledProof,
+          } }
+        : {}),
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   });
 }

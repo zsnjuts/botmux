@@ -143,8 +143,18 @@ import type {
 } from '../services/open-platform-rename.js';
 import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
-import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
+import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import { observeScheduledRunProviderReadbackDelivery } from './scheduled-run-settlement.js';
+import {
+  deriveScheduledFinalDeliveryProof,
+  providerMessageHasExactAppSender,
+  providerMessageHasExpectedTarget,
+  scheduledFinalReceiptEnvelope,
+  verifyScheduledFinalDeliveryReadback,
+} from './scheduled-final-delivery-proof.js';
+import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
+import { frozenReplyContextForTurn, replyTargetKey } from './reply-target.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -405,11 +415,16 @@ export interface DurableSessionSendRequest {
   content: string;
   msgType: string;
   providerUuid: string;
+  responseKind: 'progress' | 'final' | 'auxiliary';
+  scheduleSelfCleanup?: boolean;
   hookContext?: Record<string, unknown>;
+  /** Exact scheduled-turn origin frozen by the worker pool at the final_output
+   * IPC edge. Only the bridge fallback sets it. */
+  frozenScheduledOrigin?: import('./worker-pool.js').FrozenScheduledTurnOrigin;
 }
 
 export type DurableSessionSendResult =
-  | { kind: 'delivered'; messageId: string }
+  | { kind: 'delivered'; messageId: string; trustedFinalReceipt?: import('./scheduled-final-delivery-proof.js').ScheduledFinalReceiptEnvelope }
   | { kind: 'ambiguous'; error: string };
 
 let durableSessionSendHandler: ((
@@ -420,6 +435,41 @@ export function setDurableSessionSendHandler(
   handler: ((request: DurableSessionSendRequest) => Promise<DurableSessionSendResult>) | null,
 ): void {
   durableSessionSendHandler = handler;
+}
+
+export interface ScheduledSelfCleanupReceiptRequest {
+  action: 'record' | 'lookup';
+  appId: string;
+  taskId: string;
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+  proof: string;
+  messageId: string;
+}
+
+let scheduledSelfCleanupReceiptHandler: ((
+  request: ScheduledSelfCleanupReceiptRequest,
+) => boolean) | null = null;
+let scheduledSelfCleanupReceiptLookupHandler: ((input: {
+  appId: string;
+  taskId: string;
+  turnId: string;
+  messageId: string;
+}) => import('./scheduled-final-delivery-proof.js').ScheduledFinalReceiptEnvelope | undefined) | null = null;
+
+/** Register the daemon-owned durable credential used only to converge a
+ * verified scheduled self-delete after its HTTP response was lost. */
+export function setScheduledSelfCleanupReceiptHandler(
+  handler: ((request: ScheduledSelfCleanupReceiptRequest) => boolean) | null,
+): void {
+  scheduledSelfCleanupReceiptHandler = handler;
+}
+
+export function setScheduledSelfCleanupReceiptLookupHandler(
+  handler: typeof scheduledSelfCleanupReceiptLookupHandler,
+): void {
+  scheduledSelfCleanupReceiptLookupHandler = handler;
 }
 
 export interface DurableSessionLifecycleRequest {
@@ -1954,6 +2004,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       || typeof body.content !== 'string'
       || typeof body.msgType !== 'string'
       || typeof body.providerUuid !== 'string'
+      || (body.responseKind !== 'progress'
+        && body.responseKind !== 'final'
+        && body.responseKind !== 'auxiliary')
+      || (body.scheduleSelfCleanup !== undefined
+        && body.scheduleSelfCleanup !== true)
+      || (body.scheduleSelfCleanup === true && body.responseKind !== 'final')
       || !target || typeof target !== 'object' || Array.isArray(target)
       || (hookContext !== undefined
         && (!hookContext || typeof hookContext !== 'object' || Array.isArray(hookContext)))) {
@@ -1967,6 +2023,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       content: body.content,
       msgType: body.msgType,
       providerUuid: body.providerUuid,
+      responseKind: body.responseKind,
+      ...(body.scheduleSelfCleanup === true ? { scheduleSelfCleanup: true } : {}),
       ...(hookContext === undefined ? {} : { hookContext: hookContext as Record<string, unknown> }),
     });
     return result.kind === 'delivered'
@@ -2089,9 +2147,41 @@ ipcRoute('POST', '/api/sessions/:sessionId/link-refs/resolve', async (req, res, 
   }
 });
 
-/** Delivery row for a final answer an isolated CLI already sent: the CLI
- * cannot open the shared feedback store, so the daemon records it with
- * correlation fields taken from the live session (see relayed-turn-delivery). */
+function providerFinalCardFromReadback(input: {
+  detail: unknown;
+  messageId: string;
+  larkAppId: string;
+  chatId: string;
+  expectedTarget: import('../types.js').FrozenSessionReplyTarget;
+}): Record<string, unknown> | undefined {
+  const detail = input.detail as any;
+  const item = detail?.items?.[0] ?? detail?.message ?? detail;
+  if (!item || typeof item !== 'object'
+      || item.message_id !== input.messageId
+      || item.deleted !== false
+      || item.chat_id !== input.chatId
+      || item.msg_type !== 'interactive'
+      || !providerMessageHasExpectedTarget(item, input.expectedTarget)) return undefined;
+  if (!providerMessageHasExactAppSender(item.sender, input.larkAppId)) return undefined;
+  const content = item.body?.content ?? item.content;
+  if (typeof content !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const wrapper = parsed as Record<string, unknown>;
+    if (typeof wrapper.user_dsl !== 'string') return wrapper;
+    const inner = JSON.parse(wrapper.user_dsl) as unknown;
+    return inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? inner as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Host receipt for a final answer already accepted by Lark. The daemon binds
+ * it to the exact live turn and visible target, records the completion row
+ * idempotently, and uses an explicit final receipt to settle a scheduled run. */
 ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, async (req, res, params) => {
   let body: Record<string, unknown> | undefined;
   try {
@@ -2105,18 +2195,274 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   try {
-    const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
-    let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
-    try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
-    const result = recordRelayedTurnDelivery({
-      ds,
-      body,
-      store: await getSkillFeedbackStore(config.session.dataDir),
-      webhookDestinations,
-      teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
-    });
+    const liveTurnId = ds?.managedTurnOrigin?.turnId;
+    let trustedFinalReceipt: ReturnType<typeof scheduledFinalReceiptEnvelope> | undefined;
+    let providerDetail: unknown;
+    let persistedCleanupReplay = false;
+    let scheduledDeliveryFence: {
+      ds: DaemonSession;
+      turnId: string;
+      dispatchAttempt: number | undefined;
+      workerGeneration: number | undefined;
+      sessionWorkerGeneration: number | undefined;
+      target: import('../types.js').FrozenSessionReplyTarget;
+      targetKey: string;
+      larkAppId: string;
+      chatId: string;
+    } | undefined;
+    const scheduledDeliveryFenceIsCurrent = (): boolean => {
+      const fence = scheduledDeliveryFence;
+      if (!fence) return true;
+      const current = findActiveBySessionId(params.sessionId);
+      if (current !== fence.ds
+          || current.session.status !== 'active'
+          || current.larkAppId !== fence.larkAppId
+          || current.chatId !== fence.chatId
+          || current.workerGeneration !== fence.workerGeneration
+          || current.session.workerGeneration !== fence.sessionWorkerGeneration
+          || current.managedTurnOrigin?.turnId !== fence.turnId
+          || current.managedTurnOrigin?.dispatchAttempt !== fence.dispatchAttempt) return false;
+      try {
+        return replyTargetKey(frozenReplyContextForTurn(current, fence.turnId).target)
+          === fence.targetKey;
+      } catch {
+        return false;
+      }
+    };
+    const scheduledFinal = body.responseKind === 'final'
+      && typeof liveTurnId === 'string'
+      && parseScheduledTurnId(liveTurnId) !== null;
+    const selfCleanupReceiptRequested = body.receiptScheduleSelfCleanup === true;
+    if (body.receiptScheduleSelfCleanup !== undefined && !selfCleanupReceiptRequested) {
+      return jsonRes(res, 400, { ok: false, error: 'scheduled_cleanup_receipt_invalid' });
+    }
+    if (selfCleanupReceiptRequested && !scheduledFinal) {
+      return jsonRes(res, 409, { ok: false, error: 'scheduled_cleanup_receipt_unbound' });
+    }
+    if (scheduledFinal) {
+      const messageId = typeof body.messageId === 'string' ? body.messageId : '';
+      const taskId = parseScheduledTurnId(liveTurnId)!;
+      const expectedTarget = {
+        ...frozenReplyContextForTurn(ds!, liveTurnId).target,
+      } as import('../types.js').FrozenSessionReplyTarget;
+      scheduledDeliveryFence = {
+        ds: ds!,
+        turnId: liveTurnId,
+        dispatchAttempt: ds!.managedTurnOrigin?.dispatchAttempt,
+        workerGeneration: ds!.workerGeneration,
+        sessionWorkerGeneration: ds!.session.workerGeneration,
+        target: expectedTarget,
+        targetKey: replyTargetKey(expectedTarget),
+        larkAppId: ds!.larkAppId,
+        chatId: ds!.chatId,
+      };
+      const persistedReceipt = selfCleanupReceiptRequested
+        ? scheduledSelfCleanupReceiptLookupHandler?.({
+            appId: ds!.larkAppId,
+            taskId,
+            turnId: liveTurnId,
+            messageId,
+          })
+        : undefined;
+      if (persistedReceipt) {
+        trustedFinalReceipt = persistedReceipt;
+        persistedCleanupReplay = true;
+      } else {
+        const liveWorkerGeneration = ds?.workerGeneration;
+        const persistedWorkerGeneration = ds?.session.workerGeneration;
+        const receiptDispatchAttempt = body.receiptDispatchAttempt;
+        if (body.receiptTurnId !== liveTurnId
+            || typeof body.receiptWorkerGeneration !== 'number'
+            || body.receiptWorkerGeneration !== liveWorkerGeneration
+            || body.receiptWorkerGeneration !== persistedWorkerGeneration
+            || receiptDispatchAttempt !== ds?.managedTurnOrigin?.dispatchAttempt) {
+          return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
+        }
+        const expectedProof = deriveScheduledFinalDeliveryProof({
+          turnId: liveTurnId,
+          workerGeneration: body.receiptWorkerGeneration,
+          ...(typeof receiptDispatchAttempt === 'number'
+            ? { dispatchAttempt: receiptDispatchAttempt }
+            : {}),
+        });
+        if (!expectedProof || body.receiptProof !== expectedProof) {
+          return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_proof_invalid' });
+        }
+        trustedFinalReceipt = scheduledFinalReceiptEnvelope({
+          messageId,
+          turnId: liveTurnId,
+          workerGeneration: body.receiptWorkerGeneration,
+          ...(typeof receiptDispatchAttempt === 'number'
+            ? { dispatchAttempt: receiptDispatchAttempt }
+            : {}),
+          proof: expectedProof,
+        });
+      }
+      try {
+        providerDetail = await getMessageDetail(ds!.larkAppId, messageId, {
+          userCardContent: true,
+          timeoutMs: 10_000,
+        });
+      } catch (error) {
+        return jsonRes(res, 502, {
+          ok: false,
+          error: 'scheduled_delivery_readback_failed',
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (!scheduledDeliveryFenceIsCurrent()) {
+        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_origin_changed' });
+      }
+      const proof = verifyScheduledFinalDeliveryReadback({
+        detail: providerDetail,
+        messageId,
+        larkAppId: scheduledDeliveryFence.larkAppId,
+        chatId: scheduledDeliveryFence.chatId,
+        expectedTarget: scheduledDeliveryFence.target,
+        proof: trustedFinalReceipt.proof,
+      });
+      if (!proof.ok) return jsonRes(res, 409, { ok: false, error: proof.error });
+    }
+    // Provider readback is the authority for a scheduled final. Settle it and,
+    // when requested, persist the cleanup envelope before touching the
+    // auxiliary feedback/delivery index. A broken index must not turn a final
+    // that Lark already proved into a failed scheduled run.
+    if (scheduledFinal && liveTurnId) {
+      if (!trustedFinalReceipt) {
+        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_receipt_unavailable' });
+      }
+      const messageId = body.messageId as string;
+      const observed = persistedCleanupReplay
+        ? false
+        : observeScheduledRunProviderReadbackDelivery(liveTurnId, messageId);
+      if (selfCleanupReceiptRequested) {
+        if (!scheduledSelfCleanupReceiptHandler) {
+          return jsonRes(res, 503, { ok: false, error: 'scheduled_cleanup_receipt_unavailable' });
+        }
+        const taskId = parseScheduledTurnId(liveTurnId)!;
+        const request = {
+          appId: ds!.larkAppId,
+          taskId,
+          turnId: liveTurnId,
+          workerGeneration: body.receiptWorkerGeneration as number,
+          ...(typeof body.receiptDispatchAttempt === 'number'
+            ? { dispatchAttempt: body.receiptDispatchAttempt }
+            : {}),
+          proof: body.receiptProof as string,
+          messageId,
+        };
+        if (persistedCleanupReplay) {
+          // The immutable envelope was loaded from Host authority storage and
+          // Provider readback re-proved the same message/target. Do not touch
+          // the one-shot scheduler rendezvous in this newer daemon generation.
+        } else if (observed) {
+          if (!scheduledSelfCleanupReceiptHandler({ action: 'record', ...request })) {
+            return jsonRes(res, 409, { ok: false, error: 'scheduled_cleanup_receipt_not_recorded' });
+          }
+        } else if (!scheduledSelfCleanupReceiptHandler({ action: 'lookup', ...request })) {
+          return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_authority_changed' });
+        }
+      } else if (!observed) {
+        return jsonRes(res, 409, { ok: false, error: 'scheduled_delivery_authority_changed' });
+      }
+    }
+    const acceptScheduledDeliveryWithoutIndex = (reason: string) => {
+      logger.warn(
+        `[turn-delivery] Trusted scheduled final settled without auxiliary delivery index: ${reason}`,
+      );
+      return jsonRes(res, 200, {
+        ok: true,
+        deliveryIndexed: false,
+        ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}),
+      });
+    };
+    let result: ReturnType<typeof recordRelayedTurnDelivery>;
+    try {
+      const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
+      const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
+      let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
+      try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
+      let trustedPresentation: Parameters<typeof recordRelayedTurnDelivery>[0]['trustedPresentation'];
+      if (ds && liveTurnId) {
+        const replyContext = frozenReplyContextForTurn(ds, liveTurnId);
+        let policy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
+        try {
+          policy = resolveFeedbackPolicyForDelivery({
+            dataDir: config.session.dataDir,
+            larkAppId: ds.larkAppId,
+            chatId: ds.chatId,
+            bot: getBot(ds.larkAppId).config,
+          });
+        } catch { /* a disappearing bot has no feedback authority */ }
+        let baseCard: Record<string, unknown> | undefined;
+        if (policy) {
+          const messageId = typeof body.messageId === 'string' ? body.messageId : '';
+          if (providerDetail === undefined) {
+            try {
+              providerDetail = await getMessageDetail(ds.larkAppId, messageId, {
+                userCardContent: true,
+                timeoutMs: 10_000,
+              });
+            } catch (error) {
+              return jsonRes(res, 502, {
+                ok: false,
+                error: 'turn_delivery_feedback_readback_failed',
+                detail: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+          baseCard = providerFinalCardFromReadback({
+            detail: providerDetail,
+            messageId,
+            larkAppId: ds.larkAppId,
+            chatId: ds.chatId,
+            expectedTarget: replyContext.target,
+          });
+          if (!baseCard) {
+            if (scheduledFinal) {
+              return acceptScheduledDeliveryWithoutIndex('turn_delivery_feedback_readback_invalid');
+            }
+            return jsonRes(res, 409, { ok: false, error: 'turn_delivery_feedback_readback_invalid' });
+          }
+        }
+        trustedPresentation = {
+          topicRootId: replyContext.target.mode === 'thread'
+            ? replyContext.target.rootMessageId
+            : ds.session.rootMessageId,
+          ...(policy ? { policy } : {}),
+          ...(baseCard ? { baseCard } : {}),
+          ...(replyContext.replyTargetSenderOpenId ?? ds.session.ownerOpenId
+            ? { requesterSubjectId: replyContext.replyTargetSenderOpenId ?? ds.session.ownerOpenId }
+            : {}),
+        };
+      }
+      if (scheduledFinal && !scheduledDeliveryFenceIsCurrent()) {
+        return acceptScheduledDeliveryWithoutIndex('scheduled_delivery_origin_changed_after_settlement');
+      }
+      result = recordRelayedTurnDelivery({
+        ds,
+        body,
+        store: feedbackStore,
+        webhookDestinations,
+        teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
+        ...(trustedPresentation ? { trustedPresentation } : {}),
+      });
+    } catch (error) {
+      if (scheduledFinal && trustedFinalReceipt) {
+        return acceptScheduledDeliveryWithoutIndex(
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      throw error;
+    }
+    if (!result.ok && scheduledFinal && trustedFinalReceipt) {
+      return acceptScheduledDeliveryWithoutIndex(result.error);
+    }
     return result.ok
-      ? jsonRes(res, 200, result)
+      ? jsonRes(res, 200, {
+          ...result,
+          ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}),
+        })
       : jsonRes(res, result.status, { ok: false, error: result.error });
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });

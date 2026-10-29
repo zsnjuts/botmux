@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto';
+import { isConfirmedLarkMessageId } from '../core/scheduled-run-settlement.js';
+import {
+  matchesScheduledFinalReceiptEnvelope,
+  parseScheduledFinalReceiptEnvelope,
+  scheduledFinalReceiptEnvelope,
+  type ScheduledFinalReceiptEnvelope,
+} from '../core/scheduled-final-delivery-proof.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
+import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
 export function durablePrimaryFinalProviderUuid(input: {
   larkAppId: string;
@@ -23,7 +31,20 @@ export interface DurableSessionSendInput {
   content: string;
   msgType: string;
   providerUuid: string;
+  responseKind: TurnSendKind;
+  expectedReceipt?: {
+    turnId: string;
+    workerGeneration: number;
+    dispatchAttempt?: number;
+    proof: string;
+  };
+  scheduleSelfCleanup?: boolean;
   hookContext?: Record<string, unknown>;
+}
+
+export interface DurableSessionDelivery {
+  messageId: string;
+  trustedFinalReceipt?: ScheduledFinalReceiptEnvelope;
 }
 
 export interface DurableSessionSendDeps {
@@ -40,6 +61,7 @@ type DurableSessionSendResponse = {
   ok?: boolean;
   kind?: string;
   messageId?: string;
+  trustedFinalReceipt?: unknown;
   error?: string;
 };
 
@@ -57,13 +79,15 @@ function sleep(ms: number): Promise<void> {
 export async function dispatchDurableSessionMessage(
   deps: DurableSessionSendDeps,
   input: DurableSessionSendInput,
-): Promise<string> {
+): Promise<DurableSessionDelivery> {
   const payload = {
     turnId: input.turnId,
     target: input.target,
     content: input.content,
     msgType: input.msgType,
     providerUuid: input.providerUuid,
+    responseKind: input.responseKind,
+    ...(input.scheduleSelfCleanup === true ? { scheduleSelfCleanup: true } : {}),
     ...(input.hookContext ? { hookContext: input.hookContext } : {}),
   };
   let lastError = 'owning daemon did not return a response';
@@ -80,8 +104,25 @@ export async function dispatchDurableSessionMessage(
     }
     const body = await response.json().catch(() => ({})) as DurableSessionSendResponse;
     if (response.ok && body.ok === true && body.kind === 'delivered'
-        && typeof body.messageId === 'string' && body.messageId.startsWith('om_')) {
-      return body.messageId;
+        && isConfirmedLarkMessageId(body.messageId)) {
+      const expected = input.expectedReceipt
+        ? scheduledFinalReceiptEnvelope({
+            messageId: body.messageId,
+            ...input.expectedReceipt,
+          })
+        : undefined;
+      let trustedFinalReceipt = expected
+        && matchesScheduledFinalReceiptEnvelope(body.trustedFinalReceipt, expected)
+        ? expected
+        : undefined;
+      if (!trustedFinalReceipt && input.scheduleSelfCleanup === true) {
+        const persisted = parseScheduledFinalReceiptEnvelope(body.trustedFinalReceipt);
+        if (persisted?.messageId === body.messageId
+            && persisted.turnId === input.turnId) {
+          trustedFinalReceipt = persisted;
+        }
+      }
+      return { messageId: body.messageId, ...(trustedFinalReceipt ? { trustedFinalReceipt } : {}) };
     }
     const detail = typeof body.error === 'string' && body.error.trim()
       ? body.error.trim()

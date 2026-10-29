@@ -858,6 +858,25 @@ describe('RemoteRunnerBackend', () => {
       .resolves.toMatchObject({ submitted: false, submissionDisposition: 'untouched' });
   });
 
+  it('uses the shutdown-only operation cap without shrinking ordinary operations', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'stalled-reattach',
+      operationTimeoutMs: 1_000,
+    }, 'session-capped-shutdown');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, stalledReattachRunner);
+    await ready;
+
+    await expect(backend.prepareShutdownDetach(undefined, 100)).resolves.toMatchObject({ ok: true });
+    const startedAt = Date.now();
+    await expect(backend.abortShutdownDetach(100)).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringContaining('reattach timed out'),
+    });
+    expect(Date.now() - startedAt).toBeLessThan(800);
+  });
+
   it('fails closed when persisted state belongs to another provider', () => {
     expect(() => new RemoteRunnerBackend({ expectedProvider: 'reference' }, 'session-1', {
       version: 1,

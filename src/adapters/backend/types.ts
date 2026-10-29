@@ -423,10 +423,15 @@ export interface SessionBackend {
    * writes, drain every write accepted before the fence, and return the exact
    * final lineage without cancelling it. The daemon persists that lineage
    * before telling the worker it may exit. */
-  prepareShutdownDetach?(drainTimeoutMs?: number): Promise<SessionShutdownDetachResult>;
+  prepareShutdownDetach?(
+    drainTimeoutMs?: number,
+    operationTimeoutMs?: number,
+  ): Promise<SessionShutdownDetachResult>;
   /** Restore admission/streaming when the daemon cannot complete a prepared
    * shutdown detach (for example, lineage persistence failed). */
-  abortShutdownDetach?(): SessionShutdownDetachResult | Promise<SessionShutdownDetachResult>;
+  abortShutdownDetach?(
+    operationTimeoutMs?: number,
+  ): SessionShutdownDetachResult | Promise<SessionShutdownDetachResult>;
   /** Finalize a shutdown detach after exact lineage persistence has been
    * acknowledged by the daemon. Shutdown refusal never cancels remote work. */
   commitShutdownDetach?(): void;

@@ -31,7 +31,11 @@ import {
   type RemoteRunnerSessionToolResult,
   type RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
-import type { RemoteRunnerConfig } from './remote-runner-config.js';
+import {
+  REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS,
+  REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
+  type RemoteRunnerConfig,
+} from './remote-runner-config.js';
 
 type PendingRequest = {
   command: RemoteRunnerCommand;
@@ -67,8 +71,8 @@ const MAX_OUTBOUND_MESSAGES_PER_TURN = 10;
 const MAX_SESSION_TOOLS_PER_TURN = 30;
 const MAX_DEFERRED_RECOVERED_EVENTS = 128;
 
-function boundedTimeout(value: number | undefined, fallback: number): number {
-  if (!Number.isSafeInteger(value) || value! < 100 || value! > 300_000) return fallback;
+function boundedTimeout(value: number | undefined, fallback: number, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value! < 100 || value! > maximum) return fallback;
   return value!;
 }
 
@@ -168,8 +172,16 @@ export class RemoteRunnerBackend implements SessionBackend {
     initialState?: RemoteRunnerBackendState,
   ) {
     this.requiredCapabilities = config.requiredCapabilities ?? REMOTE_RUNNER_BASE_CAPABILITIES;
-    this.handshakeTimeoutMs = boundedTimeout(config.handshakeTimeoutMs, 15_000);
-    this.operationTimeoutMs = boundedTimeout(config.operationTimeoutMs, 30_000);
+    this.handshakeTimeoutMs = boundedTimeout(
+      config.handshakeTimeoutMs,
+      15_000,
+      REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS,
+    );
+    this.operationTimeoutMs = boundedTimeout(
+      config.operationTimeoutMs,
+      30_000,
+      REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
+    );
     if (initialState) {
       const normalized = normalizeRemoteRunnerBackendState(initialState);
       if (!normalized) throw new Error('remote runner initial state is invalid');
@@ -463,7 +475,18 @@ export class RemoteRunnerBackend implements SessionBackend {
 
   commitDestroySession(): void { this.kill(); }
 
-  async prepareShutdownDetach(drainTimeoutMs?: number): Promise<SessionShutdownDetachResult> {
+  private shutdownOperationTimeoutMs(override: number | undefined): number {
+    if (override === undefined) return this.operationTimeoutMs;
+    if (!Number.isSafeInteger(override) || override < 100) {
+      throw new Error('remote runner shutdown operation timeout is invalid');
+    }
+    return Math.min(this.operationTimeoutMs, override);
+  }
+
+  async prepareShutdownDetach(
+    drainTimeoutMs?: number,
+    operationTimeoutMs?: number,
+  ): Promise<SessionShutdownDetachResult> {
     this.shutdownDetaching = true;
     try {
       if (!this.startupPromise) throw new Error('remote runner has not spawned');
@@ -489,7 +512,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       const event = await this.request(
         remoteRunnerCommand('detach', { requestId: this.requestId('detach') }),
         candidate => candidate.type === 'status' && candidate.status === 'detached',
-        this.operationTimeoutMs,
+        this.shutdownOperationTimeoutMs(operationTimeoutMs),
       );
       if (event.type !== 'status' || event.status !== 'detached') throw new Error('provider did not confirm detach');
       if (event.state) this.applyState(event.state);
@@ -506,7 +529,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
   }
 
-  async abortShutdownDetach(): Promise<SessionShutdownDetachResult> {
+  async abortShutdownDetach(operationTimeoutMs?: number): Promise<SessionShutdownDetachResult> {
     if (!this.child || this.killed) {
       return { ok: false, taskId: null, error: 'provider process is unavailable' };
     }
@@ -518,7 +541,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       const event = await this.request(
         remoteRunnerCommand('reattach', { requestId: this.requestId('reattach') }),
         candidate => candidate.type === 'status' && candidate.status === 'ready',
-        this.operationTimeoutMs,
+        this.shutdownOperationTimeoutMs(operationTimeoutMs),
       );
       if (event.type !== 'status' || event.status !== 'ready') {
         throw new Error('provider did not confirm reattach');

@@ -12,7 +12,7 @@ import type { ScheduledTask, Session } from '../src/types.js';
 
 const scheduledTurn = 'schedule:a1b2c3d4:00000000-0000-4000-8000-000000000000';
 
-function session(): Session {
+function session(overrides: Partial<Session> = {}): Session {
   return {
     sessionId: 'session-1',
     chatId: 'oc_chat',
@@ -24,6 +24,7 @@ function session(): Session {
     createdAt: '2026-10-24T00:00:00.000Z',
     lastMessageAt: '2026-10-24T00:01:00.000Z',
     larkAppId: 'cli_test',
+    ...overrides,
   };
 }
 
@@ -39,8 +40,14 @@ function message(messageId = 'om_input'): DurableLarkMessageClaim {
   };
 }
 
-function current(messageId = 'om_input'): DurableSessionRecord {
-  const projection = durablePrimarySessionProjection(session(), message(messageId));
+function current(
+  messageId = 'om_input',
+  sessionOverrides: Partial<Session> = {},
+): DurableSessionRecord {
+  const projection = durablePrimarySessionProjection(
+    session(sessionOverrides),
+    message(messageId),
+  );
   return {
     sessionKey: projection.sessionKey,
     revision: 1,
@@ -145,6 +152,47 @@ describe('durable primary scheduled output claim', () => {
     });
   });
 
+  it('replaces a closed prior logical Session for unbound scheduled output', () => {
+    expect(resolveDurablePrimaryOutputClaim({
+      current: current('om_input', {
+        sessionId: 'closed-session',
+        status: 'closed',
+      }),
+      turnId: scheduledTurn,
+      daemonSession: daemonSession(),
+      authority: authority({
+        state: 'completed',
+        task: task({ enabled: false, disabledReason: 'once_completed' }),
+      }),
+    })).toMatchObject({
+      eventId: `im.message.receive_v1:cli_test:${scheduledTurn}`,
+      messageId: scheduledTurn,
+    });
+  });
+
+  it('rejects replacing an active prior logical Session', () => {
+    expect(() => resolveDurablePrimaryOutputClaim({
+      current: current('om_input', { sessionId: 'active-session' }),
+      turnId: scheduledTurn,
+      daemonSession: daemonSession(),
+      authority: authority(),
+    })).toThrow('durable primary Session snapshot belongs to another logical Session');
+  });
+
+  it('rejects replacing the Session bound to a scheduled task', () => {
+    expect(() => resolveDurablePrimaryOutputClaim({
+      current: current('om_input', {
+        sessionId: 'bound-session',
+        status: 'closed',
+      }),
+      turnId: scheduledTurn,
+      daemonSession: daemonSession(),
+      authority: authority({
+        task: task({ boundSessionId: 'bound-session' }),
+      }),
+    })).toThrow('durable primary Session snapshot belongs to another logical Session');
+  });
+
   it.each([
     ['changed managed turn', { managedTurnOrigin: { turnId: 'om_other', capability: 'cap', preexistingProcessIdentities: [] } }, authority()],
     ['paused authority', {}, authority({ state: 'paused' })],
@@ -156,6 +204,31 @@ describe('durable primary scheduled output claim', () => {
       turnId: scheduledTurn,
       daemonSession: { ...daemonSession(), ...sessionPatch },
       authority: record,
+    })).toThrow(/durable scheduled output authority is not committed/);
+  });
+
+  it('accepts the origin frozen at final_output after turn_terminal revoked the live one', () => {
+    const revoked = { ...daemonSession(), managedTurnOrigin: undefined };
+    expect(resolveDurablePrimaryOutputClaim({
+      current: current(),
+      turnId: scheduledTurn,
+      daemonSession: revoked,
+      authority: authority(),
+      frozenScheduledTurnId: scheduledTurn,
+    })).toMatchObject({ messageId: scheduledTurn });
+    expect(() => resolveDurablePrimaryOutputClaim({
+      current: current(),
+      turnId: scheduledTurn,
+      daemonSession: revoked,
+      authority: authority(),
+      frozenScheduledTurnId: 'schedule:a1b2c3d4:11111111-1111-4111-8111-111111111111',
+    })).toThrow(/durable scheduled output authority is not committed/);
+    expect(() => resolveDurablePrimaryOutputClaim({
+      current: current(),
+      turnId: scheduledTurn,
+      daemonSession: revoked,
+      authority: authority({ state: 'paused' }),
+      frozenScheduledTurnId: scheduledTurn,
     })).toThrow(/durable scheduled output authority is not committed/);
   });
 

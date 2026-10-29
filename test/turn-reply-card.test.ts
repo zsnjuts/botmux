@@ -12,6 +12,11 @@ import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { extractCotEntries } from '../src/services/claude-transcript.js';
+import {
+  deriveScheduledFinalDeliveryProof,
+  stampScheduledFinalDeliveryProof,
+  verifyScheduledFinalDeliveryReadback,
+} from '../src/core/scheduled-final-delivery-proof.js';
 
 const key = { larkAppId: 'app_test', sessionId: 'session', turnId: 'om_turn' };
 const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' };
@@ -484,6 +489,57 @@ describe('one reply card per turn', () => {
     expect(card).toContain('完整答复较长');
     expect(card).toContain('已截断');
     expect(store.read(key)?.finalText).toBe(text);
+  });
+
+  it('preserves the scheduled final proof carrier when a long final becomes an attachment', async () => {
+    const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000088';
+    const proof = deriveScheduledFinalDeliveryProof({ turnId, workerGeneration: 3 })!;
+    const text = '定时任务长答复。'.repeat(6000);
+    const card = JSON.parse(buildCanonicalFinalReplyCard({ markdown: text }));
+    const footerIndex = card.body.elements.findIndex((element: any) =>
+      element.element_id === 'botmux_reply_footer');
+    const footer = card.body.elements.splice(footerIndex, 1)[0];
+    card.body.elements.push({
+      tag: 'column_set',
+      columns: [
+        { tag: 'column', elements: [footer] },
+        { tag: 'column', elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'voice' } }] },
+      ],
+    });
+    stampScheduledFinalDeliveryProof(card, proof);
+    io.sendOverflow = vi.fn(async () => 'om_scheduled_full_answer');
+
+    const final = await store.update(key, {
+      kind: 'final',
+      text,
+      card: JSON.stringify(card),
+      source: 'explicit',
+    }, io);
+    const rendered = JSON.parse(cards.get(final.messageId!)!);
+
+    const voiceRow = rendered.body.elements.find((element: any) => element.tag === 'column_set');
+    const renderedFooter = voiceRow?.columns?.flatMap((column: any) => column.elements ?? [])
+      .find((element: any) => element.element_id === 'botmux_reply_footer');
+    expect(renderedFooter?.content).toContain(`#${proof}`);
+    expect(rendered.body.elements.some((element: any) => element.tag === 'hr'
+      && element.element_id === proof)).toBe(false);
+    expect(verifyScheduledFinalDeliveryReadback({
+      detail: { items: [{
+        message_id: 'om_scheduled_overflow',
+        chat_id: input.chatId,
+        deleted: false,
+        msg_type: 'interactive',
+        sender: { id: key.larkAppId, id_type: 'app_id', sender_type: 'app' },
+        body: { content: JSON.stringify(rendered) },
+      }] },
+      messageId: 'om_scheduled_overflow',
+      larkAppId: key.larkAppId,
+      chatId: input.chatId,
+      expectedTarget: { mode: 'plain', chatId: input.chatId },
+      proof,
+    })).toEqual({ ok: true });
+    expect(cards.get(final.messageId!)!).toContain('Markdown 附件');
+    expect(io.sendOverflow).toHaveBeenCalledWith(text, expect.any(String));
   });
 
   it('checks current authority again before a provider effect', async () => {

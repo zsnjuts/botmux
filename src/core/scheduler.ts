@@ -11,9 +11,17 @@ import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
-import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
-import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
+import type {
+  CommitDelegatedScheduleResult,
+  DelegatedScheduleControl,
+  ScheduleAuthorityStore,
+  ScheduleSelfCleanupReceipt,
+} from '../services/schedule-authority-store.js';
 import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
+import {
+  revokeScheduledRunSettlements,
+  ScheduledRunDeliveryError,
+} from './scheduled-run-settlement.js';
 
 export interface ScheduleExecutionContext {
   runId: string;
@@ -260,6 +268,20 @@ function recordRuntimeCalendarCheck(
   mutateRuntimeTask(id, task => ({ ...task, lastCalendarCheck: check }));
 }
 
+function expireUnschedulableOnce(id: string): void {
+  const task = runtimeTask(id);
+  if (!task || !task.enabled) return;
+  logger.warn(`[scheduler] One-shot task ${id} run time ${task.parsed.runAt ?? '?'} passed before it could be scheduled; disabling`);
+  mutateRuntimeTask(id, current => ({
+    ...current,
+    enabled: false,
+    disabledReason: 'once_completed',
+    nextRunAt: undefined,
+    lastStatus: 'error',
+    lastError: 'once_schedule_missed: run time passed before the task could be scheduled',
+  }));
+}
+
 function markRuntimeRun(
   id: string,
   success: boolean,
@@ -362,7 +384,10 @@ function parseTimeHM(s: string): { hour: number; minute: number; rest: string } 
 }
 
 /** Parse Chinese NL → { parsed, rest } where rest is the remaining text after schedule. */
-function parseChineseSchedule(input: string): { parsed: ParsedSchedule; rest: string } | null {
+function parseChineseSchedule(
+  input: string,
+  referenceTimeMs: number = Date.now(),
+): { parsed: ParsedSchedule; rest: string } | null {
   const s = input.trim();
 
   // 工作日每天 HH:MM
@@ -418,7 +443,7 @@ function parseChineseSchedule(input: string): { parsed: ParsedSchedule; rest: st
   m = s.match(/^(\d+)\s*分钟后\s*(.*)/);
   if (m) {
     const min = parseInt(m[1]);
-    const runAt = new Date(Date.now() + min * 60_000).toISOString();
+    const runAt = new Date(referenceTimeMs + min * 60_000).toISOString();
     return { parsed: { kind: 'once', runAt, display: `${min} 分钟后` }, rest: m[2] };
   }
 
@@ -426,7 +451,7 @@ function parseChineseSchedule(input: string): { parsed: ParsedSchedule; rest: st
   m = s.match(/^(\d+)\s*小时后\s*(.*)/);
   if (m) {
     const h = parseInt(m[1]);
-    const runAt = new Date(Date.now() + h * 3600_000).toISOString();
+    const runAt = new Date(referenceTimeMs + h * 3600_000).toISOString();
     return { parsed: { kind: 'once', runAt, display: `${h} 小时后` }, rest: m[2] };
   }
 
@@ -437,7 +462,7 @@ function parseChineseSchedule(input: string): { parsed: ParsedSchedule; rest: st
     if (t) {
       // 「明天HH:MM」是墙上时间：解析到 scheduleTimeZone()（与 cron 触发/显示同源），
       // 而非主机本地 setHours() —— 否则在非目标时区主机上，一次性与重复类会错开一个时差。
-      const d = zonedTomorrowAt(scheduleTimeZone(), t.hour, t.minute);
+      const d = zonedTomorrowAt(scheduleTimeZone(), t.hour, t.minute, referenceTimeMs);
       return { parsed: { kind: 'once', runAt: d.toISOString(), display: `明天 ${t.hour}:${String(t.minute).padStart(2,'0')}` }, rest: t.rest };
     }
   }
@@ -459,12 +484,46 @@ function cronPS(expr: string, display: string): ParsedSchedule {
  *   - Cron expression: "0 9 * * *" (5 space-separated fields)
  *   - ISO timestamp: "2026-05-01T10:00:00" (one-shot at time)
  */
-export function parseSchedule(input: string): ParsedSchedule {
+export interface ScheduleParseOptions {
+  /** A live Lark turn must never replace a missing platform create_time with
+   * daemon admission/tool time for relative schedules. */
+  requireTrustedReferenceTime?: boolean;
+}
+
+export function scheduleRequiresReferenceTime(input: string): boolean {
+  const s = input.trim();
+  return /^(?:\d+\s*分钟后|\d+\s*小时后|明天)/u.test(s)
+    || /^\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i.test(s);
+}
+
+function scheduleReferenceTime(
+  input: string,
+  referenceTimeMs: number | undefined,
+  opts: ScheduleParseOptions,
+): number {
+  if (referenceTimeMs !== undefined
+      && (!Number.isFinite(referenceTimeMs) || referenceTimeMs <= 0)) {
+    throw new Error('invalid schedule reference time');
+  }
+  if (referenceTimeMs === undefined
+      && opts.requireTrustedReferenceTime === true
+      && scheduleRequiresReferenceTime(input)) {
+    throw new Error('schedule_reference_time_unavailable');
+  }
+  return referenceTimeMs ?? Date.now();
+}
+
+export function parseSchedule(
+  input: string,
+  referenceTimeMs?: number,
+  opts: ScheduleParseOptions = {},
+): ParsedSchedule {
   const s = input.trim();
   if (!s) throw new Error('empty schedule');
+  const effectiveReferenceTimeMs = scheduleReferenceTime(s, referenceTimeMs, opts);
 
   // Chinese NL (match only the schedule portion — prompt is separate)
-  const zh = parseChineseSchedule(s);
+  const zh = parseChineseSchedule(s, effectiveReferenceTimeMs);
   if (zh && !zh.rest.trim()) return zh.parsed;
   if (zh && zh.rest.trim()) {
     // Caller passed "每日17:50" without prompt — rest should be empty for bare parse
@@ -505,7 +564,7 @@ export function parseSchedule(input: string): ParsedSchedule {
   m = s.match(/^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i);
   if (m) {
     const minutes = durationToMinutes(m[1], m[2]);
-    const runAt = new Date(Date.now() + minutes * 60_000).toISOString();
+    const runAt = new Date(effectiveReferenceTimeMs + minutes * 60_000).toISOString();
     return { kind: 'once', runAt, display: `once in ${s}` };
   }
 
@@ -532,8 +591,14 @@ interface ParseNLResult {
  * from the prompt (the task instruction).  Used by the /schedule command
  * handler where user types e.g. "/schedule 每日17:50 帮我看看AI新闻".
  */
-export function parseNaturalSchedule(input: string): ParseNLResult | null {
-  const zh = parseChineseSchedule(input.trim());
+export function parseNaturalSchedule(
+  input: string,
+  referenceTimeMs?: number,
+  opts: ScheduleParseOptions = {},
+): ParseNLResult | null {
+  const trimmed = input.trim();
+  const effectiveReferenceTimeMs = scheduleReferenceTime(trimmed, referenceTimeMs, opts);
+  const zh = parseChineseSchedule(trimmed, effectiveReferenceTimeMs);
   if (!zh) return null;
 
   // Clean prompt: remove leading connectors and quotes
@@ -663,6 +728,29 @@ export function computeNextRun(parsed: ParsedSchedule, lastRunAt?: string): stri
   return null;
 }
 
+/**
+ * First nextRunAt for a task being created. Relative one-shots are anchored to
+ * the source message (`referenceTimeMs`), so a slow model turn or a delayed
+ * inbox can finish creation after the target already passed — beyond the
+ * one-shot grace `computeNextRun` would return null and the task would sit
+ * active but never fire. A target that was still in the future when the user
+ * asked fires once immediately instead; a target already in the past at that
+ * moment (or with no anchor) is rejected rather than stored as a dead task.
+ */
+export function computeInitialNextRun(
+  parsed: ParsedSchedule,
+  referenceTimeMs?: number,
+  nowMs = Date.now(),
+): string | undefined {
+  const next = computeNextRun(parsed);
+  if (next || parsed.kind !== 'once') return next ?? undefined;
+  const runAtMs = parsed.runAt ? Date.parse(parsed.runAt) : Number.NaN;
+  if (Number.isFinite(runAtMs) && referenceTimeMs !== undefined && runAtMs >= referenceTimeMs) {
+    return new Date(nowMs).toISOString();
+  }
+  throw new Error('once_schedule_in_past');
+}
+
 /** Compute grace window (how late a missed run can be and still catch up) */
 function computeGraceSeconds(parsed: ParsedSchedule): number {
   let periodSec: number;
@@ -709,7 +797,12 @@ async function tick(): Promise<void> {
     if (!nextRunAt) {
       // Recover: compute from parsed + lastRunAt
       const recovered = computeNextRun(task.parsed, task.lastRunAt);
-      if (!recovered) continue;
+      if (!recovered) {
+        // A never-run one-shot with no computable run time would otherwise
+        // stay active forever without firing or reporting anything.
+        if (task.parsed.kind === 'once' && !task.lastRunAt) expireUnschedulableOnce(task.id);
+        continue;
+      }
       nextRunAt = recovered;
       mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt }));
     }
@@ -806,7 +899,13 @@ async function tick(): Promise<void> {
         .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
         .catch(err => {
           logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
-          markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
+          markRuntimeRun(
+            taskId,
+            false,
+            err.message,
+            err instanceof ScheduledRunDeliveryError ? err.message : undefined,
+            executionContext.runId,
+          );
           cleanupIfTaskWasAutoRemoved(claimedTask);
           dashboardEventBus.publish({
             type: 'schedule.fired',
@@ -955,6 +1054,13 @@ export function addTask(params: {
   /** Creator's Lark union_id (tenant-stable). Stamped only for human creators;
    *  a task without it runs its scheduled turns with no user identity. */
   ownerUnionId?: string;
+  /** Trusted time anchor for relative/"tomorrow" schedules. This is creation
+   *  input only and is never persisted: the parsed absolute runAt is the
+   *  durable fact. Managed Lark turns derive it from the source message. */
+  referenceTimeMs?: number;
+  /** Managed live-turn creation requires a platform create_time for relative
+   * schedules; absolute timestamps and recurring expressions remain valid. */
+  requireTrustedReferenceTime?: boolean;
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -974,13 +1080,15 @@ export function addTask(params: {
         chatIds: params.chatIds,
       });
   assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId]);
-  const parsed = params.parsed ?? parseSchedule(params.schedule);
+  const parsed = params.parsed ?? parseSchedule(params.schedule, params.referenceTimeMs, {
+    requireTrustedReferenceTime: params.requireTrustedReferenceTime,
+  });
   const calendar = normalizeCalendarBinding(params.calendar);
   const dayType = normalizeCalendarDayType(params.calendarDayType);
   if (!calendar && dayType === 'restday') throw new Error('calendar_required');
   const calendarDayType = calendar && dayType === 'restday' ? dayType : undefined;
   if (calendar && parsed.kind === 'once') throw new Error('calendar_once_unsupported');
-  const nextRunAt = computeNextRun(parsed) ?? undefined;
+  const nextRunAt = computeInitialNextRun(parsed, params.referenceTimeMs);
   const executionPosition: ScheduleExecutionPosition = params.executionPosition
     ?? (params.deliver === 'new-topic'
       ? 'new-topic'
@@ -1088,7 +1196,9 @@ export function commitDelegatedTask(input: {
     throw new Error('schedule_authority_store_unavailable');
   }
   const params = input.params;
-  const parsed = params.parsed ?? parseSchedule(params.schedule);
+  const parsed = params.parsed ?? parseSchedule(params.schedule, params.referenceTimeMs, {
+    requireTrustedReferenceTime: params.requireTrustedReferenceTime,
+  });
   const targets = scheduleStore.normalizeScheduleChatTargets({
     chatId: params.chatId,
     chatIds: params.chatIds,
@@ -1136,7 +1246,7 @@ export function commitDelegatedTask(input: {
     ownerUnionId: undefined,
     enabled: true,
     createdAt,
-    nextRunAt: computeNextRun(parsed) ?? undefined,
+    nextRunAt: computeInitialNextRun(parsed, params.referenceTimeMs),
     repeat: params.repeat,
     deliver: 'origin',
     silent: params.silent === true ? true : undefined,
@@ -1201,8 +1311,26 @@ export function removeTask(id: string): boolean {
   if (removed && appId && authorityStore?.isInitialized(appId)) {
     scheduleStore.removeAuthoritativeTaskProjection(id, appId);
   }
+  if (removed) revokeScheduledRunSettlements(id, appId || undefined);
   if (removed) cleanupRemovedTaskSidecars(task);
   return removed;
+}
+
+/** Versioned final-cleanup mutation. The authority store compares the exact
+ * persisted Provider receipt and revokes the task in one transaction; this is
+ * deliberately separate from ordinary operator/provider `remove`. */
+export function removeTaskAfterVerifiedFinal(
+  receipt: ScheduleSelfCleanupReceipt,
+): { replay: boolean } {
+  assertScheduleAuthorityAvailable();
+  if (!authorityStore || !authorityStore.isInitialized(receipt.appId)) {
+    throw new Error('schedule_authority_store_unavailable');
+  }
+  const result = authorityStore.revokeWithSelfCleanupReceipt(receipt);
+  scheduleStore.removeAuthoritativeTaskProjection(receipt.taskId, receipt.appId);
+  revokeScheduledRunSettlements(receipt.taskId, receipt.appId);
+  cleanupRemovedTaskSidecars(result.task);
+  return { replay: result.replay };
 }
 
 export function enableTask(id: string): boolean {
@@ -1300,7 +1428,13 @@ export function runNow(id: string): { ok: boolean; error?: string } {
     outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      markRuntimeRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      markRuntimeRun(
+        claimedTask.id,
+        false,
+        msg,
+        err instanceof ScheduledRunDeliveryError ? msg : undefined,
+        executionContext.runId,
+      );
       cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
         type: 'schedule.fired',

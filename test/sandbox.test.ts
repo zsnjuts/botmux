@@ -475,14 +475,25 @@ describe('validateRelayRequest', () => {
   it('forces host-relayed cards to use probe-free lexical link repair', () => {
     expect(buildRelayHostEnv({
       BOTMUX_SEND_RELAY: '/sandbox/outbox',
+      BOTMUX_LARK_APP_ID: 'cli_current',
+      BOTMUX_LARK_APP_SECRET: 'remote-pane-secret',
+      BOTMUX_SESSION_ID: 'sid_current',
+      BOTMUX_CHAT_ID: 'oc_current',
       BOTMUX_CARD_LOCAL_LINK_MODE: 'filesystem',
       KEEP_ME: 'yes',
     })).toMatchObject({
       BOTMUX_CARD_LOCAL_LINK_MODE: 'lexical',
+      BOTMUX_LARK_APP_ID: 'cli_current',
+      BOTMUX_SESSION_ID: 'sid_current',
+      BOTMUX_CHAT_ID: 'oc_current',
       KEEP_ME: 'yes',
     });
-    expect(buildRelayHostEnv({ BOTMUX_SEND_RELAY: '/sandbox/outbox' }))
-      .not.toHaveProperty('BOTMUX_SEND_RELAY');
+    const hostEnv = buildRelayHostEnv({
+      BOTMUX_SEND_RELAY: '/sandbox/outbox',
+      BOTMUX_LARK_APP_SECRET: 'remote-pane-secret',
+    });
+    expect(hostEnv).not.toHaveProperty('BOTMUX_SEND_RELAY');
+    expect(hostEnv).not.toHaveProperty('BOTMUX_LARK_APP_SECRET');
 
     expect(buildRelayHostEnv({}, '/private/staging/prepared.md')).toMatchObject({
       BOTMUX_CARD_LOCAL_LINK_MODE: 'disabled',

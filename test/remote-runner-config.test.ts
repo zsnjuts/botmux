@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
-import { normalizeRemoteRunnerConfig } from '../src/adapters/backend/remote-runner-config.js';
+import {
+  REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS,
+  REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS,
+  normalizeRemoteRunnerConfig,
+} from '../src/adapters/backend/remote-runner-config.js';
 import { createCliAdapterSync, rawCliExecutable } from '../src/adapters/cli/registry.js';
 import { isRemoteBackendType, resolvePairedSpawnBackendType } from '../src/core/persistent-backend.js';
 
@@ -30,6 +34,22 @@ describe('remote runner config surface', () => {
     expect(() => normalizeRemoteRunnerConfig({
       requiredCapabilities: ['outbound_message', 'outbound_message_schedule_self_cleanup'],
     })).toThrow(/requires outbound_message_final/);
+  });
+
+  it('accepts a bounded cold-start acknowledgement budget above five minutes', () => {
+    expect(normalizeRemoteRunnerConfig({
+      handshakeTimeoutMs: 300_000,
+      operationTimeoutMs: 900_000,
+    })).toEqual({
+      handshakeTimeoutMs: 300_000,
+      operationTimeoutMs: 900_000,
+    });
+    expect(() => normalizeRemoteRunnerConfig({
+      handshakeTimeoutMs: REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS + 1,
+    })).toThrow(new RegExp(String(REMOTE_RUNNER_MAX_HANDSHAKE_TIMEOUT_MS)));
+    expect(() => normalizeRemoteRunnerConfig({
+      operationTimeoutMs: REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS + 1,
+    })).toThrow(new RegExp(String(REMOTE_RUNNER_MAX_OPERATION_TIMEOUT_MS)));
   });
 
   it('loads remote-runner without embedding credentials or provider endpoints', () => {
