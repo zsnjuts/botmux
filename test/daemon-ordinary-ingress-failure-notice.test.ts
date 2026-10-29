@@ -2,6 +2,7 @@ import {
   __testOnly_durablePrimaryWorkerAdmission,
   __testOnly_handleDocComment,
   __testOnly_recordDurablePrimaryInputCommit,
+  __testOnly_handleWorkerTurnInputRejected,
   __testOnly_submitDurablePrimaryRetryTurn,
 } from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
@@ -1261,6 +1262,44 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       admitted: false,
       retryReason: 'session has an unfinished turn',
     });
+  });
+
+  it('retries a handed-back steer at once and does not mark it admitted', async () => {
+    const anchor = 'om_thread_primary_steer_handback';
+    const turnId = 'om_primary_steer_handback_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    // The worker takes the steer but the target turn ends before it lands.
+    ds.worker.send = vi.fn((message: any) => {
+      if (message.type !== 'message' || message.turnId !== turnId) return;
+      setImmediate(() => __testOnly_handleWorkerTurnInputRejected(ds, {
+        type: 'turn_input_rejected',
+        turnId,
+        reason: 'active_turn_steer_target_ended',
+        rejectedBeforeAdmission: true,
+      }, 12));
+    });
+    ds.activeTurnControls = { worker: ds.worker, steer: true, interrupt: false };
+    const queuePostAdmissionOutput = vi.fn();
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 1, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+
+    const started = Date.now();
+    await handleThreadReply(makeEventData(turnId, 'add this constraint now', anchor), ctx);
+
+    // Not the 60 s receipt timeout, and not "admitted": an admitted retry
+    // would be deduplicated away and the follow-up lost.
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'provider submit receipt is still pending',
+    });
+    expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
   });
 
   it('sends the steer notice on a retry when the steer committed after the previous attempt gave up', async () => {
