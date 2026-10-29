@@ -1,7 +1,7 @@
 /**
  * Daemon side of the person-authenticated admin API (`infrabuddy`).
  *
- * The Dashboard verifies the caller's ByteCloud JWT and forwards only the
+ * The Dashboard verifies the caller's SSO JWT and forwards only the
  * verified corporate email over the trusted-host IPC. Everything here re-derives
  * the authority from this bot's own state: the email is resolved to an open_id
  * with this bot's Lark app (open_id is app-scoped) and must be in the bot's

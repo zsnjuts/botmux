@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ADMIN_API_PREFIX, adminApiEnabledFromEnv, handleAdminApi, type AdminApiDeps } from '../src/dashboard/admin-api.js';
-import type { JwtVerifyResult } from '../src/dashboard/bytecloud-jwt.js';
+import type { JwtVerifyResult } from '../src/dashboard/admin-jwt.js';
 import {
   authorizeAdmin,
   createEmailOpenIdCache,
@@ -58,11 +58,12 @@ async function start(overrides: Partial<AdminApiDeps> & { daemon?: (call: Daemon
 }
 
 describe('admin API (dashboard layer)', () => {
-  it('needs both the opt-in flag and an https key-set URL from the deployment', () => {
+  it('needs both the opt-in flag and a configured verifier from the deployment', () => {
+    const verifier = { BOTMUX_ADMIN_JWKS_URL: 'https://keys.example/jwks', BOTMUX_ADMIN_JWT_ISSUER: 'https://sso.example' };
     expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_API: 'on' })).toBe(false);
-    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_API: 'on', BOTMUX_ADMIN_JWKS_URL: 'http://keys.example/jwks' })).toBe(false);
-    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_API: 'on', BOTMUX_ADMIN_JWKS_URL: 'https://keys.example/jwks' })).toBe(true);
-    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_JWKS_URL: 'https://keys.example/jwks' })).toBe(false);
+    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_API: 'on', BOTMUX_ADMIN_JWKS_URL: verifier.BOTMUX_ADMIN_JWKS_URL })).toBe(false);
+    expect(adminApiEnabledFromEnv({ BOTMUX_ADMIN_API: 'on', ...verifier })).toBe(true);
+    expect(adminApiEnabledFromEnv(verifier)).toBe(false);
   });
 
   it('is invisible until the deployment opts in', async () => {
@@ -71,7 +72,7 @@ describe('admin API (dashboard layer)', () => {
     expect(calls).toEqual([]);
   });
 
-  it('requires a verified ByteCloud JWT before touching any daemon', async () => {
+  it('requires a verified JWT before touching any daemon', async () => {
     const { request, calls } = await start({ verifyJwt: async () => ({ ok: false, error: 'jwt_expired' }) });
     await expect(request('whoami', { token: null })).resolves.toMatchObject({ status: 401, body: { error: 'jwt_required' } });
     await expect(request('whoami')).resolves.toMatchObject({ status: 401, body: { error: 'jwt_expired' } });

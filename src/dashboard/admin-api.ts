@@ -2,15 +2,16 @@
  * Public, person-authenticated admin API used by the `infrabuddy` CLI.
  *
  * Mounted ahead of the Dashboard token gate under `/api/admin/v1/`. The caller
- * presents a ByteCloud JWT (`X-Jwt-Token`); this layer verifies it and forwards
- * only the verified identity to the owning daemon over the trusted-host IPC,
- * where admin membership (`allowedUsers`) is decided. Off unless
- * `BOTMUX_ADMIN_API=on` and `BOTMUX_ADMIN_JWKS_URL` names the ByteCloud key
- * set, so deployments opt in explicitly.
+ * presents a personal SSO JWT (`Authorization: Bearer`, or `X-Jwt-Token`); this
+ * layer verifies it against the deployment-configured issuer (see admin-jwt.ts)
+ * and forwards only the verified identity to the owning daemon over the
+ * trusted-host IPC, where admin membership (`allowedUsers`) is decided. Off
+ * unless `BOTMUX_ADMIN_API=on` and a verifier is configured, so deployments opt
+ * in explicitly.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { closeResidualIsLocal, parseCloseResidual } from '../core/close-residual.js';
-import type { ByteCloudIdentity, JwtVerifyResult } from './bytecloud-jwt.js';
+import { adminJwtOptionsFromEnv, type AdminJwtIdentity, type JwtVerifyResult } from './admin-jwt.js';
 
 export const ADMIN_API_PREFIX = '/api/admin/v1/';
 
@@ -28,8 +29,7 @@ export interface AdminApiDeps {
 }
 
 export function adminApiEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|on|true|yes)$/i.test(env.BOTMUX_ADMIN_API?.trim() ?? '')
-    && /^https:\/\/\S+$/.test(env.BOTMUX_ADMIN_JWKS_URL?.trim() ?? '');
+  return /^(1|on|true|yes)$/i.test(env.BOTMUX_ADMIN_API?.trim() ?? '') && adminJwtOptionsFromEnv(env) !== undefined;
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -104,7 +104,7 @@ function pickBot(url: URL, online: string[]): { ok: true; larkAppId: string } | 
   return { ok: false, status: 400, error: 'bot_required', bots: online };
 }
 
-function identityBody(identity: ByteCloudIdentity): { email: string; username: string } {
+function identityBody(identity: AdminJwtIdentity): { email: string; username: string } {
   return { email: identity.email, username: identity.username };
 }
 

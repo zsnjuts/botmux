@@ -1,6 +1,6 @@
 // src/dashboard.ts
 import { ADMIN_API_PREFIX, adminApiEnabledFromEnv, handleAdminApi, type AdminApiDeps } from './dashboard/admin-api.js';
-import { createByteCloudJwtVerifier } from './dashboard/bytecloud-jwt.js';
+import { adminJwtOptionsFromEnv, createAdminJwtVerifier, type JwtVerifyResult } from './dashboard/admin-jwt.js';
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import type { Duplex } from 'node:stream';
@@ -4030,11 +4030,13 @@ const companionApi = (() => {
   }
 })();
 
+const adminJwtOptions = adminJwtOptionsFromEnv();
+const adminJwtVerifier = adminJwtOptions ? createAdminJwtVerifier(adminJwtOptions) : undefined;
 const adminApiDeps: AdminApiDeps = {
-  enabled: () => adminApiEnabledFromEnv(),
-  verifyJwt: createByteCloudJwtVerifier({
-    jwksUrl: process.env.BOTMUX_ADMIN_JWKS_URL?.trim() || undefined,
-  }),
+  enabled: () => adminApiEnabledFromEnv() && adminJwtVerifier !== undefined,
+  verifyJwt: (token): Promise<JwtVerifyResult> => adminJwtVerifier
+    ? adminJwtVerifier(token)
+    : Promise.resolve({ ok: false, error: 'jwks_unavailable' }),
   onlineBots: () => registry.list().map(d => d.larkAppId),
   callDaemon: (larkAppId, path, init) => proxyToDaemon(larkAppId, path, init),
   log: line => logger.info(line),
@@ -4067,7 +4069,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true });
     }
 
-    // Person-authenticated admin API (ByteCloud JWT). Has its own auth and must
+    // Person-authenticated admin API (SSO JWT). Has its own auth and must
     // not fall through to the Dashboard token gate below.
     if (url.pathname.startsWith(ADMIN_API_PREFIX)) {
       await handleAdminApi(req, res, url, adminApiDeps);

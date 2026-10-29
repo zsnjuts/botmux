@@ -1,6 +1,14 @@
 import { generateKeyPairSync, sign, type KeyObject } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { BYTECLOUD_JWT_ISSUER, createByteCloudJwtVerifier } from '../src/dashboard/bytecloud-jwt.js';
+import { adminJwtOptionsFromEnv, createAdminJwtVerifier, parseRequiredClaims, type AdminJwtVerifierOptions } from '../src/dashboard/admin-jwt.js';
+
+const ISSUER = 'https://sso.example.com';
+const SITE: Pick<AdminJwtVerifierOptions, 'issuer' | 'requiredClaims' | 'usernameClaim'> = {
+  issuer: ISSUER,
+  requiredClaims: { type: 'person' },
+  usernameClaim: 'username',
+};
+const createVerifier = (options: Omit<AdminJwtVerifierOptions, 'issuer'>) => createAdminJwtVerifier({ ...SITE, ...options });
 
 const NOW_MS = 1_800_000_000_000;
 const NOW_S = NOW_MS / 1000;
@@ -18,8 +26,8 @@ function token(privateKey: KeyObject, claims: Record<string, unknown>, header: R
 
 function personClaims(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    iss: BYTECLOUD_JWT_ISSUER,
-    type: 'person_account',
+    iss: ISSUER,
+    type: 'person',
     username: 'alice',
     email: 'Alice@Example.com',
     iat: NOW_S - 60,
@@ -28,10 +36,10 @@ function personClaims(overrides: Record<string, unknown> = {}): Record<string, u
   };
 }
 
-describe('ByteCloud JWT verifier', () => {
+describe('admin JWT verifier', () => {
   it('accepts a person token signed by the published key and normalizes the email', async () => {
     const { privateKey, jwk } = keyPair();
-    const verify = createByteCloudJwtVerifier({ fetchJwks: async () => ({ keys: [jwk] }), now: () => NOW_MS });
+    const verify = createVerifier({ fetchJwks: async () => ({ keys: [jwk] }), now: () => NOW_MS });
     await expect(verify(token(privateKey, personClaims()))).resolves.toEqual({
       ok: true,
       identity: { username: 'alice', email: 'alice@example.com', exp: NOW_S + 3600 },
@@ -42,18 +50,18 @@ describe('ByteCloud JWT verifier', () => {
     ['expired', personClaims({ exp: NOW_S - 3600 }), 'jwt_expired'],
     ['issued in the future', personClaims({ iat: NOW_S + 3600 }), 'jwt_not_yet_valid'],
     ['foreign issuer', personClaims({ iss: 'someone.else' }), 'jwt_bad_issuer'],
-    ['service account', personClaims({ type: 'service_account' }), 'jwt_not_person'],
+    ['non-person account', personClaims({ type: 'service' }), 'jwt_claim_mismatch'],
     ['no email', personClaims({ email: undefined }), 'jwt_missing_identity'],
   ])('rejects a %s token', async (_label, claims, error) => {
     const { privateKey, jwk } = keyPair();
-    const verify = createByteCloudJwtVerifier({ fetchJwks: async () => ({ keys: [jwk] }), now: () => NOW_MS });
+    const verify = createVerifier({ fetchJwks: async () => ({ keys: [jwk] }), now: () => NOW_MS });
     await expect(verify(token(privateKey, claims))).resolves.toEqual({ ok: false, error });
   });
 
   it('rejects tokens signed by another key and unsigned algorithms', async () => {
     const published = keyPair();
     const attacker = keyPair();
-    const verify = createByteCloudJwtVerifier({ fetchJwks: async () => ({ keys: [published.jwk] }), now: () => NOW_MS });
+    const verify = createVerifier({ fetchJwks: async () => ({ keys: [published.jwk] }), now: () => NOW_MS });
     await expect(verify(token(attacker.privateKey, personClaims()))).resolves.toEqual({ ok: false, error: 'jwt_bad_signature' });
     const unsigned = `${Buffer.from('{"alg":"none"}').toString('base64url')}.${Buffer.from(JSON.stringify(personClaims())).toString('base64url')}.x`;
     await expect(verify(unsigned)).resolves.toEqual({ ok: false, error: 'jwt_unsupported_alg' });
@@ -66,7 +74,7 @@ describe('ByteCloud JWT verifier', () => {
     let now = NOW_MS;
     let published = [oldKey.jwk];
     let fetches = 0;
-    const verify = createByteCloudJwtVerifier({
+    const verify = createVerifier({
       fetchJwks: async () => { fetches += 1; return { keys: published }; },
       now: () => now,
     });
@@ -88,7 +96,7 @@ describe('ByteCloud JWT verifier', () => {
     const { privateKey, jwk } = keyPair();
     let now = NOW_MS;
     let up = true;
-    const verify = createByteCloudJwtVerifier({
+    const verify = createVerifier({
       fetchJwks: async () => { if (!up) throw new Error('down'); return { keys: [jwk] }; },
       now: () => now,
     });
@@ -100,7 +108,41 @@ describe('ByteCloud JWT verifier', () => {
 
   it('reports an unavailable key set when it never loaded', async () => {
     const { privateKey } = keyPair();
-    const verify = createByteCloudJwtVerifier({ fetchJwks: async () => { throw new Error('down'); }, now: () => NOW_MS });
+    const verify = createVerifier({ fetchJwks: async () => { throw new Error('down'); }, now: () => NOW_MS });
     await expect(verify(token(privateKey, personClaims()))).resolves.toEqual({ ok: false, error: 'jwks_unavailable' });
+  });
+
+  it('falls back to the email local part when the username claim is absent', async () => {
+    const { privateKey, jwk } = keyPair();
+    const verify = createAdminJwtVerifier({ issuer: ISSUER, fetchJwks: async () => ({ keys: [jwk] }), now: () => NOW_MS });
+    await expect(verify(token(privateKey, personClaims({ username: undefined })))).resolves.toMatchObject({
+      ok: true,
+      identity: { email: 'alice@example.com', username: 'alice' },
+    });
+  });
+});
+
+describe('admin JWT configuration', () => {
+  it('needs an https key set and an issuer from the deployment', () => {
+    expect(adminJwtOptionsFromEnv({ BOTMUX_ADMIN_JWKS_URL: 'https://sso.example.com/jwks' })).toBeUndefined();
+    expect(adminJwtOptionsFromEnv({ BOTMUX_ADMIN_JWT_ISSUER: ISSUER })).toBeUndefined();
+    expect(adminJwtOptionsFromEnv({ BOTMUX_ADMIN_JWKS_URL: 'http://sso.example.com/jwks', BOTMUX_ADMIN_JWT_ISSUER: ISSUER })).toBeUndefined();
+    expect(adminJwtOptionsFromEnv({
+      BOTMUX_ADMIN_JWKS_URL: 'https://sso.example.com/jwks',
+      BOTMUX_ADMIN_JWT_ISSUER: ISSUER,
+      BOTMUX_ADMIN_JWT_REQUIRED_CLAIMS: 'type=person, tenant = acme ',
+      BOTMUX_ADMIN_JWT_USERNAME_CLAIM: 'username',
+    })).toEqual({
+      jwksUrl: 'https://sso.example.com/jwks',
+      issuer: ISSUER,
+      requiredClaims: { type: 'person', tenant: 'acme' },
+      emailClaim: undefined,
+      usernameClaim: 'username',
+    });
+  });
+
+  it('parses required claims and ignores malformed pairs', () => {
+    expect(parseRequiredClaims('a=1,,=x,b,c=d=e')).toEqual({ a: '1', c: 'd=e' });
+    expect(parseRequiredClaims(undefined)).toEqual({});
   });
 });

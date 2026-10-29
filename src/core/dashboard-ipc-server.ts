@@ -839,7 +839,7 @@ ipcRoute('POST', '/api/durable-config-cas/rebind-path', requireBoundBot(async (r
 }));
 
 // ─── Person-authenticated admin API (infrabuddy) ───────────────────────────
-// The Dashboard verifies the ByteCloud JWT and forwards only the verified
+// The Dashboard verifies the caller's SSO JWT and forwards only the verified
 // identity; this side re-derives the authority from the bot's own allowedUsers.
 const resolveAdminOpenId = createEmailOpenIdCache(async (larkAppId, email) => {
   const result = await resolveAllowedUsersWithMap(larkAppId, [email]);

@@ -1,25 +1,23 @@
 /**
- * ByteCloud JWT verification for the person-authenticated admin API.
+ * JWT verification for the person-authenticated admin API.
  *
- * ByteCloud signs user JWTs with RS256 and publishes the key set at
- * `<ByteCloud origin>/auth/api/v1/jwks`; the deployment injects that URL
- * (`BOTMUX_ADMIN_JWKS_URL`) because private hostnames stay out of the public
- * source. The tokens carry no
- * `aud`, so a token is a full ByteCloud credential for its lifetime: never log
- * or persist it — only the verified identity leaves this module.
+ * Identity-provider neutral: the deployment names the key set (JWKS), the
+ * expected issuer, any claims a token must carry (e.g. "only human accounts")
+ * and which claims hold the email / username. Only RS256 is accepted. Tokens
+ * from SSO providers often carry no audience and are full credentials for their
+ * lifetime: never log or persist them — only the verified identity leaves this
+ * module.
  */
 import { createPublicKey, verify as verifySignature, type JsonWebKey, type KeyObject } from 'node:crypto';
-
-export const BYTECLOUD_JWT_ISSUER = 'paas.passport.auth_oauth2';
 
 const KEYS_TTL_MS = 60 * 60_000;
 const KEYS_REFRESH_COOLDOWN_MS = 5 * 60_000;
 const CLOCK_SKEW_S = 60;
 const MAX_TOKEN_LENGTH = 8192;
 
-export interface ByteCloudIdentity {
-  username: string;
+export interface AdminJwtIdentity {
   email: string;
+  username: string;
   /** Token expiry, epoch seconds. */
   exp: number;
 }
@@ -31,19 +29,51 @@ export type JwtVerifyError =
   | 'jwt_expired'
   | 'jwt_not_yet_valid'
   | 'jwt_bad_issuer'
-  | 'jwt_not_person'
+  | 'jwt_claim_mismatch'
   | 'jwt_missing_identity'
   | 'jwks_unavailable';
 
-export type JwtVerifyResult = { ok: true; identity: ByteCloudIdentity } | { ok: false; error: JwtVerifyError };
+export type JwtVerifyResult = { ok: true; identity: AdminJwtIdentity } | { ok: false; error: JwtVerifyError };
 
-export interface ByteCloudJwtVerifierOptions {
+export interface AdminJwtVerifierOptions {
   /** Required unless `fetchJwks` is supplied. */
   jwksUrl?: string;
-  issuer?: string;
+  /** Exact `iss` every token must carry. */
+  issuer: string;
+  /** Claims that must equal these string values, e.g. `{ type: 'person' }`. */
+  requiredClaims?: Record<string, string>;
+  /** Claim holding the corporate email (default `email`). */
+  emailClaim?: string;
+  /** Claim holding a display username (default `preferred_username`; falls back to the email local part). */
+  usernameClaim?: string;
   /** Returns the parsed JWKS document; defaults to an HTTPS GET of `jwksUrl`. */
   fetchJwks?: () => Promise<unknown>;
   now?: () => number;
+}
+
+/** Parses `a=b,c=d` (as in `BOTMUX_ADMIN_JWT_REQUIRED_CLAIMS`). */
+export function parseRequiredClaims(raw: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of (raw ?? '').split(',')) {
+    const at = pair.indexOf('=');
+    const key = pair.slice(0, at).trim();
+    if (at > 0 && key) out[key] = pair.slice(at + 1).trim();
+  }
+  return out;
+}
+
+/** Verifier settings from the environment; undefined when the deployment did not configure one. */
+export function adminJwtOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): AdminJwtVerifierOptions | undefined {
+  const jwksUrl = env.BOTMUX_ADMIN_JWKS_URL?.trim();
+  const issuer = env.BOTMUX_ADMIN_JWT_ISSUER?.trim();
+  if (!jwksUrl || !/^https:\/\/\S+$/.test(jwksUrl) || !issuer) return undefined;
+  return {
+    jwksUrl,
+    issuer,
+    requiredClaims: parseRequiredClaims(env.BOTMUX_ADMIN_JWT_REQUIRED_CLAIMS),
+    emailClaim: env.BOTMUX_ADMIN_JWT_EMAIL_CLAIM?.trim() || undefined,
+    usernameClaim: env.BOTMUX_ADMIN_JWT_USERNAME_CLAIM?.trim() || undefined,
+  };
 }
 
 function base64UrlJson(part: string): Record<string, unknown> | undefined {
@@ -69,9 +99,11 @@ function rsaKeys(doc: unknown): KeyObject[] {
   return out;
 }
 
-export function createByteCloudJwtVerifier(options: ByteCloudJwtVerifierOptions = {}): (token: string) => Promise<JwtVerifyResult> {
-  const jwksUrl = options.jwksUrl;
-  const issuer = options.issuer ?? BYTECLOUD_JWT_ISSUER;
+export function createAdminJwtVerifier(options: AdminJwtVerifierOptions): (token: string) => Promise<JwtVerifyResult> {
+  const { jwksUrl, issuer } = options;
+  const requiredClaims = options.requiredClaims ?? {};
+  const emailClaim = options.emailClaim ?? 'email';
+  const usernameClaim = options.usernameClaim ?? 'preferred_username';
   const now = options.now ?? Date.now;
   const fetchJwks = options.fetchJwks ?? (async () => {
     if (!jwksUrl) throw new Error('jwks_url_unset');
@@ -130,11 +162,20 @@ export function createByteCloudJwtVerifier(options: ByteCloudJwtVerifierOptions 
     if (typeof payload.nbf === 'number' && payload.nbf - CLOCK_SKEW_S > nowS) return { ok: false, error: 'jwt_not_yet_valid' };
     if (typeof payload.iat === 'number' && payload.iat - CLOCK_SKEW_S > nowS) return { ok: false, error: 'jwt_not_yet_valid' };
     if (payload.iss !== issuer) return { ok: false, error: 'jwt_bad_issuer' };
-    if (payload.type !== 'person_account') return { ok: false, error: 'jwt_not_person' };
-    if (typeof payload.username !== 'string' || !payload.username
-        || typeof payload.email !== 'string' || !payload.email.includes('@')) {
-      return { ok: false, error: 'jwt_missing_identity' };
+    for (const [claim, expected] of Object.entries(requiredClaims)) {
+      if (payload[claim] !== expected) return { ok: false, error: 'jwt_claim_mismatch' };
     }
-    return { ok: true, identity: { username: payload.username, email: payload.email.toLowerCase(), exp: payload.exp } };
+    const email = payload[emailClaim];
+    if (typeof email !== 'string' || !email.includes('@')) return { ok: false, error: 'jwt_missing_identity' };
+    const normalizedEmail = email.toLowerCase();
+    const username = payload[usernameClaim];
+    return {
+      ok: true,
+      identity: {
+        email: normalizedEmail,
+        username: typeof username === 'string' && username ? username : normalizedEmail.split('@')[0],
+        exp: payload.exp,
+      },
+    };
   };
 }
