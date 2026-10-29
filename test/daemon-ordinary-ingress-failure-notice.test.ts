@@ -321,6 +321,7 @@ function seedActiveRemoteRunnerSession(
         turnId: message.turnId,
         dispatchAttempt: message.dispatchAttempt,
         durablePrimaryInbox: true,
+        ...(message.activeTurnSteer ? { activeTurnSteer: true as const } : {}),
       }, 12);
     });
   });
@@ -1166,6 +1167,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
           turnId,
           dispatchAttempt: 4,
           durablePrimaryInbox: true,
+          ...(message.activeTurnSteer ? { activeTurnSteer: true as const } : {}),
         }, 12);
       });
     });
@@ -1259,6 +1261,38 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       admitted: false,
       retryReason: 'session has an unfinished turn',
     });
+  });
+
+  it('sends the steer notice on a retry when the steer committed after the previous attempt gave up', async () => {
+    const anchor = 'om_thread_primary_late_steer_commit';
+    const turnId = 'om_primary_late_steer_commit_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    // Attempt 1 timed out waiting; the held steer then landed.
+    __testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId,
+      dispatchAttempt: 1,
+      durablePrimaryInbox: true,
+      activeTurnSteer: true,
+    }, 12);
+    const queuePostAdmissionOutput = vi.fn();
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 2, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+
+    await handleThreadReply(makeEventData(turnId, 'add this constraint now', anchor), ctx);
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: `<at user_id="${OWNER}"></at> 收到，引导成功`,
+      providerUuid: expect.stringMatching(/^turn_steer_accepted_[a-f0-9]{24}$/),
+    }));
   });
 
   it('keeps a same-principal follow-up waiting when the live provider did not negotiate steer', async () => {

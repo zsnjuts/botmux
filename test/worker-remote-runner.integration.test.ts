@@ -727,6 +727,156 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     );
   });
 
+  it('holds follow-ups until the opening turn is acknowledged, steers each, and hands back one that missed the turn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-steer-hold-'));
+    tempDirs.push(root);
+    const commandsPath = join(root, 'commands.jsonl');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const state = { version: 1, provider: 'steer-provider', generation: 1, remoteSessionId: 'remote-steer-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+let active;
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify({ ...command, at: Date.now() }) + '\\n');
+  if (command.type === 'hello') {
+    emit({ type: 'hello', requestId: command.requestId, provider: 'steer-provider', capabilities: ['start','resume','turn','cancel','detach','reattach','status','turn_steer'] });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    active = command;
+    // Like an opening TUI turn: acknowledged only after the remote TUI starts.
+    setTimeout(() => emit({ type: 'status', requestId: command.requestId, status: 'busy', state }), 1500);
+    setTimeout(() => { emit({ type: 'final', turnId: command.turnId, content: 'done', state }); active = undefined; }, 3500);
+  } else if (command.type === 'turn_steer') {
+    if (!active) {
+      emit({ type: 'failure', requestId: command.requestId, turnId: command.turnId, code: 'turn_steer_not_applied', message: 'no active turn', status: 'failed', retryable: true });
+      return;
+    }
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  } else if (command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_steer_hold',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: { expectedProvider: 'steer-provider' },
+    }]));
+    const caller = {
+      requestUserOpenId: 'ou_remote_user',
+      requestLarkAppId: 'app_steer_hold',
+      senderType: 'user' as const,
+    };
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-steer-hold',
+        LARK_APP_ID: 'app_steer_hold',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    const steer = (turnId: string, content: string) => child.send({
+      type: 'message',
+      content,
+      turnId,
+      dispatchAttempt: 1,
+      durablePrimaryInbox: true,
+      activeTurnSteer: true,
+      trustedCaller: caller,
+    } satisfies DaemonToWorker);
+    const commands = () => (existsSync(commandsPath) ? readFileSync(commandsPath, 'utf8') : '')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-steer-hold',
+      chatId: 'oc_steer_hold',
+      rootMessageId: 'om_steer_hold_root',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'steer-provider' },
+      prompt: 'long opening task',
+      turnId: 'om_steer_hold_root',
+      trustedCaller: caller,
+      larkAppId: 'app_steer_hold',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    // Both follow-ups arrive while the opening turn is still unacknowledged.
+    await waitFor(
+      () => commands().some(command => command.type === 'turn'),
+      () => `opening turn was not submitted\n${logs.join('')}`,
+    );
+    steer('om_steer_hold_a', 'follow-up A');
+    steer('om_steer_hold_b', 'follow-up B');
+
+    await waitFor(
+      () => ['om_steer_hold_a', 'om_steer_hold_b'].every(turnId => messages.some(message =>
+        message.type === 'turn_input_committed' && message.turnId === turnId)),
+      () => `follow-ups were not both steered\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    const turnAt = commands().find(command => command.type === 'turn').at;
+    const steers = commands().filter(command => command.type === 'turn_steer');
+    expect(steers.map(command => command.steerId)).toEqual(['om_steer_hold_a', 'om_steer_hold_b']);
+    // Held until the busy acknowledgement rather than failed against a
+    // still-starting turn.
+    expect(steers.every(command => command.at - turnAt >= 1400)).toBe(true);
+    expect(messages.filter(message => message.type === 'turn_input_committed'
+      && (message.turnId === 'om_steer_hold_a' || message.turnId === 'om_steer_hold_b'))
+      .every(message => message.type === 'turn_input_committed' && message.activeTurnSteer === true)).toBe(true);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_steer_hold_root'),
+      () => `opening turn did not finish\n${logs.join('')}`,
+    );
+    // A steer that arrives after its target turn ended is handed back for an
+    // ordinary successor instead of being dropped as a failed submit.
+    steer('om_steer_hold_late', 'late follow-up');
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_input_rejected'
+        && message.turnId === 'om_steer_hold_late'),
+      () => `late steer was not handed back\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.find(message => message.type === 'turn_input_rejected'
+      && message.turnId === 'om_steer_hold_late')).toMatchObject({
+      reason: 'active_turn_steer_target_ended',
+      rejectedBeforeAdmission: true,
+    });
+    expect(messages.some(message => message.type === 'turn_terminal'
+      && message.turnId === 'om_steer_hold_late')).toBe(false);
+  });
+
   it('settles a cancelled remote turn without rendering its diagnostic as final output', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-cancelled-turn-'));
     tempDirs.push(root);

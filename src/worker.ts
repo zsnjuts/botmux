@@ -15993,6 +15993,18 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
+  while (pendingMessages[0]?.activeTurnSteer === true && effectiveBackendType === 'remote-runner') {
+    const readiness = backend.activeTurnSteerReadiness?.() ?? 'none';
+    if (readiness === 'ready') break;
+    if (readiness === 'pending') {
+      // The opening turn is still starting the remote TUI. Hold the steer;
+      // onActiveTurnAccepted re-runs this flush once it can be delivered.
+      log(`Holding ${pendingMessages.length} pending message(s) until the active Remote Runner turn is acknowledged`);
+      return;
+    }
+    handBackEndedSteer(pendingMessages.shift()!);
+  }
+  if (!hasPendingInputForFlush()) return;
   if (remoteRunnerRecoveredTurnInFlight && pendingMessages[0]?.activeTurnSteer !== true) {
     // A resumed provider can report ready while it still owns the recovered
     // turn. That readiness only completes the transport handshake; it does not
@@ -16861,6 +16873,7 @@ async function flushPending(): Promise<void> {
           item.turnId,
           item.dispatchAttempt,
           item.durablePrimaryInbox,
+          item.activeTurnSteer,
         );
       }
       if (item.activeTurnSteer && result?.submitted === true) {
@@ -16908,6 +16921,14 @@ async function flushPending(): Promise<void> {
       // `&& backend`: if the CLI exited during this write (pane gone → onExit
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
+      if (result && result.submitted === false
+          && item.activeTurnSteer && result.submissionDisposition === 'untouched') {
+        // The provider proved the text never reached the TUI (the turn ended
+        // or was not steerable). Not a failed user turn: re-admit it.
+        inflightInputs.forget(item);
+        handBackEndedSteer(item, result.failureReason);
+        break;
+      }
       if (result && result.submitted === false) {
         codexAppPromptReplay.cancelSubmission(
           codexAppTurnLiveness,
@@ -17038,6 +17059,12 @@ async function flushPending(): Promise<void> {
     }
   } finally {
     isFlushing = false;
+    // Each flush steers at most one input before a batch boundary. A follow-up
+    // that arrived during that steer (or queued behind it) has no other wake-up
+    // until the turn ends, so keep draining while steers make progress.
+    if (itemsWrittenInThisFlush > 0 && pendingMessages[0]?.activeTurnSteer === true) {
+      setImmediate(() => { void flushPending(); });
+    }
     // A prompt can arrive after turn N completes but before turn N+1's chunked
     // control line finishes. We reject it while N+1 has a liveness slot. If that
     // write then fails, the prompt is still the runner's real ready boundary;
@@ -23038,6 +23065,10 @@ async function spawnCli(
     if (backend !== observedBackend) return;
     send({ type: 'remote_usage', usage });
   });
+  backend.onActiveTurnAccepted?.(() => {
+    if (backend !== observedBackend) return;
+    if (pendingMessages[0]?.activeTurnSteer === true) void flushPending();
+  });
   backend.onReady?.(() => {
     if (backend !== observedBackend || fatalWorkerErrorPending) return;
     if (effectiveBackendType === 'remote-runner') {
@@ -26224,6 +26255,7 @@ function acknowledgeTurnInputCommitted(
   turnId?: string,
   dispatchAttempt?: number,
   durablePrimaryInbox?: true,
+  activeTurnSteer?: true,
 ): void {
   if (!turnId) return;
   ordinaryImTurnDedupe.commit(turnId);
@@ -26232,7 +26264,21 @@ function acknowledgeTurnInputCommitted(
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
+    ...(activeTurnSteer ? { activeTurnSteer: true } : {}),
   });
+}
+
+/** Reason the worker hands an un-steered follow-up back to the daemon. */
+const ACTIVE_TURN_STEER_TARGET_ENDED = 'active_turn_steer_target_ended';
+
+/** A steer whose target turn ended before the input reached it never touched
+ * the provider. Hand it back so the daemon re-admits it as the next ordinary
+ * turn (the same thing a native composer does with text typed during a turn),
+ * instead of reporting it as a failed submit and dropping it. */
+function handBackEndedSteer(item: PendingCliInput, reason = ACTIVE_TURN_STEER_TARGET_ENDED): void {
+  if (!item.turnId) return;
+  log(`Active-turn steer ${item.turnId.substring(0, 12)} handed back to the daemon (${reason})`);
+  rejectOrdinaryImTurn(item.turnId, ACTIVE_TURN_STEER_TARGET_ENDED, { rejectedBeforeAdmission: true });
 }
 
 function acknowledgeTurnInputReceived(turnId?: string): void {

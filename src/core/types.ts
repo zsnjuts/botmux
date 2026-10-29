@@ -111,6 +111,11 @@ export interface DaemonSession {
    *  by that worker's active_turn_controls. Bound to the worker object so a
    *  respawned worker never inherits the previous generation's answer. */
   activeTurnControls?: { worker: unknown; steer: boolean; interrupt: boolean };
+  /** Follow-ups the worker steered into an active turn (from their
+   *  `turn_input_committed`), so whichever delivery attempt observes the commit
+   *  sends the acceptance notice. In memory and bounded; the notice is
+   *  idempotent by providerUuid. */
+  steeredInputTurnIds?: Set<string>;
   /** runtime 级联定序器（daemon 的 runPassthroughCascade）在飞：同 anchor 后到的普通消息 /
    *  单条透传排进 `cascadeDeferred`，定序器收尾时按到达顺序重入 handleThreadReply；第二条级联
    *  fail closed。`parsed` / `resources` 是首过 preamble（parse、merge_forward 展开、语音转写）

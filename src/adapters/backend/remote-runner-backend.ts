@@ -120,6 +120,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private activeTurnId: string | null = null;
   private activeTurnHostContext: RemoteRunnerTurnHostContext = {};
   private activeTurnAccepted = false;
+  private activeTurnAcceptedCb: (() => void) | null = null;
   private ready = false;
   private killed = false;
   private closing = false;
@@ -229,6 +230,21 @@ export class RemoteRunnerBackend implements SessionBackend {
     });
     this.startupPromise = this.initialize(opts);
     void this.startupPromise.catch(error => this.failProtocol(error.message));
+  }
+
+  /** Whether a follow-up can be steered right now: `ready` once the provider
+   * acknowledged the active turn, `pending` while it is still being submitted
+   * (an opening turn can spend tens of seconds starting the remote TUI), `none`
+   * when no turn is active any more. */
+  activeTurnSteerReadiness(): 'ready' | 'pending' | 'none' {
+    if (!this.activeTurnId) return 'none';
+    return this.activeTurnAccepted ? 'ready' : 'pending';
+  }
+
+  /** Fires when the provider acknowledges the active turn (busy ack or a
+   * recovered turn), i.e. when a held steer becomes deliverable. */
+  onActiveTurnAccepted(cb: () => void): void {
+    this.activeTurnAcceptedCb = cb;
   }
 
   /** What the provider negotiated for an in-flight turn. Only meaningful after
@@ -912,15 +928,19 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.turnSettled = new Promise<void>(resolve => { this.settleTurn = resolve; });
       this.recoveredTurn = event.recoveredTurn;
       this.turnRecoveredCb?.(event.recoveredTurn);
+      this.activeTurnAcceptedCb?.();
     }
     clearTimeout(pending.timer);
     this.pendingRequests.delete(id);
+    let turnJustAccepted = false;
     if (pending.command.type === 'turn' && this.activeTurnRequestId === id
         && event.type === 'status' && event.status === 'busy') {
+      turnJustAccepted = !this.activeTurnAccepted;
       this.activeTurnAccepted = true;
     }
     if (event.type === 'failure') pending.reject(new RemoteRunnerRequestError(event));
     else pending.resolve(event);
+    if (turnJustAccepted) this.activeTurnAcceptedCb?.();
   }
 
   private acceptActiveTurn(turnId: string): boolean {
