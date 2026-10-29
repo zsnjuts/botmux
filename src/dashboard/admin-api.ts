@@ -9,6 +9,7 @@
  * set, so deployments opt in explicitly.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { closeResidualIsLocal, parseCloseResidual } from '../core/close-residual.js';
 import type { ByteCloudIdentity, JwtVerifyResult } from './bytecloud-jwt.js';
 
 export const ADMIN_API_PREFIX = '/api/admin/v1/';
@@ -157,9 +158,18 @@ export async function handleAdminApi(req: IncomingMessage, res: ServerResponse, 
   if (route.kind === 'session') {
     return relay(res, await deps.callDaemon(target.larkAppId, `/api/sessions/${route.sessionId}`, { method: 'GET' }));
   }
-  return relay(res, await deps.callDaemon(target.larkAppId, `/api/sessions/${route.sessionId}/close`, {
+  const closed = await deps.callDaemon(target.larkAppId, `/api/sessions/${route.sessionId}/close`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(typeof body.rootId === 'string' ? { rootId: body.rootId } : {}),
-  }));
+  });
+  const text = await closed.text();
+  let result: Record<string, unknown>;
+  try { result = JSON.parse(text); } catch { return send(res, closed.status, { ok: false, error: 'daemon_bad_response' }); }
+  // A closed row with a residual is not a plain success: say what is left and
+  // where (a local subtree vs a remote session need opposite follow-ups).
+  const residual = parseCloseResidual(result);
+  return send(res, closed.status, residual
+    ? { ...result, residual: { ...residual, scope: closeResidualIsLocal(residual) ? 'local' : 'remote' } }
+    : result);
 }

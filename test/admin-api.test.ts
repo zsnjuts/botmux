@@ -131,6 +131,18 @@ describe('admin API (dashboard layer)', () => {
     ]);
   });
 
+  it('surfaces a close residual instead of a plain success', async () => {
+    const { request } = await start({
+      daemon: call => call.path.endsWith('/close')
+        ? { status: 200, body: { ok: true, outcome: 'closed_with_residual', residual: { reason: 'remote_cancel_unconfirmed', taskId: 't-1' } } }
+        : { status: 200, body: { ok: true } },
+    });
+    await expect(request('sessions/s_1/close', { method: 'POST', body: '{}' })).resolves.toMatchObject({
+      status: 200,
+      body: { outcome: 'closed_with_residual', residual: { reason: 'remote_cancel_unconfirmed', taskId: 't-1', scope: 'remote' } },
+    });
+  });
+
   it('rejects unknown routes and malformed session ids', async () => {
     const { request, calls } = await start();
     await expect(request('config/delete', { method: 'POST' })).resolves.toMatchObject({ status: 404 });
