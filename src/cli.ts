@@ -68,7 +68,7 @@ import {
   CurrentTurnProvenanceError,
   resolveCurrentTurnProvenance,
 } from './core/current-turn-provenance.js';
-import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
+import { ENTRY_SUBCOMMANDS, entryForSubcommand, entryLogsInfo, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
@@ -17919,6 +17919,9 @@ if (command === '__orca-relay-local') {
 // these tokens are never used (spawners pass the real dist/*.js path).
 const __entrySubcommand = command && ENTRY_SUBCOMMANDS.has(command) ? entryForSubcommand(command) : null;
 if (__entrySubcommand) {
+  // Node spawns these entries as their own files and never runs the CLI-wide
+  // setSilent(true) above; restore the same info logging here.
+  if (entryLogsInfo(__entrySubcommand)) logger.setSilent(false);
   // Bun's --compile can't bundle a fully-dynamic import specifier, so switch on
   // a static import per entry — the same modules the Node path spawns as files.
   if (__entrySubcommand === 'core-only') await import('./index-core-only.js');
