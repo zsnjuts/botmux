@@ -107,6 +107,10 @@ export interface DaemonSession {
    *  cannot tell the two apart.
    *  See docs/design/2026-09-11-command-router.md §5 / §6. */
   cliReadyGeneration?: number;
+  /** In-turn controls the live Remote Runner provider negotiated, as reported
+   *  by that worker's active_turn_controls. Bound to the worker object so a
+   *  respawned worker never inherits the previous generation's answer. */
+  activeTurnControls?: { worker: unknown; steer: boolean; interrupt: boolean };
   /** runtime 级联定序器（daemon 的 runPassthroughCascade）在飞：同 anchor 后到的普通消息 /
    *  单条透传排进 `cascadeDeferred`，定序器收尾时按到达顺序重入 handleThreadReply；第二条级联
    *  fail closed。`parsed` / `resources` 是首过 preamble（parse、merge_forward 展开、语音转写）

@@ -15,6 +15,7 @@ export const messages: Record<string, string> = {
   'cmd.effort.unavailable': '当前 Codex App 连接尚未就绪或正在切换，请稍后重试。',
   'cmd.effort.error': '未能确认推理强度修改结果，请稍后重试。',
   'worker.steer_accepted': '收到，引导成功',
+  'worker.steer_accepted_by': '{mention} 收到，引导成功',
   // ─── Terminal status pages ───────────────────────────────────────────────
   'terminal.status.starting.title': '终端正在启动',
   'terminal.status.starting.detail': '正在恢复该会话的终端连接，请稍后刷新页面或从最新卡片重新打开 Web 终端。',
@@ -335,7 +336,7 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.queue.usage': '用法：/queue <文字消息>（支持多行纯文本，暂不支持富文本和附件）',
-  'cmd.queue.unsupported': '/queue 暂只支持 Codex App 会话。',
+  'cmd.queue.unsupported': '/queue 暂只支持 Codex App 或 Remote Runner 会话。',
   'cmd.queue.not_ready': '会话尚未就绪，请启动会话后重试 /queue。',
   'cmd.queue.accepted': '已接纳：将在当前任务结束后作为独立一轮执行；空闲时直接开始。',
   'cmd.queue.identity_window': '等待期间的新消息可能使本轮 bytedcli/lark-cli 身份失效。若提示轮次不匹配，请重新发送任务。',

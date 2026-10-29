@@ -10,6 +10,13 @@ export interface DurablePrimaryTurnRuntimeState {
   worker?: { killed?: boolean } | null;
   cliReady?: boolean;
   activeInteractiveTurn?: unknown;
+  /** This exact ingress was independently authorized as a subordinate steer of
+   * the active turn. It may cross the busy gate and does not wait for
+   * `cliReady` (a session opened with a prompt reports its first prompt_ready
+   * only after that turn ends); it still requires a live worker, and the
+   * provider itself rejects a steer without an acknowledged active turn. All
+   * other active-turn input remains retry-only. */
+  allowActiveTurnSteer?: boolean;
   /** A real worker-null start conflict, never a durable recovery journal. */
   workerStartBlocker?: DurablePrimaryWorkerStartBlocker;
 }
@@ -29,9 +36,8 @@ export function durablePrimaryExistingTurnDisposition(
     // Only an already-owned start boundary must remain retry-only.
     return state.workerStartBlocker ? 'retry' : 'ready';
   }
-  if (!state.cliReady || state.activeInteractiveTurn) {
-    return 'retry';
-  }
+  if (state.allowActiveTurnSteer) return 'ready';
+  if (!state.cliReady || state.activeInteractiveTurn) return 'retry';
   return 'ready';
 }
 

@@ -12,6 +12,7 @@ export const messages: Record<string, string> = {
   'cmd.effort.unavailable': 'The Codex App connection is not ready or is being replaced. Please retry shortly.',
   'cmd.effort.error': 'The reasoning effort update could not be confirmed. Please retry shortly.',
   'worker.steer_accepted': 'Got it — guidance accepted',
+  'worker.steer_accepted_by': '{mention} Got it — guidance accepted',
   // ─── Terminal status pages ───────────────────────────────────────────────
   'terminal.status.starting.title': 'Terminal is starting',
   'terminal.status.starting.detail': 'Restoring this session\'s terminal connection. Refresh this page later or reopen the Web Terminal from the latest card.',
@@ -337,7 +338,7 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.queue.usage': 'Usage: /queue <text message> (multiline plain text supported; rich text and attachments are not supported yet)',
-  'cmd.queue.unsupported': '/queue currently supports Codex App sessions only.',
+  'cmd.queue.unsupported': '/queue currently supports Codex App or Remote Runner sessions only.',
   'cmd.queue.not_ready': 'Session is not ready. Start the session before retrying /queue.',
   'cmd.queue.accepted': 'Accepted: runs as a separate turn after the active task, or starts immediately when idle.',
   'cmd.queue.identity_window': 'Later messages during the wait may invalidate this turn’s bytedcli/lark-cli identity. If a turn mismatch is reported, resend the task.',

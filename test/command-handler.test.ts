@@ -4525,6 +4525,59 @@ describe('handleCommand', () => {
       );
     });
 
+    it('uses the negotiated Remote Runner terminal input channel for /stop', async () => {
+      const worker = { killed: false, send: vi.fn() } as any;
+      const ds = makeDaemonSession({
+        worker,
+        session: makeSession({
+          cliId: 'remote-runner' as any,
+          backendType: 'remote-runner',
+        }),
+        initConfig: { type: 'init', backendType: 'remote-runner', backendConfig: {} } as any,
+        activeTurnControls: { worker, steer: true, interrupt: true },
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+
+      expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, {
+        type: 'term_action',
+        key: 'ctrlc',
+      });
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已发送停止信号'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('keeps /stop unsupported when the live Remote Runner provider has no Ctrl-C channel', async () => {
+      const worker = { killed: false, send: vi.fn() } as any;
+      const ds = makeDaemonSession({
+        worker,
+        session: makeSession({
+          cliId: 'remote-runner' as any,
+          backendType: 'remote-runner',
+        }),
+        initConfig: { type: 'init', backendType: 'remote-runner', backendConfig: {} } as any,
+        activeTurnControls: { worker, steer: true, interrupt: false },
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+
+      expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        t('cmd.stop.unsupported', undefined, 'zh'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
     it('does not treat /stop without a session as a normal prompt', async () => {
       const deps = makeDeps();
 

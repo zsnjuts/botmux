@@ -12129,9 +12129,15 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
 }
 
 async function handleTermAction(key: TermActionKey): Promise<void> {
-  // 远端后端：没有终端可驱动——把控制字符 write 进 riff/mojo 会变成一个内容为
-  // ANSI 序列的 follow-up turn（^C 也不会 cancel 远端执行），必须整体拒绝。
+  // Remote Runner may explicitly negotiate a structured terminal_input channel
+  // for Ctrl-C. Other remote backends treat writes as model follow-ups, so keep
+  // rejecting every terminal action there.
   if (isRemoteBackendType(effectiveBackendType)) {
+    if (effectiveBackendType === 'remote-runner' && key === 'ctrlc' && backend) {
+      const delivered = backend.write('\x03') !== false;
+      log(`Remote Runner Ctrl-C ${delivered ? 'submitted' : 'rejected'}`);
+      return;
+    }
     log(`term_action '${key}' ignored — ${effectiveBackendType} backend has no local terminal to drive`);
     return;
   }
@@ -15987,7 +15993,7 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
-  if (remoteRunnerRecoveredTurnInFlight) {
+  if (remoteRunnerRecoveredTurnInFlight && pendingMessages[0]?.activeTurnSteer !== true) {
     // A resumed provider can report ready while it still owns the recovered
     // turn. That readiness only completes the transport handshake; it does not
     // make the provider's serial turn channel available. Keep every successor
@@ -16031,7 +16037,7 @@ async function flushPending(): Promise<void> {
   // idle while the logical delivery is unresolved, so no following IM or
   // meeting turn may cross this boundary until an explicit terminal releases
   // the active attempt.
-  if (!pendingInputMayFlush(durableTurnInFlight)) return;
+  if (!pendingInputMayFlush(durableTurnInFlight, pendingMessages[0])) return;
   // A no-native or locally-unregistered RPC delivery is deliberately
   // fail-closed: its exact execution state is unknown. Codex normally permits
   // type-ahead/steer, but admitting a successor here could merge it into the
@@ -16266,7 +16272,7 @@ async function flushPending(): Promise<void> {
       applyMojoLivePatch(item.mojoLivePatch);
       // Type-ahead can drain several items in one flush. Each logical submit
       // starts its own readiness generation before transcript marking/writing.
-      beginCliWriteCycle();
+      if (!item.activeTurnSteer) beginCliWriteCycle();
       const writeGeneration = cliSpawnGeneration;
       const writeBackend = backend;
       const writeAdapter = cliAdapter;
@@ -16510,10 +16516,25 @@ async function flushPending(): Promise<void> {
               failureReason: 'remote-runner requires an authenticated BotMux turn id',
             };
           } else {
-            prepareNormalWrite();
+            if (item.activeTurnSteer) {
+              // A steer is an acknowledged subordinate ingress, not a second
+              // final-owning turn. Preserve the active capture/authority tuple
+              // and make this exact write non-replayable outside the provider's
+              // own pending-steer fence.
+              item.noReplay = true;
+              inflightInputs.onWrite(item);
+              itemsWrittenInThisFlush++;
+              log(
+                `Steering active Remote Runner turn with input `
+                + `${item.turnId.substring(0, 12)} (${msg.length} chars)`,
+              );
+            } else {
+              prepareNormalWrite();
+            }
             result = await writeBackend.submitTurn({
               content: msg,
               turnId: item.turnId,
+              ...(item.activeTurnSteer ? { activeTurnSteer: true } : {}),
               ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
               ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
               ...(item.linkRefMode ? { linkRefMode: item.linkRefMode } : {}),
@@ -16842,6 +16863,11 @@ async function flushPending(): Promise<void> {
           item.durablePrimaryInbox,
         );
       }
+      if (item.activeTurnSteer && result?.submitted === true) {
+        // Provider acknowledgement is the complete host lifecycle for this
+        // subordinate input. The original active turn still owns final/terminal.
+        inflightInputs.retire(item);
+      }
       const queuedPostSubmitNativeTitle = result?.submitted !== false
         ? maybeQueuePostSubmitNativeSessionTitle(item)
         : false;
@@ -17053,6 +17079,7 @@ function sendToPty(
   turnId?: string,
   opts: {
     queueAfterActiveTurn?: true;
+    activeTurnSteer?: true;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
     durablePrimaryInbox?: true;
@@ -17083,6 +17110,7 @@ function sendToPty(
     content,
     turnId,
     ...(opts.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+    ...(opts.activeTurnSteer ? { activeTurnSteer: true } : {}),
     ...(opts.replyTurnId ? { replyTurnId: opts.replyTurnId } : {}),
     ...(opts.codexAppDispatchId ? { codexAppDispatchId: opts.codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
@@ -22978,14 +23006,21 @@ async function spawnCli(
       log(`Ignored stale remote failure for turn ${failure.turnId.substring(0, 12)}`);
       return;
     }
-    send({
-      type: 'final_output',
-      content: failure.message,
-      lastUuid: failure.turnId,
-      turnId: failure.turnId,
-      dispatchAttempt: currentBotmuxDispatchAttempt,
-      turnFailed: true,
-    });
+    // `cancelled` is a lifecycle terminal, not an assistant answer or an
+    // execution failure. The command/card path that requested cancellation
+    // already owns the user-visible acknowledgement; echoing the provider's
+    // diagnostic as final_output makes a successful stop look like a failed
+    // model turn. Failed and ambiguous terminals still surface their message.
+    if (failure.status !== 'cancelled') {
+      send({
+        type: 'final_output',
+        content: failure.message,
+        lastUuid: failure.turnId,
+        turnId: failure.turnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+        turnFailed: true,
+      });
+    }
     emitTurnTerminal(
       failure.turnId,
       failure.status,
@@ -23006,6 +23041,12 @@ async function spawnCli(
   backend.onReady?.(() => {
     if (backend !== observedBackend || fatalWorkerErrorPending) return;
     if (effectiveBackendType === 'remote-runner') {
+      const controls = backend.activeTurnControls?.();
+      send({
+        type: 'active_turn_controls',
+        steer: controls?.steer === true,
+        interrupt: controls?.interrupt === true,
+      });
       if (remoteRunnerRecoveredTurnInFlight && currentBotmuxTurnId) {
         log(`Remote runner ready with recovered turn ${currentBotmuxTurnId.substring(0, 12)} still active`);
         return;
@@ -27118,6 +27159,7 @@ process.on('message', async (raw: unknown) => {
           linkRefMode: msg.linkRefMode,
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(msg.activeTurnSteer ? { activeTurnSteer: true } : {}),
           ...(msg.atMostOnce ? { atMostOnce: true } : {}),
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,

@@ -138,6 +138,28 @@ describe('remote runner protocol', () => {
     });
   });
 
+  it('builds a generation-fenced subordinate turn steer command', () => {
+    expect(remoteRunnerCommand('turn_steer', {
+      requestId: 'turn-steer-1',
+      turnId: 'turn-active',
+      steerId: 'turn-follow-up',
+      generation: 7,
+      content: 'use the new constraint',
+      dispatchAttempt: 2,
+    })).toEqual({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'turn_steer',
+      requestId: 'turn-steer-1',
+      turnId: 'turn-active',
+      steerId: 'turn-follow-up',
+      generation: 7,
+      content: 'use the new constraint',
+      dispatchAttempt: 2,
+    });
+    expect(REMOTE_RUNNER_CAPABILITIES).toContain('turn_steer');
+  });
+
   it('validates a generation-fenced recovered turn on ready', () => {
     const recovered = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,

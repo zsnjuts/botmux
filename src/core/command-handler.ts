@@ -1897,7 +1897,9 @@ export async function handleCommand(
           break;
         }
         const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-        if (cliId !== 'codex-app' || ds.adoptedFrom || ds.initConfig?.adoptMode) {
+        const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        if ((cliId !== 'codex-app' && backendType !== 'remote-runner')
+            || ds.adoptedFrom || ds.initConfig?.adoptMode) {
           await sessionReply(rootId, t('cmd.queue.unsupported', undefined, loc));
           break;
         }
@@ -1907,9 +1909,12 @@ export async function handleCommand(
           break;
         }
         const accepted = await deps.submitQueuedMessage?.(ds, message, text, deps.invocationReplyTarget);
-        await sessionReply(rootId, t(accepted ? 'cmd.queue.accepted' : 'cmd.queue.failed', undefined, loc)
+        const result = t(accepted ? 'cmd.queue.accepted' : 'cmd.queue.failed', undefined, loc)
           + (accepted && getBot(ds.larkAppId).config.triggerUserAuth?.enabled
-            ? '\n' + t('cmd.queue.identity_window', undefined, loc) : ''));
+            ? '\n' + t('cmd.queue.identity_window', undefined, loc) : '');
+        await (accepted && deps.postAdmissionReply
+          ? deps.postAdmissionReply(rootId, result)
+          : sessionReply(rootId, result));
         break;
       }
 
@@ -2862,7 +2867,14 @@ export async function handleCommand(
           break;
         }
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
+        const effectiveBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        const remoteRunnerInterrupt = effectiveBackendType === 'remote-runner'
+          && !!ds.worker
+          && ds.activeTurnControls?.worker === ds.worker
+          && ds.activeTurnControls.interrupt;
+        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app'
+            || ((isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds))
+              && !remoteRunnerInterrupt)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
         }

@@ -54,12 +54,30 @@ export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
   'orphan_reconciliation',
 ] as const;
 
+/** Optional in-turn user steering. The steer augments one already-active
+ * execution; it never creates another final-owning model turn. */
+export const REMOTE_RUNNER_TURN_STEER_CAPABILITIES = [
+  'turn_steer',
+] as const;
+
+/** Capabilities the host can use when a provider advertises them, without the
+ * bot config pinning them in `requiredCapabilities`. The host lists them in
+ * hello `optionalCapabilities`; a provider that does not implement one simply
+ * leaves it out of its hello and the host keeps the pre-existing behavior
+ * (follow-ups wait for the active turn, `/stop` stays unsupported). Pinning
+ * stays reserved for capabilities whose absence must fail the handshake. */
+export const REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES = [
+  'turn_steer',
+  'terminal_input',
+] as const;
+
 export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_BASE_CAPABILITIES,
   ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
   ...REMOTE_RUNNER_OUTBOUND_CAPABILITIES,
   ...REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES,
   ...REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES,
+  ...REMOTE_RUNNER_TURN_STEER_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -276,6 +294,8 @@ export type RemoteRunnerCommand =
       type: 'hello';
       sessionId: string;
       requiredCapabilities: RemoteRunnerCapability[];
+      /** Additive: providers that predate it ignore the field. */
+      optionalCapabilities?: RemoteRunnerCapability[];
     })
   | (RemoteRunnerCommandBase & {
       type: 'start';
@@ -305,6 +325,17 @@ export type RemoteRunnerCommand =
   | (RemoteRunnerCommandBase & {
       type: 'turn';
       turnId: string;
+      content: string;
+      dispatchAttempt?: number;
+      trustedCaller?: RemoteRunnerTrustedCaller;
+    })
+  | (RemoteRunnerCommandBase & {
+      type: 'turn_steer';
+      /** Existing final-owning turn that must still be active. */
+      turnId: string;
+      /** Exact host ingress identity of this subordinate user input. */
+      steerId: string;
+      generation: number;
       content: string;
       dispatchAttempt?: number;
       trustedCaller?: RemoteRunnerTrustedCaller;

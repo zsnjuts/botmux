@@ -15,6 +15,7 @@ import type {
 import {
   MAX_REMOTE_RUNNER_LINE_BYTES,
   REMOTE_RUNNER_BASE_CAPABILITIES,
+  REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES,
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,
@@ -230,6 +231,15 @@ export class RemoteRunnerBackend implements SessionBackend {
     void this.startupPromise.catch(error => this.failProtocol(error.message));
   }
 
+  /** What the provider negotiated for an in-flight turn. Only meaningful after
+   * hello; the worker reports it to the daemon when the provider is ready. */
+  activeTurnControls(): { steer: boolean; interrupt: boolean } {
+    return {
+      steer: this.ready && this.providerCapabilities.has('turn_steer'),
+      interrupt: this.ready && this.providerCapabilities.has('terminal_input'),
+    };
+  }
+
   write(data: string): boolean {
     if (!this.ready || !this.child || !this.providerCapabilities.has('terminal_input')) return false;
     if (!data || Buffer.byteLength(data, 'utf8') > MAX_REMOTE_RUNNER_LINE_BYTES) return false;
@@ -263,6 +273,9 @@ export class RemoteRunnerBackend implements SessionBackend {
         submissionDisposition: 'untouched',
         failureReason: 'remote runner is not accepting turns',
       };
+    }
+    if (input.activeTurnSteer) {
+      return this.submitActiveTurnSteer(input);
     }
     if (this.activeTurnId) {
       return {
@@ -315,6 +328,57 @@ export class RemoteRunnerBackend implements SessionBackend {
       // that execution did not start. Retire this provider generation and emit
       // an exact ambiguous terminal before any successor can be admitted.
       this.failProtocol(`turn acknowledgement failed: ${reason}`);
+      return {
+        submitted: false,
+        submissionDisposition: 'dirty_unknown',
+        failureReason: reason,
+      };
+    }
+  }
+
+  private async submitActiveTurnSteer(input: BackendTurnInput): Promise<BackendTurnSubmission> {
+    const activeTurnId = this.activeTurnId;
+    const generation = this.state?.generation;
+    if (!activeTurnId || !this.activeTurnAccepted || generation === undefined) {
+      return {
+        submitted: false,
+        submissionDisposition: 'untouched',
+        failureReason: 'remote runner has no acknowledged active turn to steer',
+      };
+    }
+    if (!this.providerCapabilities.has('turn_steer')) {
+      return {
+        submitted: false,
+        submissionDisposition: 'untouched',
+        failureReason: 'remote runner provider does not support active-turn steer',
+      };
+    }
+
+    const requestId = this.requestId('turn-steer');
+    try {
+      await this.request(remoteRunnerCommand('turn_steer', {
+        requestId,
+        turnId: activeTurnId,
+        steerId: input.turnId,
+        generation,
+        content: input.content,
+        ...(input.dispatchAttempt !== undefined ? { dispatchAttempt: input.dispatchAttempt } : {}),
+        ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+      }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
+      return { submitted: true };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (error instanceof RemoteRunnerRequestError && error.event.status !== 'ambiguous') {
+        return {
+          submitted: false,
+          submissionDisposition: 'untouched',
+          failureReason: reason,
+        };
+      }
+      // A timeout or provider-declared ambiguous result cannot prove whether the
+      // steer reached the model. Retire the whole provider generation so neither
+      // this subordinate input nor a successor can be replayed automatically.
+      this.failProtocol(`turn steer acknowledgement failed: ${reason}`);
       return {
         submitted: false,
         submissionDisposition: 'dirty_unknown',
@@ -570,6 +634,8 @@ export class RemoteRunnerBackend implements SessionBackend {
         requestId: helloId,
         sessionId: this.sessionId,
         requiredCapabilities: [...this.requiredCapabilities],
+        optionalCapabilities: REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES
+          .filter(capability => !this.requiredCapabilities.includes(capability)),
       }),
       event => event.type === 'hello',
       this.handshakeTimeoutMs,
@@ -766,6 +832,17 @@ export class RemoteRunnerBackend implements SessionBackend {
       const pending = pendingTurnRequestId
         ? this.pendingRequests.get(pendingTurnRequestId)
         : undefined;
+      if (pending?.command.type === 'turn_steer') {
+        const turnId = pending.command.turnId;
+        if ((event.turnId && event.turnId !== turnId) || !this.acceptActiveTurn(turnId)) {
+          this.failProtocol('remote runner emitted a failure with mismatched turn steer acknowledgement');
+          return;
+        }
+        clearTimeout(pending.timer);
+        this.pendingRequests.delete(pendingTurnRequestId!);
+        pending.reject(new RemoteRunnerRequestError(event));
+        return;
+      }
       if (pending?.command.type === 'turn') {
         const turnId = pending.command.turnId;
         if ((event.turnId && event.turnId !== turnId) || !this.acceptActiveTurn(turnId)) {
