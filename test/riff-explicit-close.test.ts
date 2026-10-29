@@ -289,6 +289,23 @@ describe('Riff explicit close', () => {
     );
   });
 
+  it('notifies once per turn while a durable inbox keeps retrying the rejected turn', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    fixture.ds.remoteCloseState = { phase: 'uncertain', requestId: 'close-riff' };
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      expect(sendWorkerInput(fixture.ds, 'late turn', 'om_retried_turn', {
+        dispatchAttempt: attempt + 1,
+        durablePrimaryInbox: true,
+      })).toBe(false);
+    }
+    expect(sendWorkerInput(fixture.ds, 'another turn', 'om_other_turn')).toBe(false);
+    await new Promise(resolve => setImmediate(resolve));
+
+    const notices = sessionReplyMock.mock.calls.filter(call => /正在关闭/.test(String(call[1])));
+    expect(notices.map(call => call[4])).toEqual(['om_retried_turn', 'om_other_turn']);
+  });
+
   it('keeps the newest runtime lineage when its durable save fails', async () => {
     const fixture = createFixture({ liveWorker: true });
     vi.spyOn(sessionStore, 'updateSession').mockImplementationOnce(() => {

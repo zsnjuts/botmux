@@ -733,6 +733,7 @@ import {
   isDocNativeSession,
   isHttpVirtualSession,
   larkTransportEnabled,
+  claimRemoteCloseNotice,
   remoteRetirementAdmissionPhase,
   type DaemonSession,
 } from './types.js';
@@ -12521,13 +12522,18 @@ export function sendWorkerInput(
 ): boolean {
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
-    const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
+    const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    const remoteBackend = backendType === 'mojo'
       ? 'Mojo'
-      : 'Riff';
+      : backendType === 'remote-runner'
+        ? 'Remote Runner'
+        : 'Riff';
+    const notify = opts.notifyRejection !== false && claimRemoteCloseNotice(ds, turnId);
     logger.warn(
-      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`,
+      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`
+      + (notify ? '' : ' (already notified)'),
     );
-    if (opts.notifyRejection !== false) void callbacks?.sessionReply(
+    if (notify) void callbacks?.sessionReply(
       sessionAnchorId(ds),
       tr('worker.remote_close_in_progress', { backend: remoteBackend }, localeForBot(ds.larkAppId)),
       'text',

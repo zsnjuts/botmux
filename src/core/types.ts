@@ -695,6 +695,10 @@ export interface DaemonSession {
      *  degrading it to a plain `closed` (see Session.mojoCloseJournal). */
     localResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
   };
+  /** Turns already told that the remote session is closing. A durable inbox
+   * retries a rejected turn every few seconds while the fence holds, so the
+   * notice must be sent once per turn, not once per retry. */
+  remoteCloseNoticeTurnIds?: string[];
   /** Graceful-shutdown transaction for the exact remote worker generation. */
   remoteShutdownState?: {
     phase: 'preparing' | 'prepared';
@@ -936,6 +940,19 @@ export function remoteRetirementAdmissionPhase(ds: DaemonSession): string | null
  *  between the two address spaces are not possible. */
 export function sessionKey(anchorId: string, larkAppId: string): string {
   return `${anchorId}::${larkAppId}`;
+}
+
+const REMOTE_CLOSE_NOTICE_CAP = 16;
+
+/** Claim the single close-in-progress notice for `turnId`. Returns false when
+ *  that turn was already notified (an inbox retry of the same message). */
+export function claimRemoteCloseNotice(ds: DaemonSession, turnId: string | undefined): boolean {
+  if (!turnId) return true;
+  const ids = ds.remoteCloseNoticeTurnIds ?? (ds.remoteCloseNoticeTurnIds = []);
+  if (ids.includes(turnId)) return false;
+  ids.push(turnId);
+  if (ids.length > REMOTE_CLOSE_NOTICE_CAP) ids.splice(0, ids.length - REMOTE_CLOSE_NOTICE_CAP);
+  return true;
 }
 
 const CONSUMED_REPO_CARD_CAP = 16;
