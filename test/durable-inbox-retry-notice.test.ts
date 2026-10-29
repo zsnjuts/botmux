@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  durableInboxExhaustedNotice,
   durableInboxRetryNotice,
+  enqueueDurableInboxExhaustedNotice,
   enqueueDurableInboxRetryNotice,
   MESSAGE_QUOTA_INFRASTRUCTURE_RETRY,
   MESSAGE_QUOTA_RETRY_NOTICE_ZH,
@@ -77,6 +79,33 @@ describe('durable Inbox retry notice', () => {
       attempts: 0,
       sessionKey: `retry-notice:${notice.providerUuid}`,
     });
+    store.close();
+  });
+
+  it('tells the sender once that a message dropped at the retry limit was not executed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'botmux-dropped-notice-'));
+    tempDirs.push(directory);
+    const store = new SqliteDurableCoordinationStore(join(directory, 'coordination.db'), {
+      now: () => 10,
+    });
+    const message = claim();
+    for (const now of [10, 20]) {
+      expect(await enqueueDurableInboxExhaustedNotice({
+        store, message, ownerId: 'notice-owner', now,
+      })).toBe('accepted');
+    }
+    const notice = durableInboxExhaustedNotice(message)!;
+    expect(notice.anchor).toBe('om_demo');
+    expect(notice.providerUuid).toMatch(/^drop_[0-9a-f]{40}$/);
+    expect(notice.providerUuid).not.toBe(durableInboxRetryNotice(message, {
+      kind: 'retry',
+      reason: MESSAGE_QUOTA_INFRASTRUCTURE_RETRY,
+    })!.providerUuid);
+    expect(await store.readOutbox(`out_${notice.providerUuid}`)).toMatchObject({
+      state: 'pending',
+      attempts: 0,
+    });
+    expect(durableInboxExhaustedNotice(claim('lark.im.message.updated_v1'))).toBeUndefined();
     store.close();
   });
 });

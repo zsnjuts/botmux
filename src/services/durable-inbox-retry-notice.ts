@@ -33,6 +33,22 @@ export function durableInboxRetryNotice(
   };
 }
 
+export const MESSAGE_DROPPED_NOTICE_ZH =
+  '⚠️ 这条消息多次处理失败，已停止重试，没有被执行。请稍后重新发送。';
+
+/** The notice for a message row that was completed at the retry limit. */
+export function durableInboxExhaustedNotice(
+  message: DurableLarkMessageClaim,
+): DurableInboxRetryNotice | undefined {
+  if (message.eventType !== 'lark.im.message.receive_v1') return undefined;
+  const digest = createHash('sha256').update(message.eventId).digest('hex');
+  return {
+    anchor: message.messageId,
+    content: MESSAGE_DROPPED_NOTICE_ZH,
+    providerUuid: `drop_${digest.slice(0, 40)}`,
+  };
+}
+
 export async function enqueueDurableInboxRetryNotice(input: {
   store: DurableCoordinationStore;
   message: DurableLarkMessageClaim;
@@ -40,7 +56,32 @@ export async function enqueueDurableInboxRetryNotice(input: {
   ownerId: string;
   now?: number;
 }): Promise<'ignored' | 'busy' | 'accepted'> {
-  const notice = durableInboxRetryNotice(input.message, input.result);
+  return enqueueDurableInboxNotice({
+    ...input,
+    notice: durableInboxRetryNotice(input.message, input.result),
+  });
+}
+
+export async function enqueueDurableInboxExhaustedNotice(input: {
+  store: DurableCoordinationStore;
+  message: DurableLarkMessageClaim;
+  ownerId: string;
+  now?: number;
+}): Promise<'ignored' | 'busy' | 'accepted'> {
+  return enqueueDurableInboxNotice({
+    ...input,
+    notice: durableInboxExhaustedNotice(input.message),
+  });
+}
+
+async function enqueueDurableInboxNotice(input: {
+  store: DurableCoordinationStore;
+  message: DurableLarkMessageClaim;
+  notice: DurableInboxRetryNotice | undefined;
+  ownerId: string;
+  now?: number;
+}): Promise<'ignored' | 'busy' | 'accepted'> {
+  const notice = input.notice;
   if (!notice) return 'ignored';
   const now = input.now ?? Date.now();
   const sessionKey = `retry-notice:${notice.providerUuid}`;
