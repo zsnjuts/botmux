@@ -4,9 +4,15 @@ import readline from 'node:readline';
 
 const protocol = 'botmux.remote-runner';
 const version = 1;
+// TURN_STEER_FIXTURE_UNSUPPORTED=1 models a provider that predates turn_steer.
 const capabilities = [
-  'start', 'resume', 'turn', 'turn_steer', 'cancel', 'detach', 'reattach', 'status',
+  'start', 'resume', 'turn',
+  ...(process.env.TURN_STEER_FIXTURE_UNSUPPORTED === '1' ? [] : ['turn_steer']),
+  'cancel', 'detach', 'reattach', 'status',
 ];
+// Like the TAE provider, steer is enabled only when the host asked for it in
+// hello, either pinned (required) or optional.
+let steerRequested = false;
 let state;
 let status = 'starting';
 let activeTurn;
@@ -28,6 +34,10 @@ function fail(command, code, message, failureStatus = 'failed') {
 readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
   const command = JSON.parse(line);
   if (command.type === 'hello') {
+    steerRequested = [
+      ...(command.requiredCapabilities ?? []),
+      ...(command.optionalCapabilities ?? []),
+    ].includes('turn_steer');
     emit({ type: 'hello', requestId: command.requestId, provider: 'turn-steer', capabilities });
   } else if (command.type === 'start') {
     state = {
@@ -47,6 +57,10 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     status = 'busy';
     emit({ type: 'status', requestId: command.requestId, status, state });
   } else if (command.type === 'turn_steer') {
+    if (!steerRequested) {
+      fail(command, 'turn_steer_not_negotiated', 'host did not request turn_steer');
+      return;
+    }
     if (!activeTurn || status !== 'busy'
         || command.turnId !== activeTurn.turnId
         || command.generation !== state?.generation) {

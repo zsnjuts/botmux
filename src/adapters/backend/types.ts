@@ -266,6 +266,9 @@ export interface SessionBackend {
    * bypass terminal keystroke adapters and receive the daemon-authenticated
    * turn envelope directly. */
   submitTurn?(input: BackendTurnInput): Promise<BackendTurnSubmission>;
+  /** Provider-negotiated controls for an in-flight turn (Remote Runner only):
+   * `steer` adds a follow-up to the running turn, `interrupt` accepts Ctrl-C. */
+  activeTurnControls?(): { steer: boolean; interrupt: boolean };
   /**
    * Begin one logical adapter submission and return its recovery fence.
    * Backends with a persistent ambiguity journal may arm it here so all

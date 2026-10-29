@@ -12128,6 +12128,15 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
   return false;
 }
 
+function promptReadyMessage(): Extract<WorkerToDaemon, { type: 'prompt_ready' }> {
+  const controls = backend?.activeTurnControls?.();
+  return {
+    type: 'prompt_ready',
+    ...(controls?.steer ? { activeTurnSteer: true as const } : {}),
+    ...(controls?.interrupt ? { activeTurnInterrupt: true as const } : {}),
+  };
+}
+
 async function handleTermAction(key: TermActionKey): Promise<void> {
   // Remote Runner may explicitly negotiate a structured terminal_input channel
   // for Ctrl-C. Other remote backends treat writes as model follow-ups, so keep
@@ -15042,7 +15051,7 @@ function settleRestartAttemptOnReady(
     upgradeInFlight: !!codexAutoUpgrade,
   });
   if (receipt === 'emit') {
-    if (opts.republishPromptReady) send({ type: 'prompt_ready' });
+    if (opts.republishPromptReady) send(promptReadyMessage());
     send({
       type: 'restart_result',
       attemptId: activeRestartAttemptId,
@@ -15254,7 +15263,7 @@ function markPromptReady(): void {
     // Before the flush below, so the note lands as this CLI's first input.
     deliverRestartInterruptionNote();
   }
-  send({ type: 'prompt_ready' });
+  send(promptReadyMessage());
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
   if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
     // Record the actual running version while its executable is still present.

@@ -27,12 +27,16 @@ function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBac
   return backend;
 }
 
-function spawnBackend(backend: RemoteRunnerBackend, runner = referenceRunner): void {
+function spawnBackend(
+  backend: RemoteRunnerBackend,
+  runner = referenceRunner,
+  env: Record<string, string> = {},
+): void {
   backend.spawn(process.execPath, [runner], {
     cwd: process.cwd(),
     cols: 120,
     rows: 40,
-    env: { ...process.env } as Record<string, string>,
+    env: { ...process.env, ...env } as Record<string, string>,
   });
 }
 
@@ -80,15 +84,35 @@ describe('RemoteRunnerBackend', () => {
     expect(progress.join('')).toContain('steered:turn-follow-up:new constraint');
   });
 
-  it('requires bilateral capability negotiation before active-turn steering', async () => {
+  it('steers when the provider advertises turn_steer without the bot config pinning it', async () => {
     const backend = new RemoteRunnerBackend({
       expectedProvider: 'turn-steer',
       requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status'],
-    }, 'session-turn-steer-disabled');
+    }, 'session-turn-steer-optional');
     children.push(backend);
     const ready = once<void>(cb => backend.onReady(cb));
     spawnBackend(backend, turnSteerRunner);
     await ready;
+    expect(backend.activeTurnControls()).toEqual({ steer: true, interrupt: false });
+    await backend.submitTurn({ turnId: 'turn-owner', content: 'original' });
+
+    await expect(backend.submitTurn({
+      turnId: 'turn-follow-up',
+      content: 'also check logs',
+      activeTurnSteer: true,
+    })).resolves.toMatchObject({ submitted: true });
+  });
+
+  it('keeps an active-turn follow-up local when the provider does not support turn_steer', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'turn-steer',
+      requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status'],
+    }, 'session-turn-steer-unsupported');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, turnSteerRunner, { TURN_STEER_FIXTURE_UNSUPPORTED: '1' });
+    await ready;
+    expect(backend.activeTurnControls()).toEqual({ steer: false, interrupt: false });
     await backend.submitTurn({ turnId: 'turn-owner', content: 'original' });
 
     await expect(backend.submitTurn({
@@ -98,7 +122,7 @@ describe('RemoteRunnerBackend', () => {
     })).resolves.toEqual({
       submitted: false,
       submissionDisposition: 'untouched',
-      failureReason: 'remote runner active-turn steer was not bilaterally negotiated',
+      failureReason: 'remote runner provider does not support active-turn steer',
     });
   });
 

@@ -15,6 +15,7 @@ import type {
 import {
   MAX_REMOTE_RUNNER_LINE_BYTES,
   REMOTE_RUNNER_BASE_CAPABILITIES,
+  REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES,
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,
@@ -230,6 +231,15 @@ export class RemoteRunnerBackend implements SessionBackend {
     void this.startupPromise.catch(error => this.failProtocol(error.message));
   }
 
+  /** What the provider negotiated for an in-flight turn. Only meaningful after
+   * hello; the worker republishes it with every prompt_ready. */
+  activeTurnControls(): { steer: boolean; interrupt: boolean } {
+    return {
+      steer: this.ready && this.providerCapabilities.has('turn_steer'),
+      interrupt: this.ready && this.providerCapabilities.has('terminal_input'),
+    };
+  }
+
   write(data: string): boolean {
     if (!this.ready || !this.child || !this.providerCapabilities.has('terminal_input')) return false;
     if (!data || Buffer.byteLength(data, 'utf8') > MAX_REMOTE_RUNNER_LINE_BYTES) return false;
@@ -336,12 +346,11 @@ export class RemoteRunnerBackend implements SessionBackend {
         failureReason: 'remote runner has no acknowledged active turn to steer',
       };
     }
-    if (!this.requiredCapabilities.includes('turn_steer')
-        || !this.providerCapabilities.has('turn_steer')) {
+    if (!this.providerCapabilities.has('turn_steer')) {
       return {
         submitted: false,
         submissionDisposition: 'untouched',
-        failureReason: 'remote runner active-turn steer was not bilaterally negotiated',
+        failureReason: 'remote runner provider does not support active-turn steer',
       };
     }
 
@@ -625,6 +634,8 @@ export class RemoteRunnerBackend implements SessionBackend {
         requestId: helloId,
         sessionId: this.sessionId,
         requiredCapabilities: [...this.requiredCapabilities],
+        optionalCapabilities: REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES
+          .filter(capability => !this.requiredCapabilities.includes(capability)),
       }),
       event => event.type === 'hello',
       this.handshakeTimeoutMs,

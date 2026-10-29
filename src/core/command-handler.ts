@@ -2868,8 +2868,9 @@ export async function handleCommand(
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
         const effectiveBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
         const remoteRunnerInterrupt = effectiveBackendType === 'remote-runner'
-          && (ds.initConfig?.backendConfig as { requiredCapabilities?: string[] } | undefined)
-            ?.requiredCapabilities?.includes('terminal_input') === true;
+          && !!ds.worker
+          && ds.activeTurnControls?.worker === ds.worker
+          && ds.activeTurnControls.interrupt;
         if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app'
             || ((isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds))
               && !remoteRunnerInterrupt)) {

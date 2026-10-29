@@ -54,12 +54,21 @@ export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
   'orphan_reconciliation',
 ] as const;
 
-/** Optional in-turn user steering. The host enables this only through explicit
- * bilateral negotiation: a provider must advertise it and the bot config must
- * list it in `requiredCapabilities`. The steer augments one already-active
+/** Optional in-turn user steering. The steer augments one already-active
  * execution; it never creates another final-owning model turn. */
 export const REMOTE_RUNNER_TURN_STEER_CAPABILITIES = [
   'turn_steer',
+] as const;
+
+/** Capabilities the host can use when a provider advertises them, without the
+ * bot config pinning them in `requiredCapabilities`. The host lists them in
+ * hello `optionalCapabilities`; a provider that does not implement one simply
+ * leaves it out of its hello and the host keeps the pre-existing behavior
+ * (follow-ups wait for the active turn, `/stop` stays unsupported). Pinning
+ * stays reserved for capabilities whose absence must fail the handshake. */
+export const REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES = [
+  'turn_steer',
+  'terminal_input',
 ] as const;
 
 export const REMOTE_RUNNER_CAPABILITIES = [
@@ -285,6 +294,8 @@ export type RemoteRunnerCommand =
       type: 'hello';
       sessionId: string;
       requiredCapabilities: RemoteRunnerCapability[];
+      /** Additive: providers that predate it ignore the field. */
+      optionalCapabilities?: RemoteRunnerCapability[];
     })
   | (RemoteRunnerCommandBase & {
       type: 'start';

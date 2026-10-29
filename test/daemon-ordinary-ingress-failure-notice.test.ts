@@ -286,6 +286,7 @@ function seedActiveRemoteRunnerSession(
     senderType: 'user' | 'bot';
   },
   activeTurnId = 'om_primary_active_owner',
+  opts: { providerSteer?: boolean } = {},
 ): { ds: any; workerSend: ReturnType<typeof vi.fn> } {
   const ds = seedThreadSession(anchor, 'active remote runner') as any;
   ds.cliReady = true;
@@ -293,11 +294,7 @@ function seedActiveRemoteRunnerSession(
   ds.session.workerGeneration = 12;
   ds.session.backendType = 'remote-runner';
   ds.session.cliId = 'remote-runner';
-  ds.initConfig = {
-    type: 'init',
-    backendType: 'remote-runner',
-    backendConfig: { requiredCapabilities: ['turn_steer'] },
-  };
+  ds.initConfig = { type: 'init', backendType: 'remote-runner', backendConfig: {} };
   ds.currentTurnId = activeTurnId;
   ds.activeInteractiveTurn = {
     turnId: activeTurnId,
@@ -328,6 +325,12 @@ function seedActiveRemoteRunnerSession(
     });
   });
   ds.worker = { killed: false, send: workerSend };
+  // What this worker's prompt_ready reported after the provider hello.
+  ds.activeTurnControls = {
+    worker: ds.worker,
+    steer: opts.providerSteer ?? true,
+    interrupt: false,
+  };
   return { ds, workerSend };
 }
 
@@ -1139,11 +1142,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ds.session.workerGeneration = 12;
     ds.session.backendType = 'remote-runner';
     ds.session.cliId = 'remote-runner';
-    ds.initConfig = {
-      type: 'init',
-      backendType: 'remote-runner',
-      backendConfig: { requiredCapabilities: ['turn_steer'] },
-    };
+    ds.initConfig = { type: 'init', backendType: 'remote-runner', backendConfig: {} };
     ds.currentTurnId = 'om_primary_active_owner';
     ds.activeInteractiveTurn = {
       turnId: 'om_primary_active_owner',
@@ -1171,6 +1170,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       });
     });
     ds.worker = { killed: false, send: workerSend };
+    ds.activeTurnControls = { worker: ds.worker, steer: true, interrupt: false };
     const queuePostAdmissionOutput = vi.fn();
     const ctx = makeCtx(anchor, turnId);
     ctx.durablePrimaryDispatch = {
@@ -1202,6 +1202,57 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       providerUuid: expect.stringMatching(/^turn_steer_accepted_[a-f0-9]{24}$/),
       hookContext: { sessionId: ds.session.sessionId, turnId },
     }));
+  });
+
+  it('keeps a same-principal follow-up waiting when the live provider did not negotiate steer', async () => {
+    const anchor = 'om_thread_primary_active_no_steer';
+    const turnId = 'om_primary_active_no_steer_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(
+      anchor,
+      activeCaller,
+      undefined,
+      { providerSteer: false },
+    );
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 4, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'add this constraint now', anchor), ctx);
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+    expect(ds.currentTurnId).toBe('om_primary_active_owner');
+  });
+
+  it('does not reuse a previous worker\'s steer negotiation after a respawn', async () => {
+    const anchor = 'om_thread_primary_active_stale_steer';
+    const turnId = 'om_primary_active_stale_steer_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    ds.activeTurnControls = { worker: { killed: true }, steer: true, interrupt: true };
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 4, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'add this constraint now', anchor), ctx);
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
   });
 
   it('steers an explicit same-peer-bot @steer follow-up without forwarding the directive', async () => {

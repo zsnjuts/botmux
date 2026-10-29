@@ -694,7 +694,6 @@ import {
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
-import type { RemoteRunnerConfig } from './adapters/backend/remote-runner-config.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import { createPluginCardActionGateway } from './core/plugins/card-actions/gateway.js';
 import { createInputCaptureStore } from './core/plugins/input-capture/store.js';
@@ -23560,10 +23559,10 @@ function durablePrimaryTurnDisposition(
   }, turnId);
 }
 
-/** A Remote Runner steer is opt-in on both sides and may only inherit the
- * exact active principal. This helper reads the frozen live worker config,
- * never a newly edited bot default, so capability changes take effect only on
- * a new worker generation. */
+/** A Remote Runner steer needs the live provider to have negotiated
+ * `turn_steer` (reported by this worker's prompt_ready) and may only inherit
+ * the exact active principal. Without it the follow-up keeps waiting for the
+ * active turn, as before. */
 function durablePrimaryActiveTurnSteerAuthorized(
   ds: DaemonSession,
   caller: TrustedCaller | undefined,
@@ -23571,9 +23570,6 @@ function durablePrimaryActiveTurnSteerAuthorized(
 ): boolean {
   const active = ds.activeInteractiveTurn;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  const remoteConfig = backendType === 'remote-runner'
-    ? ds.initConfig?.backendConfig as RemoteRunnerConfig | undefined
-    : undefined;
   // Match the existing single-machine steer contract: an authenticated human
   // may append normally, while a positively classified peer bot must opt in
   // with the consumed `@steer` directive.  The bot stays a bot in the trusted
@@ -23581,7 +23577,9 @@ function durablePrimaryActiveTurnSteerAuthorized(
   const callerRequestedSteer = caller?.senderType === 'user'
     || (caller?.senderType === 'bot' && opts.explicitBotSteer === true);
   return backendType === 'remote-runner'
-    && remoteConfig?.requiredCapabilities?.includes('turn_steer') === true
+    && !!ds.worker
+    && ds.activeTurnControls?.worker === ds.worker
+    && ds.activeTurnControls.steer
     && callerRequestedSteer
     && !!active
     && hasDurablePrimaryInputCommit(ds, active.turnId)

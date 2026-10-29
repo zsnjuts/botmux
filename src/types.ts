@@ -2225,7 +2225,10 @@ export type WorkerToDaemon =
       rpcGeneration: string;
       eligible: boolean;
     }
-  | { type: 'prompt_ready' }
+  /** `activeTurnSteer` / `activeTurnInterrupt`: the live backend negotiated
+   *  in-turn steer / Ctrl-C (Remote Runner). Republished on every prompt_ready
+   *  so the daemon's view always belongs to the current worker. */
+  | { type: 'prompt_ready'; activeTurnSteer?: true; activeTurnInterrupt?: true }
   | { type: 'cli_runtime_version'; version: string }
   /** The CLI said its own install changed under the running process (Pi after
    *  a global upgrade: on-demand modules then fail with "Cannot find module").

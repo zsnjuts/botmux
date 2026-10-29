@@ -618,6 +618,108 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
+  it('asks for optional in-turn controls and reports what the provider negotiated on prompt_ready', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-controls-'));
+    tempDirs.push(root);
+    const commandsPath = join(root, 'commands.jsonl');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const state = { version: 1, provider: 'controls-provider', generation: 1, remoteSessionId: 'remote-controls-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(command) + '\\n');
+  if (command.type === 'hello') {
+    emit({ type: 'hello', requestId: command.requestId, provider: 'controls-provider', capabilities: ['start','resume','turn','cancel','detach','reattach','status','turn_steer','terminal_input'] });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+    setTimeout(() => emit({ type: 'final', turnId: command.turnId, content: 'done', state }), 20);
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  } else if (command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_controls',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: { expectedProvider: 'controls-provider' },
+    }]));
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-controls',
+        LARK_APP_ID: 'app_controls',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-controls',
+      chatId: 'oc_controls',
+      rootMessageId: 'om_controls',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'controls-provider' },
+      prompt: 'say done',
+      turnId: 'turn-controls',
+      trustedCaller: {
+        requestUserOpenId: 'ou_remote_user',
+        requestLarkAppId: 'app_controls',
+        senderType: 'user',
+      },
+      larkAppId: 'app_controls',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'prompt_ready'),
+      () => `worker never reported prompt_ready\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.find(message => message.type === 'prompt_ready')).toEqual({
+      type: 'prompt_ready',
+      activeTurnSteer: true,
+      activeTurnInterrupt: true,
+    });
+    const hello = readFileSync(commandsPath, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line))
+      .find(command => command.type === 'hello');
+    expect(hello.requiredCapabilities).not.toContain('turn_steer');
+    expect(hello.optionalCapabilities).toEqual(
+      expect.arrayContaining(['turn_steer', 'terminal_input']),
+    );
+  });
+
   it('settles a cancelled remote turn without rendering its diagnostic as final output', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-cancelled-turn-'));
     tempDirs.push(root);
