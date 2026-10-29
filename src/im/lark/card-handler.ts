@@ -89,6 +89,8 @@ import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markR
 import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
+import { issueWriteLink } from '../../core/terminal-write-link-issuance.js';
+import { appendControlAudit, controlAuditRecord } from '../../dashboard/control-audit.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
@@ -2555,8 +2557,16 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     const pendingRepoOwnerException =
       sensitiveMeta.pendingRepoOwnerException === true && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
+    // 会话发起人取自己会话的操作链接（见 SensitiveCardActionMeta.sessionOwnerException）。
+    // ownerOpenId 是 daemon 认证的 app-scoped 身份，只和同一 bot 的 operator 比较。
+    const sessionOwnerException =
+      sensitiveMeta.sessionOwnerException === true && !!ds && !!effectiveAppId
+      && ds.larkAppId === effectiveAppId
+      && !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId
+      && !getBot(effectiveAppId).resolvedBlockedUsers.includes(operatorOpenId);
     if (effectiveAppId) {
-      if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
+      if (!pendingRepoOwnerException && !sessionOwnerException
+          && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
         logger.info(`Card action "${value?.action}" blocked for non-operator user: ${operatorOpenId} (chat=${chatId})`);
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
@@ -3915,7 +3925,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return;
       }
       if (sessionSupportsWebTerminal(ds) && (ds.riffAccessUrl || (ds.workerPort && ds.workerToken))) {
-        const writeUrl = buildTerminalUrl(ds, { write: true });
+        // 本机 worker 终端的写链接带上签名的领取人，网页终端输入审计据此记到这个人名下。
+        const writeUrl = ds.riffAccessUrl
+          ? buildTerminalUrl(ds, { write: true })
+          : issueWriteLink(buildTerminalUrl(ds, { write: true }), ds.session.sessionId, operatorOpenId);
+        if (!ds.riffAccessUrl) {
+          appendControlAudit(controlAuditRecord(operatorOpenId, ds.session.sessionId, 'terminal.write_link_issued'));
+        }
         const cardJson = buildSessionCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
