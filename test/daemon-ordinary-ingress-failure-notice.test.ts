@@ -1198,7 +1198,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.lastCliInput).toBe('original task');
     expect(ctx.ingressAdmission).toEqual({ admitted: true });
     expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
-      content: '收到，引导成功',
+      content: `<at user_id="${OWNER}"></at> 收到，引导成功`,
       providerUuid: expect.stringMatching(/^turn_steer_accepted_[a-f0-9]{24}$/),
       hookContext: { sessionId: ds.session.sessionId, turnId },
     }));
@@ -1355,7 +1355,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     });
     expect(ctx.ingressAdmission).toEqual({ admitted: true });
     expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
-      content: '收到，引导成功',
+      content: '<at user_id="ou_proposer_bot"></at> 收到，引导成功',
       providerUuid: expect.stringMatching(/^turn_steer_accepted_[a-f0-9]{24}$/),
       hookContext: { sessionId: ds.session.sessionId, turnId },
     }));

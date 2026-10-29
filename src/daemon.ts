@@ -28078,9 +28078,16 @@ async function handleThreadReplyAdmitted(
               ]))
               .digest('hex')
               .slice(0, 24)}`;
+            // @ the sender so the topic shows whose guidance joined the turn.
+            const steerSenderOpenId = threadTrustedCaller?.requestUserOpenId;
+            const steerAckContent = steerSenderOpenId && /^ou_[A-Za-z0-9_-]+$/.test(steerSenderOpenId)
+              ? tr('worker.steer_accepted_by', {
+                  mention: `<at user_id="${steerSenderOpenId}"></at>`,
+                }, localeForBot(ds.larkAppId))
+              : tr('worker.steer_accepted', undefined, localeForBot(ds.larkAppId));
             ctx.queuePostAdmissionOutput({
               target: durableOutboxTargetForTurn(ds, parsed.messageId),
-              content: tr('worker.steer_accepted', undefined, localeForBot(ds.larkAppId)),
+              content: steerAckContent,
               msgType: 'text',
               providerUuid,
               hookContext: { sessionId: ds.session.sessionId, turnId: parsed.messageId },

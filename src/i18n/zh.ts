@@ -15,6 +15,7 @@ export const messages: Record<string, string> = {
   'cmd.effort.unavailable': '当前 Codex App 连接尚未就绪或正在切换，请稍后重试。',
   'cmd.effort.error': '未能确认推理强度修改结果，请稍后重试。',
   'worker.steer_accepted': '收到，引导成功',
+  'worker.steer_accepted_by': '{mention} 收到，引导成功',
   // ─── Terminal status pages ───────────────────────────────────────────────
   'terminal.status.starting.title': '终端正在启动',
   'terminal.status.starting.detail': '正在恢复该会话的终端连接，请稍后刷新页面或从最新卡片重新打开 Web 终端。',

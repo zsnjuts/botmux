@@ -12,6 +12,7 @@ export const messages: Record<string, string> = {
   'cmd.effort.unavailable': 'The Codex App connection is not ready or is being replaced. Please retry shortly.',
   'cmd.effort.error': 'The reasoning effort update could not be confirmed. Please retry shortly.',
   'worker.steer_accepted': 'Got it — guidance accepted',
+  'worker.steer_accepted_by': '{mention} Got it — guidance accepted',
   // ─── Terminal status pages ───────────────────────────────────────────────
   'terminal.status.starting.title': 'Terminal is starting',
   'terminal.status.starting.detail': 'Restoring this session\'s terminal connection. Refresh this page later or reopen the Web Terminal from the latest card.',
