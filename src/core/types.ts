@@ -108,7 +108,7 @@ export interface DaemonSession {
    *  See docs/design/2026-09-11-command-router.md §5 / §6. */
   cliReadyGeneration?: number;
   /** In-turn controls the live Remote Runner provider negotiated, as reported
-   *  by that worker's last prompt_ready. Bound to the worker object so a
+   *  by that worker's active_turn_controls. Bound to the worker object so a
    *  respawned worker never inherits the previous generation's answer. */
   activeTurnControls?: { worker: unknown; steer: boolean; interrupt: boolean };
   /** runtime 级联定序器（daemon 的 runPassthroughCascade）在飞：同 anchor 后到的普通消息 /

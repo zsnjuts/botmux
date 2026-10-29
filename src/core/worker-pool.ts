@@ -16294,6 +16294,12 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'active_turn_controls': {
+        if (ds.worker !== worker) break;
+        ds.activeTurnControls = { worker, steer: msg.steer, interrupt: msg.interrupt };
+        break;
+      }
+
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
         // The ONLY set point for the in-memory readiness flag (design
@@ -16302,11 +16308,6 @@ function setupWorkerHandlers(
         // and wait for the NEXT set instead of trusting a stale `true`.
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
-        ds.activeTurnControls = {
-          worker,
-          steer: msg.activeTurnSteer === true,
-          interrupt: msg.activeTurnInterrupt === true,
-        };
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The

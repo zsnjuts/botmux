@@ -23560,7 +23560,7 @@ function durablePrimaryTurnDisposition(
 }
 
 /** A Remote Runner steer needs the live provider to have negotiated
- * `turn_steer` (reported by this worker's prompt_ready) and may only inherit
+ * `turn_steer` (reported by this worker's active_turn_controls) and may only inherit
  * the exact active principal. Without it the follow-up keeps waiting for the
  * active turn, as before. */
 function durablePrimaryActiveTurnSteerAuthorized(

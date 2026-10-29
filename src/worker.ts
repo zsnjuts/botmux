@@ -12128,15 +12128,6 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
   return false;
 }
 
-function promptReadyMessage(): Extract<WorkerToDaemon, { type: 'prompt_ready' }> {
-  const controls = backend?.activeTurnControls?.();
-  return {
-    type: 'prompt_ready',
-    ...(controls?.steer ? { activeTurnSteer: true as const } : {}),
-    ...(controls?.interrupt ? { activeTurnInterrupt: true as const } : {}),
-  };
-}
-
 async function handleTermAction(key: TermActionKey): Promise<void> {
   // Remote Runner may explicitly negotiate a structured terminal_input channel
   // for Ctrl-C. Other remote backends treat writes as model follow-ups, so keep
@@ -15051,7 +15042,7 @@ function settleRestartAttemptOnReady(
     upgradeInFlight: !!codexAutoUpgrade,
   });
   if (receipt === 'emit') {
-    if (opts.republishPromptReady) send(promptReadyMessage());
+    if (opts.republishPromptReady) send({ type: 'prompt_ready' });
     send({
       type: 'restart_result',
       attemptId: activeRestartAttemptId,
@@ -15263,7 +15254,7 @@ function markPromptReady(): void {
     // Before the flush below, so the note lands as this CLI's first input.
     deliverRestartInterruptionNote();
   }
-  send(promptReadyMessage());
+  send({ type: 'prompt_ready' });
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
   if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
     // Record the actual running version while its executable is still present.
@@ -23050,6 +23041,12 @@ async function spawnCli(
   backend.onReady?.(() => {
     if (backend !== observedBackend || fatalWorkerErrorPending) return;
     if (effectiveBackendType === 'remote-runner') {
+      const controls = backend.activeTurnControls?.();
+      send({
+        type: 'active_turn_controls',
+        steer: controls?.steer === true,
+        interrupt: controls?.interrupt === true,
+      });
       if (remoteRunnerRecoveredTurnInFlight && currentBotmuxTurnId) {
         log(`Remote runner ready with recovered turn ${currentBotmuxTurnId.substring(0, 12)} still active`);
         return;

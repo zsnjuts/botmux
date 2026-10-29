@@ -618,7 +618,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
-  it('asks for optional in-turn controls and reports what the provider negotiated on prompt_ready', async () => {
+  it('asks for optional in-turn controls and reports what the provider negotiated once ready', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-controls-'));
     tempDirs.push(root);
     const commandsPath = join(root, 'commands.jsonl');
@@ -703,14 +703,21 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     } satisfies DaemonToWorker);
 
     await waitFor(
-      () => messages.some(message => message.type === 'prompt_ready'),
-      () => `worker never reported prompt_ready\n${logs.join('')}\n${JSON.stringify(messages)}`,
+      () => messages.some(message => message.type === 'turn_terminal'),
+      () => `turn did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
     );
-    expect(messages.find(message => message.type === 'prompt_ready')).toEqual({
-      type: 'prompt_ready',
-      activeTurnSteer: true,
-      activeTurnInterrupt: true,
+    // Reported before the opening turn is submitted, so a follow-up sent
+    // during the very first turn can already steer.
+    const controlsAt = messages.findIndex(message => message.type === 'active_turn_controls');
+    expect(messages[controlsAt]).toEqual({
+      type: 'active_turn_controls',
+      steer: true,
+      interrupt: true,
     });
+    const committedAt = messages.findIndex(message => message.type === 'turn_input_committed'
+      || message.type === 'turn_terminal');
+    expect(controlsAt).toBeGreaterThanOrEqual(0);
+    expect(controlsAt).toBeLessThan(committedAt);
     const hello = readFileSync(commandsPath, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line))
       .find(command => command.type === 'hello');

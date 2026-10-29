@@ -232,7 +232,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   }
 
   /** What the provider negotiated for an in-flight turn. Only meaningful after
-   * hello; the worker republishes it with every prompt_ready. */
+   * hello; the worker reports it to the daemon when the provider is ready. */
   activeTurnControls(): { steer: boolean; interrupt: boolean } {
     return {
       steer: this.ready && this.providerCapabilities.has('turn_steer'),
