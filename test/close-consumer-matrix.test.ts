@@ -416,6 +416,10 @@ const RESPONSE_CONSUMERS: Record<string, ResponseRule> = {
     why: '/dismiss closes peer bots\' sessions in the group; residual is reported and keeps the group.',
     mustParse: true,
   },
+  'dashboard/admin-api.ts::handleAdminApi::close-route': {
+    why: 'infrabuddy admin close: returns the parsed residual (local vs remote) so the CLI warns instead of reporting a plain close.',
+    mustParse: true,
+  },
   'core/dashboard-ipc-server.ts::<module>::close-route': {
     why: 'Serves the route; replays the residual on the closed-row fast path.',
     mustParse: false,
