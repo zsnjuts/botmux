@@ -193,6 +193,19 @@ export const ENTRY_SUBCOMMANDS: ReadonlySet<string> = new Set(Object.values(ENTR
  */
 export const WORKER_ENTRY_SUBCOMMAND: string = ENTRY_SUBCOMMAND.worker;
 
+/**
+ * Long-running fleet processes whose info logs are their operational record
+ * (daemon stdout → `daemon-<n>-out.log`; the daemon re-logs worker stdout).
+ * cli.ts silences info for CLI subcommands so their JSON stdout stays clean,
+ * and a compiled binary reaches every entry through that same cli.ts, so these
+ * entries must switch info back on before importing. Runner / relay entries
+ * keep the CLI default: their stdout can be a protocol stream.
+ */
+export function entryLogsInfo(entry: BotmuxEntry): boolean {
+  return entry === 'core-only' || entry === 'daemon' || entry === 'worker'
+    || entry === 'supervisor' || entry === 'dashboard' || entry === 'plugin-supervisor';
+}
+
 /** Map a hidden subcommand token back to its entry (null if not one). */
 export function entryForSubcommand(token: string): BotmuxEntry | null {
   for (const [entry, sub] of Object.entries(ENTRY_SUBCOMMAND)) {
