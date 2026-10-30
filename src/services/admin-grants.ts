@@ -10,13 +10,7 @@
  * `globalGrants`（talk-only），从不碰 `allowedUsers`。
  */
 import { getBot, getBotOpenId } from '../bot-registry.js';
-import {
-  getUserProfileStrict,
-  listChatUserMembers,
-  resolveAllowedUsersWithMap,
-  type ChatUserMember,
-  type UserProfileLookup,
-} from '../im/lark/client.js';
+import type { ChatUserMember, UserProfileLookup } from '../im/lark/client.js';
 import { ADMIN_ACTOR_VIA, type AdminIdentity } from './admin-api.js';
 import { withConfigActor } from './durable-config-mutation.js';
 import { MAX_GRANT_QUOTA } from './grant-policy.js';
@@ -58,10 +52,15 @@ export interface GrantResolveDeps {
   now: () => number;
 }
 
+// 飞书客户端在调用时才加载：本模块在 dashboard-ipc-server 的静态导入图里，很多测试用
+// 只列出部分导出的工厂函数 mock 了 client.js，静态具名导入会让它们在加载时就失败。
+let larkClient: Promise<typeof import('../im/lark/client.js')> | undefined;
+const lark = () => (larkClient ??= import('../im/lark/client.js'));
+
 export const defaultGrantResolveDeps: GrantResolveDeps = {
-  listChatMembers: listChatUserMembers,
-  resolveUsers: resolveAllowedUsersWithMap,
-  lookupProfile: (larkAppId, openId) => getUserProfileStrict(larkAppId, openId, 'open_id'),
+  listChatMembers: async (larkAppId, chatId) => (await lark()).listChatUserMembers(larkAppId, chatId),
+  resolveUsers: async (larkAppId, raw) => (await lark()).resolveAllowedUsersWithMap(larkAppId, raw),
+  lookupProfile: async (larkAppId, openId) => (await lark()).getUserProfileStrict(larkAppId, openId, 'open_id'),
   now: Date.now,
 };
 
