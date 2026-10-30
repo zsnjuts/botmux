@@ -1070,6 +1070,13 @@ export interface WorkerPoolCallbacks {
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
    * may be cleared without emitting the ambiguous-failure terminal. */
+  /** Every worker `turn_input_rejected` (ordinary IM or not), for owners that
+   * wait on the input outside the ordinary IM delivery ledger. */
+  onTurnInputRejected?: (
+    ds: DaemonSession,
+    rejection: Extract<WorkerToDaemon, { type: 'turn_input_rejected' }>,
+    context: { workerGeneration: number },
+  ) => void;
   onOrdinaryImInputRejected?: (
     ds: DaemonSession,
     context: {
@@ -15639,6 +15646,11 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        try {
+          cb.onTurnInputRejected?.(ds, msg, { workerGeneration });
+        } catch (err) {
+          logger.warn(`[${t}] turn input rejection handler failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         break;
       }

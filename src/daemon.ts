@@ -23571,14 +23571,17 @@ function durablePrimaryTurnDisposition(
 }
 
 /** A Remote Runner steer needs the live provider to have negotiated
- * `turn_steer` (reported by this worker's active_turn_controls) and may only inherit
- * the exact active principal. Without it the follow-up keeps waiting for the
- * active turn, as before. */
-function durablePrimaryActiveTurnSteerAuthorized(
+ * `turn_steer` (reported by this worker's active_turn_controls). The active
+ * principal steers as itself. Another authenticated human of the same bot may
+ * steer an interactive human turn too, like typing into the owner's terminal:
+ * the steer runs as the turn's owner (the returned caller), never as a second
+ * identity inside one turn. Without authority the follow-up keeps waiting for
+ * the active turn, as before. */
+function durablePrimaryActiveTurnSteerCaller(
   ds: DaemonSession,
   caller: TrustedCaller | undefined,
   opts: { explicitBotSteer?: boolean } = {},
-): boolean {
+): TrustedCaller | undefined {
   const active = ds.activeInteractiveTurn;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   // Match the existing single-machine steer contract: an authenticated human
@@ -23587,15 +23590,31 @@ function durablePrimaryActiveTurnSteerAuthorized(
   // caller/audit tuple; the directive never borrows its configured human owner.
   const callerRequestedSteer = caller?.senderType === 'user'
     || (caller?.senderType === 'bot' && opts.explicitBotSteer === true);
-  return backendType === 'remote-runner'
-    && !!ds.worker
-    && ds.activeTurnControls?.worker === ds.worker
-    && ds.activeTurnControls.steer
-    && callerRequestedSteer
-    && !!active
-    && activeTurnInputCommitted(ds, active.turnId)
-    && (sameTrustedPrincipal(active.caller, caller)
-      || sameTrustedPrincipal(active.controller, caller));
+  if (backendType !== 'remote-runner'
+    || !caller
+    || !ds.worker
+    || ds.activeTurnControls?.worker !== ds.worker
+    || !ds.activeTurnControls.steer
+    || !callerRequestedSteer
+    || !active
+    || !activeTurnInputCommitted(ds, active.turnId)) {
+    return undefined;
+  }
+  if (sameTrustedPrincipal(active.caller, caller)
+    || sameTrustedPrincipal(active.controller, caller)) {
+    return caller;
+  }
+  // The XPI switch owns cross-principal follow-ups when it is on (the owner
+  // approves them); a bot or a schedule turn is never borrowed.
+  const owner = active.caller;
+  return !config.crossPrincipalInterruption
+    && caller.senderType === 'user'
+    && (caller.source ?? 'interactive') === 'interactive'
+    && owner?.senderType === 'user'
+    && (owner.source ?? 'interactive') === 'interactive'
+    && owner.requestLarkAppId === caller.requestLarkAppId
+    ? owner
+    : undefined;
 }
 
 function retryDurablePrimaryIngress(ctx: RoutingContext, reason: string): boolean {
@@ -23611,6 +23630,13 @@ function recordDurablePrimaryInputCommit(
   workerGeneration: number,
 ): void {
   if (!receipt.durablePrimaryInbox) return;
+  if (receipt.activeTurnSteer) {
+    // Before waking waiters: whichever attempt observes this commit owns the
+    // acceptance notice.
+    const steered = ds.steeredInputTurnIds ??= new Set();
+    steered.add(receipt.turnId);
+    if (steered.size > 64) steered.delete(steered.values().next().value!);
+  }
   const previous = ds.session.durablePrimaryInputCommits ?? [];
   const appended = appendDurablePrimaryInputCommit(previous, {
     turnId: receipt.turnId,
@@ -23636,6 +23662,58 @@ function recordDurablePrimaryInputCommit(
 }
 
 export const __testOnly_recordDurablePrimaryInputCommit = recordDurablePrimaryInputCommit;
+
+function rejectDurablePrimaryInputCommitWaiters(ds: DaemonSession, turnId: string, error: Error): void {
+  const key = durablePrimaryInputCommitKey(ds.session.sessionId, turnId);
+  const waiters = durablePrimaryInputCommitWaiters.get(key);
+  if (!waiters) return;
+  for (const waiter of [...waiters]) waiter.reject(error);
+}
+
+/** The worker handed a steer back: it never reached the provider. Fail the
+ * waiting durable attempt now (not after the receipt timeout) so the Inbox
+ * retries it, admitted as the next turn once the target turn is gone. */
+function handleWorkerTurnInputRejected(
+  ds: DaemonSession,
+  rejection: Extract<WorkerToDaemon, { type: 'turn_input_rejected' }>,
+  workerGeneration: number,
+): void {
+  if (ds.session.workerGeneration !== workerGeneration) return;
+  if (rejection.reason !== 'active_turn_steer_target_ended') return;
+  rejectDurablePrimaryInputCommitWaiters(
+    ds,
+    rejection.turnId,
+    new Error('active turn steer was handed back by the worker'),
+  );
+}
+
+export const __testOnly_handleWorkerTurnInputRejected = handleWorkerTurnInputRejected;
+
+/** Idempotent (stable providerUuid) acceptance notice for a steered follow-up,
+ * @-mentioning the sender so the topic shows whose guidance joined the turn. */
+function queueTurnSteerAcceptedNotice(
+  ds: DaemonSession,
+  ctx: RoutingContext,
+  turnId: string,
+  caller: TrustedCaller | undefined,
+): void {
+  if (!ctx.queuePostAdmissionOutput || !ds.steeredInputTurnIds?.has(turnId)) return;
+  const providerUuid = `turn_steer_accepted_${createHash('sha256')
+    .update(JSON.stringify([ds.larkAppId, ds.session.sessionId, turnId, 'turn-steer-accepted']))
+    .digest('hex')
+    .slice(0, 24)}`;
+  const senderOpenId = caller?.requestUserOpenId;
+  const content = senderOpenId && /^ou_[A-Za-z0-9_-]+$/.test(senderOpenId)
+    ? tr('worker.steer_accepted_by', { mention: `<at user_id="${senderOpenId}"></at>` }, localeForBot(ds.larkAppId))
+    : tr('worker.steer_accepted', undefined, localeForBot(ds.larkAppId));
+  ctx.queuePostAdmissionOutput({
+    target: durableOutboxTargetForTurn(ds, turnId),
+    content,
+    msgType: 'text',
+    providerUuid,
+    hookContext: { sessionId: ds.session.sessionId, turnId },
+  });
+}
 
 function waitForDurablePrimaryInputCommit(
   ds: DaemonSession,
@@ -26959,6 +27037,9 @@ async function handleThreadReplyAdmitted(
 
   let ds = activeSessions.get(runtimeSessionKey);
   let durablePrimaryActiveTurnSteer = false;
+  // Who the steer runs as: the sender, or the active turn's owner when someone
+  // else steers it. The accepted notice still @-mentions the sender.
+  let steerTrustedCaller: TrustedCaller | undefined;
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
@@ -26972,11 +27053,12 @@ async function handleThreadReplyAdmitted(
   // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
   // retry must be a pure claim-state transition.
   if (ds && ctx.durablePrimaryDispatch) {
-    durablePrimaryActiveTurnSteer = durablePrimaryActiveTurnSteerAuthorized(
+    steerTrustedCaller = durablePrimaryActiveTurnSteerCaller(
       ds,
       threadTrustedCaller,
       { explicitBotSteer: botSteerDirective.requested },
-    )
+    );
+    durablePrimaryActiveTurnSteer = !!steerTrustedCaller
       && !ds.adoptedFrom
       && !ds.initConfig?.adoptMode
       && !ds.session.principalLane
@@ -26991,6 +27073,8 @@ async function handleThreadReplyAdmitted(
       ...(durablePrimaryActiveTurnSteer ? { allowActiveTurnSteer: true } : {}),
     });
     if (disposition === 'committed') {
+      // The steer can land after an earlier attempt's receipt wait expired.
+      queueTurnSteerAcceptedNotice(ds, ctx, parsed.messageId, threadTrustedCaller);
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       markSessionActivity(ds, Date.now(), {
         human: parsed.senderType === 'user' && !isForeignBot,
@@ -28030,7 +28114,9 @@ async function handleThreadReplyAdmitted(
           ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(durablePrimaryActiveTurnSteer ? { activeTurnSteer: true as const } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
-          ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+          ...(durablePrimaryActiveTurnSteer && steerTrustedCaller
+            ? { trustedCaller: steerTrustedCaller }
+            : threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
         });
       // Record the input as the session's last real CLI turn ONLY after the
       // worker accepted it. Recording before delivery (the old order) persisted
@@ -28040,7 +28126,10 @@ async function handleThreadReplyAdmitted(
       // and wrongly `--resume` a CLI that never took a real turn.
       if (accepted) {
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
-        markIngressAdmitted(ctx);
+        // steer 例外：它可能被退回（目标轮次已结束），只有提交回执才算接收，
+        // 否则重投会被当成已接收的重复消息而丢掉。重发同一 steer 是安全的：
+        // worker 按 turnId 去重，provider 按 steerId 幂等。
+        if (!durablePrimaryActiveTurnSteer) markIngressAdmitted(ctx);
         if (!durablePrimaryActiveTurnSteer) beginNewTurn(ds, parsed.content, parsed.messageId);
         if (threadTrustedCaller && !durablePrimaryActiveTurnSteer) {
           setActiveInteractiveTurn(
@@ -28068,31 +28157,8 @@ async function handleThreadReplyAdmitted(
             );
             return;
           }
-          if (durablePrimaryActiveTurnSteer && ctx.queuePostAdmissionOutput) {
-            const providerUuid = `turn_steer_accepted_${createHash('sha256')
-              .update(JSON.stringify([
-                ds.larkAppId,
-                ds.session.sessionId,
-                parsed.messageId,
-                'turn-steer-accepted',
-              ]))
-              .digest('hex')
-              .slice(0, 24)}`;
-            // @ the sender so the topic shows whose guidance joined the turn.
-            const steerSenderOpenId = threadTrustedCaller?.requestUserOpenId;
-            const steerAckContent = steerSenderOpenId && /^ou_[A-Za-z0-9_-]+$/.test(steerSenderOpenId)
-              ? tr('worker.steer_accepted_by', {
-                  mention: `<at user_id="${steerSenderOpenId}"></at>`,
-                }, localeForBot(ds.larkAppId))
-              : tr('worker.steer_accepted', undefined, localeForBot(ds.larkAppId));
-            ctx.queuePostAdmissionOutput({
-              target: durableOutboxTargetForTurn(ds, parsed.messageId),
-              content: steerAckContent,
-              msgType: 'text',
-              providerUuid,
-              hookContext: { sessionId: ds.session.sessionId, turnId: parsed.messageId },
-            });
-          }
+          if (durablePrimaryActiveTurnSteer) markIngressAdmitted(ctx);
+          queueTurnSteerAcceptedNotice(ds, ctx, parsed.messageId, threadTrustedCaller);
         }
       }
       else {
@@ -30933,6 +30999,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         proposer,
         message: envelope,
       });
+    },
+    onTurnInputRejected(ds, rejection, context) {
+      handleWorkerTurnInputRejected(ds, rejection, context.workerGeneration);
     },
     onTurnInputCommitted(ds, receipt, context) {
       // A recovered Remote Runner turn can conservatively classify an

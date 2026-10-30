@@ -2,6 +2,7 @@ import {
   __testOnly_durablePrimaryWorkerAdmission,
   __testOnly_handleDocComment,
   __testOnly_recordDurablePrimaryInputCommit,
+  __testOnly_handleWorkerTurnInputRejected,
   __testOnly_submitDurablePrimaryRetryTurn,
 } from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
@@ -207,9 +208,9 @@ const CHAT = 'oc_ingress_notice_chat';
 const OWNER = 'ou_owner';
 const NOW = new Date().toISOString();
 
-function makeEventData(messageId: string, text: string, rootId?: string): any {
+function makeEventData(messageId: string, text: string, rootId?: string, senderOpenId = OWNER): any {
   return {
-    sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+    sender: { sender_id: { open_id: senderOpenId }, sender_type: 'user' },
     message: {
       message_id: messageId,
       root_id: rootId,
@@ -321,6 +322,7 @@ function seedActiveRemoteRunnerSession(
         turnId: message.turnId,
         dispatchAttempt: message.dispatchAttempt,
         durablePrimaryInbox: true,
+        ...(message.activeTurnSteer ? { activeTurnSteer: true as const } : {}),
       }, 12);
     });
   });
@@ -1166,6 +1168,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
           turnId,
           dispatchAttempt: 4,
           durablePrimaryInbox: true,
+          ...(message.activeTurnSteer ? { activeTurnSteer: true as const } : {}),
         }, 12);
       });
     });
@@ -1259,6 +1262,76 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       admitted: false,
       retryReason: 'session has an unfinished turn',
     });
+  });
+
+  it('retries a handed-back steer at once and does not mark it admitted', async () => {
+    const anchor = 'om_thread_primary_steer_handback';
+    const turnId = 'om_primary_steer_handback_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    // The worker takes the steer but the target turn ends before it lands.
+    ds.worker.send = vi.fn((message: any) => {
+      if (message.type !== 'message' || message.turnId !== turnId) return;
+      setImmediate(() => __testOnly_handleWorkerTurnInputRejected(ds, {
+        type: 'turn_input_rejected',
+        turnId,
+        reason: 'active_turn_steer_target_ended',
+        rejectedBeforeAdmission: true,
+      }, 12));
+    });
+    ds.activeTurnControls = { worker: ds.worker, steer: true, interrupt: false };
+    const queuePostAdmissionOutput = vi.fn();
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 1, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+
+    const started = Date.now();
+    await handleThreadReply(makeEventData(turnId, 'add this constraint now', anchor), ctx);
+
+    // Not the 60 s receipt timeout, and not "admitted": an admitted retry
+    // would be deduplicated away and the follow-up lost.
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'provider submit receipt is still pending',
+    });
+    expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
+  });
+
+  it('sends the steer notice on a retry when the steer committed after the previous attempt gave up', async () => {
+    const anchor = 'om_thread_primary_late_steer_commit';
+    const turnId = 'om_primary_late_steer_commit_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    // Attempt 1 timed out waiting; the held steer then landed.
+    __testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId,
+      dispatchAttempt: 1,
+      durablePrimaryInbox: true,
+      activeTurnSteer: true,
+    }, 12);
+    const queuePostAdmissionOutput = vi.fn();
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 2, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+
+    await handleThreadReply(makeEventData(turnId, 'add this constraint now', anchor), ctx);
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: `<at user_id="${OWNER}"></at> 收到，引导成功`,
+      providerUuid: expect.stringMatching(/^turn_steer_accepted_[a-f0-9]{24}$/),
+    }));
   });
 
   it('keeps a same-principal follow-up waiting when the live provider did not negotiate steer', async () => {
@@ -1385,6 +1458,68 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       makeBotEventData(turnId, 'ordinary bot follow-up', anchor),
       ctx,
     );
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
+  it('steers another human\'s follow-up into the turn as the turn\'s owner', async () => {
+    const helper = 'ou_steering_helper';
+    const bot = getBot(APP);
+    bot.config.allowedUsers = [OWNER, helper];
+    bot.resolvedAllowedUsers = [OWNER, helper];
+    const anchor = 'om_thread_primary_active_other_human_steer';
+    const turnId = 'om_primary_active_other_human_steer_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    ds.activeInteractiveTurn.controller = undefined;
+    const queuePostAdmissionOutput = vi.fn();
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 4, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+
+    await handleThreadReply(makeEventData(turnId, 'also cover the edge case', anchor, helper), ctx);
+
+    const submitted = workerSend.mock.calls.map(([message]) => message)
+      .find(message => message.type === 'message');
+    // The steer runs under the turn owner's identity, not a second one.
+    expect(submitted).toMatchObject({ turnId, activeTurnSteer: true, trustedCaller: activeCaller });
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId: 'om_primary_active_owner',
+      caller: activeCaller,
+    });
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    // The notice still names whoever steered.
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: `<at user_id="${helper}"></at> 收到，引导成功`,
+    }));
+  });
+
+  it('keeps a human follow-up serial behind a bot-owned turn', async () => {
+    const bot = getBot(APP);
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_primary_active_bot_owned';
+    const turnId = 'om_primary_active_bot_owned_follow_up';
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, {
+      requestLarkAppId: APP,
+      requestUserOpenId: 'ou_active_peer_bot',
+      requestUserUnionId: 'on_active_peer_bot',
+      senderType: 'bot' as const,
+    });
+    ds.activeInteractiveTurn.controller = undefined;
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 4, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'take this over', anchor), ctx);
 
     expect(workerSend).not.toHaveBeenCalled();
     expect(ctx.ingressAdmission).toEqual({

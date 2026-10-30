@@ -269,6 +269,10 @@ export interface SessionBackend {
   /** Provider-negotiated controls for an in-flight turn (Remote Runner only):
    * `steer` adds a follow-up to the running turn, `interrupt` accepts Ctrl-C. */
   activeTurnControls?(): { steer: boolean; interrupt: boolean };
+  /** Remote Runner: `ready` / `pending` (turn not yet acknowledged) / `none`. */
+  activeTurnSteerReadiness?(): 'ready' | 'pending' | 'none';
+  /** Remote Runner: the active turn was acknowledged by the provider. */
+  onActiveTurnAccepted?(cb: () => void): void;
   /**
    * Begin one logical adapter submission and return its recovery fence.
    * Backends with a persistent ambiguity journal may arm it here so all

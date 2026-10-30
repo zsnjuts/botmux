@@ -2126,7 +2126,7 @@ export type WorkerToDaemon =
   /** The exact inbound turn is now durably owned by this worker generation's
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
-  | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true }
+  | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true; activeTurnSteer?: true }
   /** Native write observation for display timing; never an admission or completion receipt. */
   | { type: 'turn_execution_started'; turnId: string; dispatchAttempt?: number; startedAtMs: number }
   /** The native CLI accepted this exact dispatched input into its own
