@@ -482,6 +482,56 @@ describe('grant-store message quota', () => {
     expect(readConfig().quotaState).toBeUndefined();
   });
 
+  it('addGlobalGrants writes a whole batch permanently and unlimited, leaving other grants alone', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'], chatGrants: { oc_1: ['ou_c'] }, globalGrants: ['ou_old'] });
+    const { registry, store } = await freshModules();
+    const r = await store.addGlobalGrants('a1', ['ou_a', 'ou_b', 'ou_a', 'ou_old']);
+    expect(r).toEqual({ ok: true, changes: { ou_a: 'created', ou_b: 'created', ou_old: 'unchanged' } });
+    const disk = readConfig();
+    expect(disk.globalGrants).toEqual(['ou_old', 'ou_a', 'ou_b']);
+    expect(disk.quotaState).toBeUndefined();
+    expect(disk.grantExpiryState).toBeUndefined();
+    expect(disk.allowedUsers).toEqual(['ou_owner']);
+    expect(disk.chatGrants).toEqual({ oc_1: ['ou_c'] });
+    expect(registry.getBot('a1').config.globalGrants).toEqual(['ou_old', 'ou_a', 'ou_b']);
+  });
+
+  it('addGlobalGrants is idempotent and never resets a used quota when only the expiry moves', async () => {
+    writeConfig({
+      allowedUsers: ['ou_owner'], globalGrants: ['ou_g'],
+      quotaState: { 'global:ou_g': { limit: 5, used: 2 } },
+      grantExpiryState: { 'global:ou_g': { expiresAt: 1000 } },
+    });
+    const { registry, store } = await freshModules();
+    expect(await store.addGlobalGrants('a1', ['ou_g'], { quota: 5, expiresAt: 1000 }))
+      .toEqual({ ok: true, changes: { ou_g: 'unchanged' } });
+    expect(await store.addGlobalGrants('a1', ['ou_g'], { quota: 5, expiresAt: 2000 }))
+      .toEqual({ ok: true, changes: { ou_g: 'updated' } });
+    expect(readConfig().quotaState).toEqual({ 'global:ou_g': { limit: 5, used: 2 } });
+    expect(readConfig().grantExpiryState).toEqual({ 'global:ou_g': { expiresAt: 2000 } });
+    // Turning it into a permanent, unlimited grant drops both records.
+    expect(await store.addGlobalGrants('a1', ['ou_g'])).toEqual({ ok: true, changes: { ou_g: 'updated' } });
+    expect(readConfig().quotaState).toBeUndefined();
+    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(registry.getBot('a1').config.quotaState).toBeUndefined();
+    expect(registry.getBot('a1').config.grantExpiryState).toBeUndefined();
+  });
+
+  it('removeGlobalGrants drops listed grants with their records and reports the absent ones', async () => {
+    writeConfig({
+      allowedUsers: ['ou_owner'], chatGrants: { oc_1: ['ou_a'] }, globalGrants: ['ou_a', 'ou_b', 'ou_keep'],
+      quotaState: { 'global:ou_a': { limit: 3, used: 1 }, 'global:ou_keep': { limit: 3, used: 0 } },
+    });
+    const { registry, store } = await freshModules();
+    const r = await store.removeGlobalGrants('a1', ['ou_a', 'ou_b', 'ou_missing']);
+    expect(r).toEqual({ ok: true, removed: ['ou_a', 'ou_b'], absent: ['ou_missing'] });
+    expect(readConfig().globalGrants).toEqual(['ou_keep']);
+    expect(readConfig().quotaState).toEqual({ 'global:ou_keep': { limit: 3, used: 0 } });
+    expect(readConfig().chatGrants).toEqual({ oc_1: ['ou_a'] });
+    expect(readConfig().allowedUsers).toEqual(['ou_owner']);
+    expect(registry.getBot('a1').config.globalGrants).toEqual(['ou_keep']);
+  });
+
   it('exposes scope-aware key builders', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { store } = await freshModules();
