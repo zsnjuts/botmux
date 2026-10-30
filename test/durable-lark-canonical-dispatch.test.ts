@@ -156,6 +156,29 @@ describe('durable Lark canonical dispatch', () => {
     await facade.stop();
   });
 
+  it('carries the retry wake key to the Inbox consumer', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async () => ({
+        kind: 'retry',
+        reason: 'session has an unfinished turn',
+        wakeKey: 'session:session-1',
+      }),
+    });
+
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .resolves.toEqual({
+        kind: 'retry',
+        reason: 'session has an unfinished turn',
+        wakeKey: 'session:session-1',
+      });
+    expect(store.writeSession).not.toHaveBeenCalled();
+    await facade.stop();
+  });
+
   it('fails closed when a retry result queued a post-admission output', async () => {
     const { store } = fakeStore();
     const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });

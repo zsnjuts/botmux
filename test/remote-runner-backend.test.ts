@@ -19,6 +19,7 @@ const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs'
 const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.mjs');
 const orphanProofRunner = resolve('test/fixtures/remote-runner-orphan-proof.mjs');
 const turnSteerRunner = resolve('test/fixtures/remote-runner-turn-steer.mjs');
+const startupProgressRunner = resolve('test/fixtures/remote-runner-startup-progress.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -49,6 +50,41 @@ afterEach(() => {
 });
 
 describe('RemoteRunnerBackend', () => {
+  it('relays startup_progress only while start/resume or the named turn is still preparing', async () => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'startup-progress' }, 'session-startup-progress');
+    children.push(backend);
+    const stages: string[] = [];
+    backend.onStartupProgress(stage => stages.push(stage));
+    const accepted: string[] = [];
+    backend.onActiveTurnAccepted(() => accepted.push(stages.join(',')));
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, startupProgressRunner);
+    await ready;
+    const final = once<string | undefined>(cb => backend.onTurnFinal((_text, turnId) => cb(turnId)));
+    await expect(backend.submitTurn({ turnId: 'turn-1', content: 'hello' })).resolves.toEqual({ submitted: true });
+    await expect(final).resolves.toBe('turn-1');
+    // sandbox_init after ready, the other turn's stage and cli_start after busy
+    // are all dropped without failing the protocol.
+    expect(stages).toEqual(['sandbox_resume', 'sandbox_create', 'provider_future_stage']);
+    expect(accepted).toEqual(['sandbox_resume,sandbox_create,provider_future_stage']);
+    expect(backend.reportsStartupProgress()).toBe(true);
+  });
+
+  it('ignores startup_progress from a provider that did not advertise it', async () => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'startup-progress' }, 'session-startup-unadvertised');
+    children.push(backend);
+    const stages: string[] = [];
+    backend.onStartupProgress(stage => stages.push(stage));
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, startupProgressRunner, { STARTUP_PROGRESS_FIXTURE_UNADVERTISED: '1' });
+    await ready;
+    const final = once<string | undefined>(cb => backend.onTurnFinal((_text, turnId) => cb(turnId)));
+    await expect(backend.submitTurn({ turnId: 'turn-1', content: 'hello' })).resolves.toEqual({ submitted: true });
+    await expect(final).resolves.toBe('turn-1');
+    expect(stages).toEqual([]);
+    expect(backend.reportsStartupProgress()).toBe(false);
+  });
+
   it('steers a negotiated active turn without changing final ownership', async () => {
     const backend = new RemoteRunnerBackend({
       expectedProvider: 'turn-steer',

@@ -74,6 +74,7 @@ export const REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES = [
   'turn_steer',
   'terminal_input',
   'orphan_reconciliation_verdict',
+  'startup_progress',
 ] as const;
 
 /** Structured answer to an `orphan-reconcile` resume when the Session is not
@@ -94,6 +95,26 @@ export function normalizeRemoteRunnerOrphanVerdict(
   return { verdict: 'not_orphan', reason: value.reason };
 }
 
+/** Optional display-only startup milestones (`startup_progress` events). */
+export const REMOTE_RUNNER_STARTUP_PROGRESS_CAPABILITIES = [
+  'startup_progress',
+] as const;
+
+/** Startup stages a provider may report through `startup_progress` while a
+ * start/resume request or a not-yet-acknowledged turn is still preparing. The
+ * host owns the user-facing wording; an unknown but well-formed stage from a
+ * newer provider is accepted and shown as the generic starting state. */
+export const REMOTE_RUNNER_STARTUP_STAGES = [
+  'sandbox_check',
+  'sandbox_resume',
+  'sandbox_create',
+  'sandbox_init',
+  'tools_prepare',
+  'cli_start',
+] as const;
+export type RemoteRunnerStartupStage = typeof REMOTE_RUNNER_STARTUP_STAGES[number];
+const STARTUP_STAGE_RE = /^[a-z][a-z0-9_]{0,47}$/;
+
 export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_BASE_CAPABILITIES,
   ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
@@ -101,6 +122,7 @@ export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES,
   ...REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES,
   ...REMOTE_RUNNER_TURN_STEER_CAPABILITIES,
+  ...REMOTE_RUNNER_STARTUP_PROGRESS_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -470,6 +492,13 @@ export type RemoteRunnerEvent =
       message: string;
       status: 'failed' | 'ambiguous' | 'cancelled';
       retryable: boolean;
+    })
+  | (RemoteRunnerEventBase & {
+      /** Display-only startup milestone. It never acknowledges a turn. */
+      type: 'startup_progress';
+      stage: string;
+      /** Present while a turn is preparing; absent during start/resume. */
+      turnId?: string;
     })
   | (RemoteRunnerEventBase & {
       type: 'access_url';
@@ -1191,6 +1220,14 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       status: raw.status as 'failed' | 'ambiguous' | 'cancelled',
       retryable: raw.retryable,
     };
+  }
+
+  if (raw.type === 'startup_progress') {
+    const stage = typeof raw.stage === 'string' && STARTUP_STAGE_RE.test(raw.stage) ? raw.stage : undefined;
+    const turnId = raw.turnId === undefined ? undefined : nonEmptyString(raw.turnId, 256);
+    if (!stage || (raw.turnId !== undefined && !turnId)) return undefined;
+    return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'startup_progress', stage, ...(turnId ? { turnId } : {}) };
   }
 
   if (raw.type === 'access_url') {

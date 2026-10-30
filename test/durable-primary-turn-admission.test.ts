@@ -3,6 +3,7 @@ import {
   appendDurablePrimaryInputCommit,
   durablePrimaryExistingTurnDisposition,
   durablePrimaryRejectedLiveSendDisposition,
+  durablePrimarySessionAdmitsTurns,
   shouldPersistTriggeredMessage,
 } from '../src/services/durable-primary-turn-admission.js';
 
@@ -33,6 +34,28 @@ describe('durable primary existing-turn admission', () => {
       state({ worker: null, workerStartBlocker: 'pending-repo' }),
       'om_next',
     )).toBe('retry');
+  });
+
+  it('admits a retried turn again once the CLI is ready and the previous turn ended', () => {
+    // The two edges the Inbox redelivery waits for, in either order.
+    const starting = state({ cliReady: false, activeInteractiveTurn: { turnId: 'om_open' } });
+    expect(durablePrimarySessionAdmitsTurns(starting)).toBe(false);
+    expect(durablePrimarySessionAdmitsTurns({ ...starting, cliReady: true })).toBe(false);
+    expect(durablePrimarySessionAdmitsTurns({ ...starting, activeInteractiveTurn: undefined })).toBe(false);
+    expect(durablePrimarySessionAdmitsTurns({
+      ...starting, cliReady: true, activeInteractiveTurn: undefined,
+    })).toBe(true);
+    // Always agrees with the per-turn disposition of a not-yet-committed turn.
+    for (const candidate of [
+      starting,
+      state(),
+      state({ worker: null }),
+      state({ worker: null, workerStartBlocker: 'pending-repo' }),
+      state({ activeInteractiveTurn: { turnId: 'om_current' }, allowActiveTurnSteer: true }),
+    ]) {
+      expect(durablePrimarySessionAdmitsTurns(candidate))
+        .toBe(durablePrimaryExistingTurnDisposition(candidate, 'om_next') === 'ready');
+    }
   });
 
   it('does not treat a durable queued-activation journal as a live start conflict', () => {

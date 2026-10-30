@@ -1263,6 +1263,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'session has an unfinished turn',
+      // Redelivered as soon as the busy Session admits turns again.
+      retryWakeKey: expect.any(String),
     });
   });
 
@@ -1360,6 +1362,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'session has an unfinished turn',
+      // Redelivered as soon as the busy Session admits turns again.
+      retryWakeKey: expect.any(String),
     });
     expect(ds.currentTurnId).toBe('om_primary_active_owner');
   });
@@ -1384,6 +1388,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'session has an unfinished turn',
+      // Redelivered as soon as the busy Session admits turns again.
+      retryWakeKey: expect.any(String),
     });
   });
 
@@ -1465,6 +1471,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'session has an unfinished turn',
+      // Redelivered as soon as the busy Session admits turns again.
+      retryWakeKey: expect.any(String),
     });
   });
 
@@ -1527,6 +1535,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'session has an unfinished turn',
+      // Redelivered as soon as the busy Session admits turns again.
+      retryWakeKey: expect.any(String),
     });
   });
 
@@ -1627,6 +1637,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'session has an unfinished turn',
+      // Redelivered as soon as the busy Session admits turns again.
+      retryWakeKey: expect.any(String),
     });
   });
 
@@ -1908,6 +1920,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'session has an unfinished turn',
+      // Redelivered as soon as the busy Session admits turns again.
+      retryWakeKey: expect.any(String),
     });
   });
 
@@ -1935,6 +1949,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'session has an unfinished turn',
+      // Redelivered as soon as the busy Session admits turns again.
+      retryWakeKey: expect.any(String),
     });
   });
 

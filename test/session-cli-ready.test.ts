@@ -207,6 +207,22 @@ describe('ds.cliReady (command-router §5)', () => {
     expect(ds.cliReadyGeneration).toBe(2);
   });
 
+  it('prompt_ready tells the daemon after the flag is set, so waiting input can run', async () => {
+    const seen: Array<boolean | undefined> = [];
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_card'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onCliPromptReady: ds => { seen.push(ds.cliReady); },
+    });
+    const { worker } = wire();
+
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(seen).toEqual([true]);
+  });
+
   it('prompt_ready from a replaced worker generation does not set the flag', async () => {
     const { ds, worker } = wire();
     // The session has already moved on to a replacement worker.

@@ -546,6 +546,191 @@ describe('durable inbox primary consumer', () => {
     }
   });
 
+  it('claims a freshly enqueued row on wake instead of the next poll tick', async () => {
+    let now = 1_000;
+    const store = sqliteStore(() => now);
+    const dispatched: string[] = [];
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => now,
+      dispatch: async message => {
+        dispatched.push(message.messageId);
+        return committed(message);
+      },
+    });
+    await consumer.ready;
+
+    await store.enqueueInbox(claim('om_woken').event);
+    consumer.wake();
+    await vi.waitFor(() => expect(dispatched).toEqual(['om_woken']));
+    await vi.waitFor(async () => expect(await store.claimNextInbox({
+      workerId: 'probe',
+      leaseDurationMs: 1_000,
+    })).toBeUndefined());
+    await consumer.stop();
+    await store.close();
+  });
+
+  describe('retry waiting on a wake key', () => {
+    const waiting = (wakeKey = 'session:busy'): DurableInboxPrimaryDispatchResult => ({
+      kind: 'retry',
+      reason: 'session has an unfinished turn',
+      wakeKey,
+    });
+
+    it('is redelivered as soon as its key is woken, not after the retry delay', async () => {
+      let now = 1_000;
+      const store = sqliteStore(() => now);
+      await store.enqueueInbox(claim('om_follow_up').event);
+      let busy = true;
+      const dispatched: string[] = [];
+      const retried: string[] = [];
+      const consumer = startDurableInboxPrimaryConsumer({
+        store,
+        workerId: 'primary-boot',
+        concurrency: 1,
+        intervalMs: 60_000,
+        retryDelayMs: 30_000,
+        now: () => now,
+        dispatch: async message => {
+          dispatched.push(message.messageId);
+          return busy ? waiting() : committed(message);
+        },
+        onRetried: ({ result }) => { retried.push(result.reason); },
+      });
+      await consumer.ready;
+      expect(dispatched).toEqual(['om_follow_up']);
+      // Waiting rows stay unavailable to every other claimer, exactly like a
+      // retry whose visibility time has not come yet.
+      expect(await store.claimNextInbox({ workerId: 'other-replica', leaseDurationMs: 1_000 }))
+        .toBeUndefined();
+
+      busy = false;
+      consumer.wakeRetry('session:someone-else');
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(dispatched).toHaveLength(1);
+
+      consumer.wakeRetry('session:busy');
+      await vi.waitFor(() => expect(dispatched).toEqual(['om_follow_up', 'om_follow_up']));
+      expect(retried).toEqual(['session has an unfinished turn']);
+      await vi.waitFor(async () => expect(await store.claimNextInbox({
+        workerId: 'probe',
+        leaseDurationMs: 1_000,
+      })).toBeUndefined());
+      await consumer.stop();
+      await store.close();
+    });
+
+    it('keeps partition FIFO: a later message waits behind the waiting one', async () => {
+      let now = 1_000;
+      const store = sqliteStore(() => now);
+      await store.enqueueInbox(claim('om_first').event);
+      await store.enqueueInbox(claim('om_second').event);
+      let busy = true;
+      const dispatched: string[] = [];
+      const consumer = startDurableInboxPrimaryConsumer({
+        store,
+        workerId: 'primary-boot',
+        concurrency: 2,
+        intervalMs: 60_000,
+        retryDelayMs: 30_000,
+        now: () => now,
+        dispatch: async message => {
+          dispatched.push(message.messageId);
+          return busy && message.messageId === 'om_first' ? waiting() : committed(message);
+        },
+      });
+      await consumer.ready;
+      consumer.wake();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(dispatched).toEqual(['om_first']);
+
+      busy = false;
+      consumer.wakeRetry('session:busy');
+      await vi.waitFor(() => expect(dispatched).toEqual(['om_first', 'om_first', 'om_second']));
+      await consumer.stop();
+      await store.close();
+    });
+
+    it('is still handed back at its retry delay when no wake comes', async () => {
+      let now = 1_000;
+      const store = sqliteStore(() => now);
+      await store.enqueueInbox(claim('om_never_woken').event);
+      const dispatched: string[] = [];
+      const consumer = startDurableInboxPrimaryConsumer({
+        store,
+        workerId: 'primary-boot',
+        concurrency: 1,
+        intervalMs: 60_000,
+        retryDelayMs: 100,
+        now: () => now,
+        dispatch: async message => {
+          dispatched.push(message.messageId);
+          return dispatched.length === 1 ? waiting() : committed(message);
+        },
+      });
+      await consumer.ready;
+      expect(dispatched).toHaveLength(1);
+      await vi.waitFor(() => expect(dispatched).toHaveLength(2));
+      await consumer.stop();
+      await store.close();
+    });
+
+    it('frees the row about when the plain retry would have if the process dies while waiting', async () => {
+      let now = 1_000;
+      const store = sqliteStore(() => now);
+      await store.enqueueInbox(claim('om_crash').event);
+      const renew = vi.spyOn(store, 'renewInboxClaim');
+      const consumer = startDurableInboxPrimaryConsumer({
+        store,
+        workerId: 'primary-boot',
+        concurrency: 1,
+        intervalMs: 60_000,
+        leaseDurationMs: 60_000,
+        retryDelayMs: 1_000,
+        now: () => now,
+        dispatch: async () => waiting(),
+      });
+      await consumer.ready;
+      await vi.waitFor(() => expect(renew).toHaveBeenCalled());
+      await renew.mock.results[0].value;
+      consumer.terminate();
+
+      // Not before the retry delay: the row still waits as a retry would.
+      now = 1_000 + 999;
+      expect(await store.claimNextInbox({ workerId: 'survivor', leaseDurationMs: 1_000 }))
+        .toBeUndefined();
+      // Well before the full claim lease would have expired.
+      now = 1_000 + 59_999;
+      await expect(store.claimNextInbox({ workerId: 'survivor', leaseDurationMs: 1_000 }))
+        .resolves.toMatchObject({ event: { eventId: claim('om_crash').event.eventId } });
+      await store.close();
+    });
+
+    it('is handed back on stop exactly like the plain retry', async () => {
+      const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+      const store = inboxStore({ claims: [claim('om_stop_waiting')], retried });
+      const consumer = startDurableInboxPrimaryConsumer({
+        store,
+        workerId: 'primary-boot',
+        concurrency: 1,
+        intervalMs: 60_000,
+        retryDelayMs: 750,
+        now: () => 9_000,
+        dispatch: async () => waiting(),
+      });
+      await consumer.ready;
+      expect(retried).toHaveLength(0);
+
+      await expect(consumer.stop()).resolves.toMatchObject({ kind: 'stopped' });
+      expect(retried).toHaveLength(1);
+      expect(retried[0].visibleAt).toBe(9_750);
+    });
+  });
+
   it('bounds shutdown and aborts an in-flight dispatch without completing', async () => {
     const store = inboxStore({ claims: [claim('om_shutdown')] });
     const started = deferred<void>();

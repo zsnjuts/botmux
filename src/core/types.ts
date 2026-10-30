@@ -414,6 +414,10 @@ export interface DaemonSession {
   };
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
+  /** Remote Runner 正在准备本轮时报的启动阶段（建沙箱、启动 CLI 等），provider 回
+   *  busy 后清掉。卡头据此显示「启动中 · 正在创建沙箱」而不是「工作中」。只在
+   *  starting / working 时生效；每个新轮次入口和离开 working 时清理。内存态。 */
+  remoteStartupStage?: { stage: string; turnId?: string };
   /** Set on sessions restored after a daemon restart: suppresses the automatic
    *  card post/patch from the recovery re-fork so a restart stays silent in the
    *  group (the owner gets a private DM summary instead). Cleared on the first

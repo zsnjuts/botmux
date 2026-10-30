@@ -348,6 +348,15 @@ export interface SessionBackend {
    */
   onAccessUrl?(cb: (url: string) => void): void;
   /**
+   * Remote Runner startup milestone (sandbox create/resume, CLI start, …) while
+   * the session or the current turn is still preparing. Display-only: it never
+   * signals readiness or turn admission. Only RemoteRunnerBackend implements it.
+   */
+  onStartupProgress?(cb: (stage: string) => void): void;
+  /** True once the provider advertised `startup_progress`, so the host may
+   *  hold the card at 「启动中…」 until the turn's busy acknowledgement. */
+  reportsStartupProgress?(): boolean;
+  /**
    * Remote-task turn boundary — backends that execute discrete remote tasks
    * (Riff/Mojo) invoke this when the current task finishes or fails. The worker
    * uses it to re-arm prompt-ready and flush queued follow-up messages: remote

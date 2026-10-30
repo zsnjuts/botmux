@@ -266,6 +266,126 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
+  it('relays provider startup stages and holds the card at starting until the turn is accepted', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-startup-progress-'));
+    tempDirs.push(root);
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+let state;
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  if (command.type === 'hello') {
+    emit({
+      type: 'hello', requestId: command.requestId, provider: 'startup-provider',
+      capabilities: ['start','resume','turn','cancel','detach','reattach','status',
+        ...((command.optionalCapabilities ?? []).includes('startup_progress') ? ['startup_progress'] : [])],
+    });
+  } else if (command.type === 'start') {
+    state = { version, provider: 'startup-provider', generation: 1, remoteSessionId: 'compute-1' };
+    emit({ type: 'startup_progress', stage: 'sandbox_resume' });
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    setTimeout(() => {
+      emit({ type: 'startup_progress', turnId: command.turnId, stage: 'cli_start' });
+      setTimeout(() => {
+        emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+        emit({ type: 'final', turnId: command.turnId, content: 'STARTUP_OK', state });
+      }, 100);
+    }, 100);
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const botsPath = join(root, 'bots.json');
+    const backendConfig = {
+      expectedProvider: 'startup-provider',
+      requiredCapabilities: ['start','resume','turn','cancel','detach','reattach','status'],
+    };
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_remote_startup', larkAppSecret: 'secret', cliId: 'remote-runner',
+      backendType: 'remote-runner', cliPathOverride: provider, remoteRunner: backendConfig,
+    }]));
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: join(root, 'data'),
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-remote-startup',
+        LARK_APP_ID: 'app_remote_startup',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'link_ref_restore_mode') {
+        child.send({
+          type: 'link_ref_restore_mode_result', requestId: message.requestId, mode: 'enabled',
+        } satisfies DaemonToWorker);
+      }
+    });
+    child.send({
+      type: 'init',
+      sessionId: 'sid-remote-startup',
+      chatId: 'oc_remote_startup',
+      rootMessageId: 'om_remote_startup',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig,
+      prompt: '',
+      larkAppId: 'app_remote_startup',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    await waitFor(
+      () => messages.some(message => message.type === 'ready'),
+      () => `remote runner did not become ready\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    child.send({
+      type: 'message',
+      content: 'hello',
+      turnId: 'om_turn_startup',
+      dispatchAttempt: 1,
+      trustedCaller: {
+        requestUserOpenId: 'ou_remote_user', requestLarkAppId: 'app_remote_startup', senderType: 'user',
+      },
+    } satisfies DaemonToWorker);
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_turn_startup' && message.status === 'completed'),
+      () => `startup turn did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    const progress = messages.flatMap(message => message.type === 'remote_startup_progress'
+      ? [{ stage: message.stage, turnId: message.turnId }]
+      : []);
+    expect(progress.map(entry => entry.stage)).toEqual(['sandbox_resume', 'submitting', 'cli_start', null]);
+    expect(progress.slice(1).every(entry => entry.turnId === 'om_turn_startup')).toBe(true);
+    // The placeholder precedes this turn's first working status, so the card
+    // never shows 「工作中」 before the provider's own stages arrive.
+    const submittingIndex = messages.findIndex(message => message.type === 'remote_startup_progress'
+      && message.stage === 'submitting');
+    const firstWorkingIndex = messages.findIndex((message, index) => index > 0
+      && message.type === 'screen_update' && message.status === 'working'
+      && message.turnId === 'om_turn_startup');
+    if (firstWorkingIndex >= 0) expect(submittingIndex).toBeLessThan(firstWorkingIndex);
+    expect(messages.some(message => message.type === 'error')).toBe(false);
+  });
+
   it('does not publish worker ready before orphan reconciliation advances durable lineage', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-orphan-ready-'));
     tempDirs.push(root);

@@ -834,6 +834,9 @@ type WorkerStartupState = {
    *  gate as a structured error, not reply out-of-band. */
   initTurnId?: string;
   initDispatchAttempt?: number;
+  /** A startup failure of this generation was actually told to the user (not
+   *  suppressed, not converted into a silent auto-retry). */
+  failureSurfaced?: boolean;
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1081,6 +1084,9 @@ export interface WorkerPoolCallbacks {
     rejection: Extract<WorkerToDaemon, { type: 'turn_input_rejected' }>,
     context: { workerGeneration: number },
   ) => void;
+  /** The current worker's CLI reported prompt-ready (`ds.cliReady` was just
+   * set). Optional; used to redeliver input that waited for readiness. */
+  onCliPromptReady?: (ds: DaemonSession) => void;
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
    * may be cleared without emitting the ambiguous-failure terminal. */
@@ -1488,6 +1494,16 @@ function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
   scheduleActiveRuntimePatch(ds);
 }
 
+/** Re-render the live card after a Remote Runner startup stage change. The
+ * revision bump makes a starting-card POST still in flight reconcile once it
+ * lands; an already-posted card is patched now (fenced to `turnId`). */
+function scheduleRemoteStartupStagePatch(ds: DaemonSession, turnId: string | undefined): void {
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) return;
+  if (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce) return;
+  bumpStreamCardStatusRevision(ds);
+  reconcilePostedStartingCard(ds, turnId, -1);
+}
+
 /** Card-label flag for a turn that completed as DELIBERATE silence (worker
  *  terminal outputDisposition 'nothing_to_send'): every live-card rebuild —
  *  status edges, button toggles, runtime/tier patches — must keep rendering
@@ -1509,10 +1525,17 @@ export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
   return undefined;
 }
 
-/** 活卡卡头标签（重建活卡的 buildStreamingCard 调用点统一从这里取）：主回合已结束
- *  但仍有后台子任务在跑时为「后台子任务运行中（N）」，盖过 idle 标签；否则同
- *  {@link idleCardLabel}。冻结卡不用它——后台计数只描述当下。 */
+/** 活卡卡头标签（重建活卡的 buildStreamingCard 调用点统一从这里取）：Remote Runner
+ *  还在准备本轮时为启动阶段（`remoteStartupStage`）；主回合已结束但仍有后台子任务
+ *  在跑时为「后台子任务运行中（N）」，盖过 idle 标签；否则同 {@link idleCardLabel}。
+ *  冻结卡不用它——启动阶段和后台计数都只描述当下。 */
 export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
+  const startup = ds.remoteStartupStage;
+  if (startup
+      && (ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'starting' || ds.lastScreenStatus === 'working')
+      && (!startup.turnId || !ds.currentTurnId || startup.turnId === ds.currentTurnId)) {
+    return { startupStage: startup.stage };
+  }
   if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
     return { backgroundTasks: ds.backgroundTaskCount };
   }
@@ -5032,6 +5055,50 @@ export async function updateHandoffLiveCard(ds: DaemonSession, event: HandoffCar
     },
     clear: () => { clearUsageRefreshTimer(ds); persistStreamCardState(ds); },
   });
+}
+
+// ─── Remote Runner: opening card before worker `ready` ──────────────────────
+// A remote-runner worker reports `ready` only after the provider finished its
+// multi-second startup, and a new session's first card used to be POSTed from
+// that `ready` handler — the group saw nothing until then. Each remote-runner
+// worker generation registers a one-shot poster; the daemon calls it right
+// after forking an opening turn. `ready` re-renders that same card (never a
+// second POST) and a pre-ready worker exit marks it failed.
+
+interface PreReadyStartingCard {
+  /** The worker generation that published (or is publishing) the card. */
+  worker: ChildProcess;
+  nonce: string;
+  /** Absent while the POST is still in flight. */
+  messageId?: string;
+  failed?: boolean;
+}
+
+const preReadyStartingCardPosters = new WeakMap<ChildProcess, () => Promise<boolean>>();
+const preReadyStartingCards = new WeakMap<DaemonSession, PreReadyStartingCard>();
+
+/** Publish the opening's 「启动中」 card for the current remote-runner worker
+ * without waiting for `ready`. One-shot per worker generation; resolves false
+ * (and posts nothing) for any other backend, a session that already has a
+ * card, or a turn whose card is suppressed. */
+export function postPreReadyStartingCard(ds: DaemonSession): Promise<boolean> {
+  const worker = ds.worker;
+  const post = worker ? preReadyStartingCardPosters.get(worker) : undefined;
+  if (!worker || !post) return Promise.resolve(false);
+  preReadyStartingCardPosters.delete(worker);
+  return post();
+}
+
+/** A new turn starts while the live card is still the pre-ready opening card.
+ * beginNewTurn only freezes cards of an initialized worker, so park this one
+ * explicitly: the new turn's card then withdraws it instead of orphaning a
+ * card stuck at 「启动中」. */
+export function parkPreReadyStartingCard(ds: DaemonSession): void {
+  const card = preReadyStartingCards.get(ds);
+  if (!card?.messageId || workerHasInitialized(ds)) return;
+  if (ds.streamCardId !== card.messageId || ds.streamCardNonce !== card.nonce) return;
+  preReadyStartingCards.delete(ds);
+  parkStreamCard(ds);
 }
 
 /**
@@ -15403,6 +15470,7 @@ function setupWorkerHandlers(
       );
       return;
     }
+    startupState.failureSurfaced = true;
     const cliName = sessionCliDisplayName(ds, botCfg);
     const message = tr('worker.start_failed', { cliName, reason }, loc);
     try {
@@ -15479,6 +15547,206 @@ function setupWorkerHandlers(
   // Bridge mode (the v3 default for /adopt) hides the legacy takeover button.
   const isAdopt = isSharedAdoptSession(ds);
   const showTakeover = false;
+
+  // ── Remote Runner opening card before `ready` (postPreReadyStartingCard) ──
+  /** Set by the exit handler once this generation's pre-ready exit has been
+   * fenced (worker cleared, generation advanced). */
+  let exitedBeforeReady = false;
+  const ownPreReadyCard = (): PreReadyStartingCard | undefined => {
+    const card = preReadyStartingCards.get(ds);
+    return card?.worker === worker ? card : undefined;
+  };
+  /** The pre-ready card is still this session's live card for the opening turn. */
+  const preReadyCardIsLive = (card: PreReadyStartingCard): boolean =>
+    !!card.messageId
+    && ds.streamCardId === card.messageId
+    && ds.streamCardNonce === card.nonce
+    && !ds.streamCardPending;
+  /** `ready` arrived: bring the same card to the ready-time state (terminal
+   * link, runtime, current status) instead of POSTing another one. */
+  const refreshPreReadyCardAfterReady = (card: PreReadyStartingCard, turnId?: string): void => {
+    preReadyStartingCards.delete(ds);
+    reconcilePostedStartingCard(ds, turnId ?? startupState.initTurnId, -1);
+    syncUsageRefreshTimer(ds);
+    logger.info(`[${t}] Reused starting card ${card.messageId!.substring(0, 12)} posted before worker ready`);
+  };
+  /** This generation exited before `ready` and the failure was surfaced: the
+   * opening card must not stay at 「启动中」. Same card, failed label. */
+  const markPreReadyCardFailed = (): void => {
+    const card = ownPreReadyCard();
+    if (!card || card.failed || !preReadyCardIsLive(card)) return;
+    if (ds.session.status !== 'active') return;
+    card.failed = true;
+    preReadyStartingCards.delete(ds);
+    const turnId = startupState.initTurnId;
+    if (turnId) markFailedTurnIdle(ds, turnId);
+    const cardJson = buildStreamingCard(
+      ds.session.sessionId,
+      sessionAnchorId(ds),
+      readableTerminalUrlFor(ds),
+      ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+      ds.lastScreenContent ?? '',
+      'idle',
+      sessionCliId(ds, botCfg),
+      ds.displayMode ?? 'hidden',
+      ds.streamCardNonce,
+      streamingCardPresentationImageKey(ds),
+      isAdopt,
+      showTakeover,
+      loc,
+      undefined,
+      writableTerminalLinkFor(ds),
+      isLocalCliOpenReady(ds, { cliId: sessionCliId(ds, botCfg) }),
+      getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds, botCfg)),
+      sessionRuntimeDisplayName(ds, botCfg),
+      codexServiceTierBadge(sessionCliId(ds, botCfg), ds.codexServiceTier),
+      idleCardLabel(ds) ?? 'failed',
+      dshRuntimeForSession(ds),
+      resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    );
+    scheduleCardPatch(ds, cardJson, turnId);
+    logger.info(`[${t}] Marked starting card ${card.messageId!.substring(0, 12)} failed (worker exited before ready)`);
+  };
+  const postPreReadyCard = async (): Promise<boolean> => {
+    const turnId = startupState.initTurnId;
+    const dispatchAttempt = startupState.initDispatchAttempt;
+    const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    // Same gates as the ready-time POST, evaluated for the opening turn.
+    if (startupState.ready || !ownsLifecycleMutation()) return false;
+    if (backendType !== 'remote-runner' || ds.initConfig?.remoteResumeMode) return false;
+    if (!turnId || preReadyStartingCards.has(ds)) return false;
+    // Only a session's very first card: never replace, park or reuse one.
+    if (ds.streamCardId || ds.streamCardPending) return false;
+    if (ds.suppressRecoveryCard || isAdopt) return false;
+    if (hasPendingTriggerStreamingCard(ds, turnId)) return false;
+    if (managedAuxUiSuppressed(turnId, dispatchAttempt)) return false;
+    if (streamingCardDisabled(ds, turnId)) return false;
+    if (remoteRetirementAdmissionPhase(ds) !== null || !retainsLarkStreamingCardTransport(ds)) return false;
+
+    const effectiveCliId = sessionCliId(ds, botCfg);
+    const postingSession = ds.session;
+    const postingAppId = ds.larkAppId;
+    const postingDisplayAnchor = sessionAnchorId(ds);
+    const postingRuntimeKey = activeSessionKey(ds);
+    const postingGeneration = ds.streamCardTurnGeneration ?? 0;
+    const previousNonce = ds.streamCardNonce;
+    const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
+    const cardReplyTarget = captureStreamingCardReplyTarget(ds, turnId);
+    const nonce = randomBytes(4).toString('hex');
+    const cardJson = buildStreamingCard(
+      ds.session.sessionId,
+      postingDisplayAnchor,
+      readableTerminalUrlFor(ds),
+      ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+      '',
+      turnStartingCardStatus(ds, effectiveCliId),
+      effectiveCliId,
+      ds.displayMode ?? 'hidden',
+      nonce,
+      undefined,
+      isAdopt,
+      showTakeover,
+      loc,
+      ds.usageLimit,
+      writableTerminalLinkFor(ds),
+      isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+      getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+      sessionRuntimeDisplayName(ds, botCfg),
+      codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+      streamCardLabel(ds),
+      dshRuntimeForSession(ds),
+      resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    );
+    // The sentinel makes `ready` / screen_update treat this POST as the
+    // session's in-flight card instead of posting their own.
+    const card: PreReadyStartingCard = { worker, nonce };
+    preReadyStartingCards.set(ds, card);
+    ds.streamCardNonce = nonce;
+    ds.streamCardId = CARD_POSTING_SENTINEL;
+    const ownsPost = (): boolean =>
+      ds.session === postingSession
+      && ds.session.status === 'active'
+      && ds.larkAppId === postingAppId
+      && sessionAnchorId(ds) === postingDisplayAnchor
+      && activeSessionKey(ds) === postingRuntimeKey
+      && !isSessionTransferring(ds)
+      && ds.streamCardId === CARD_POSTING_SENTINEL
+      && ds.streamCardNonce === nonce
+      && activeSessionsRegistry?.get(postingRuntimeKey) === ds;
+    const stillOwnsPost = (): boolean =>
+      ownsPost() && remoteRetirementAdmissionPhase(ds) === null && retainsLarkStreamingCardTransport(ds);
+    const releaseSentinel = (): void => {
+      if (preReadyStartingCards.get(ds) === card) preReadyStartingCards.delete(ds);
+      if (!ownsPost()) return;
+      ds.streamCardId = undefined;
+      ds.streamCardNonce = previousNonce;
+      persistStreamCardState(ds);
+    };
+    try {
+      const post = scopedReplyTo(
+        postingDisplayAnchor, postingAppId, cardJson, 'interactive', cardReplyTarget.turnId,
+        { replyTarget: cardReplyTarget.target, beforeWrite: () => {
+          // A generation that already died or was replaced must not publish.
+          if (!ownsLifecycleMutation() || !stillOwnsPost()) {
+            throw new Error('Pre-ready starting card no longer owns delivery');
+          }
+        } },
+      );
+      trackStartingCardPublication(ds, post);
+      const messageId = await post;
+      // The session-level identity decides whether the card is kept; the
+      // worker may legitimately have reached ready or died meanwhile.
+      if (!stillOwnsPost()) {
+        void deleteMessage(postingAppId, messageId).catch(() => { /* best-effort stale-card cleanup */ });
+        releaseSentinel();
+        logger.info(`[${t}] Discarded stale pre-ready starting card for turn ${turnId.substring(0, 12)}`);
+        return false;
+      }
+      card.messageId = messageId;
+      ds.streamCardId = messageId;
+      ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
+      ds.parkedStreamCardNonce = undefined;
+      rememberPublishedStreamingCardIdentity(ds, messageId, postingGeneration);
+      // Same binding the ready-time POST of an opening card uses: follow live.
+      bindStreamCardDisplayTarget(ds, messageId);
+      const predecessorIds = snapshotStreamingCardPredecessorIds(ds, messageId);
+      persistStreamCardState(ds);
+      recallFrozenCards(ds);
+      flushPendingLocalCliOpenReadinessPatch(ds);
+      flushPendingRiffUrlPatch(ds);
+      flushPendingActiveRuntimePatch(ds);
+      flushPendingCodexServiceTierPatch(ds);
+      logger.info(`[${t}] Posted starting card before worker ready for turn ${turnId.substring(0, 12)}`);
+      continuePublishedStreamingCardPinChain(ds, messageId, predecessorIds);
+      if ((ds.streamCardTurnGeneration ?? 0) !== postingGeneration) {
+        // A newer turn began during the POST (beginNewTurn saw the sentinel
+        // and could not park it). Park it now so that turn's card withdraws
+        // it, and let that pending card follow like any superseded POST.
+        preReadyStartingCards.delete(ds);
+        parkStreamCard(ds);
+        if (ds.streamCardPendingTurnId) {
+          void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+        }
+      } else if (startupState.ready) {
+        // `ready` arrived during the POST and skipped at the sentinel.
+        refreshPreReadyCardAfterReady(card, turnId);
+      } else if (exitedBeforeReady) {
+        // The generation already ended while the card was posting.
+        if (startupState.failureSurfaced) markPreReadyCardFailed();
+        if (preReadyStartingCards.get(ds) === card) preReadyStartingCards.delete(ds);
+      } else {
+        // Still starting: a startup stage reported during the POST is not on
+        // the card that just landed.
+        reconcilePostedStartingCard(ds, turnId, statusRevisionAtPost);
+      }
+      return true;
+    } catch (err) {
+      releaseSentinel();
+      logger.warn(`[${t}] Failed to post starting card before worker ready for turn ${turnId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  };
+  preReadyStartingCardPosters.set(worker, postPreReadyCard);
 
   worker.on('message', async (msg: WorkerToDaemon) => {
     // Every IPC message is scoped to the child generation that emitted it.
@@ -15867,6 +16135,9 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
+        // Past the pre-ready window: the ordinary ready-time card flow below
+        // owns any card this generation has not published yet.
+        preReadyStartingCardPosters.delete(worker);
         ds.workerReady = true;
         // A generation reached ready: the transient-startup failing streak is
         // over. Clear the budget and any still-pending retry timer (an inbound
@@ -15990,6 +16261,19 @@ function setupWorkerHandlers(
           // proof and claim a human/foreign collision through idempotent create.
           logger.info(`[${t}] Restored session — suppressing recovery streaming card (silent restart)`);
           break;
+        }
+
+        // Remote Runner opening: this generation already published the
+        // starting card while the provider was booting. Re-render that same
+        // card (serialized PATCH) — no second POST, and unlike the restored-
+        // card reuse below, no fresh-card fallback on a transient PATCH error.
+        // Still in flight: the sentinel break below defers to its completion.
+        {
+          const preReadyCard = ownPreReadyCard();
+          if (preReadyCard && preReadyCardIsLive(preReadyCard)) {
+            refreshPreReadyCardAfterReady(preReadyCard, msg.turnId);
+            break;
+          }
         }
 
         // If a previous streaming card survived (e.g. daemon restart), try to
@@ -16338,6 +16622,9 @@ function setupWorkerHandlers(
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
+        try { cb.onCliPromptReady?.(ds); } catch (err) {
+          logger.warn(`[${t}] prompt-ready observer failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
@@ -16661,6 +16948,7 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        if (ds.lastScreenStatus !== 'working') ds.remoteStartupStage = undefined;
         ds.backgroundTaskCount = (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
@@ -17819,6 +18107,26 @@ function setupWorkerHandlers(
         // the cause; the process exit itself is handled by the exit handler.
         logger.error(`[${t}] Worker fatal: ${msg.message}`);
         stderrRing.pushMarker(msg.message);
+        break;
+      }
+
+      case 'remote_startup_progress': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        if (msg.stage === null) {
+          if (!ds.remoteStartupStage) break;
+          ds.remoteStartupStage = undefined;
+        } else {
+          if (ds.remoteStartupStage?.stage === msg.stage && ds.remoteStartupStage.turnId === msg.turnId) break;
+          ds.remoteStartupStage = { stage: msg.stage, ...(msg.turnId ? { turnId: msg.turnId } : {}) };
+        }
+        logger.info(`[${t}] Remote runner startup stage: ${msg.stage ?? 'turn accepted'}`);
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        // A follow-up's stage can arrive while the status is still the previous
+        // turn's idle; repainting then would show 「等待输入」 on the new card.
+        // Keep it — the working screen_update that follows renders it.
+        if (ds.lastScreenStatus !== undefined && ds.lastScreenStatus !== 'starting'
+          && ds.lastScreenStatus !== 'working') break;
+        scheduleRemoteStartupStagePatch(ds, msg.turnId ?? startupState.initTurnId);
         break;
       }
 
@@ -19704,6 +20012,14 @@ function setupWorkerHandlers(
             + `${error instanceof Error ? error.message : String(error)}`,
           );
         }
+        // Remote Runner opening card published before ready: after a surfaced
+        // startup failure it shows the failure instead of 「启动中」. Runs after
+        // the generation fence above, so the PATCH is not bound to this dead
+        // generation. A POST still in flight marks itself on completion.
+        preReadyStartingCardPosters.delete(worker);
+        exitedBeforeReady = true;
+        if (startupState.failureSurfaced) markPreReadyCardFailed();
+        if (ownPreReadyCard()?.messageId) preReadyStartingCards.delete(ds);
       }
     }
     if (!transferRetirement) {

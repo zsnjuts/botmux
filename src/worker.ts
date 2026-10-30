@@ -16583,6 +16583,17 @@ async function flushPending(): Promise<void> {
                 + `${item.turnId.substring(0, 12)} (${msg.length} chars)`,
               );
             } else {
+              // The provider's first startup stage lags the write by about a
+              // second; hold the card at 「启动中…」 so the working status
+              // published for this write does not flash 「工作中」 first.
+              if (writeBackend.reportsStartupProgress?.()) {
+                send({
+                  type: 'remote_startup_progress',
+                  stage: 'submitting',
+                  turnId: item.turnId,
+                  dispatchAttempt: item.dispatchAttempt,
+                });
+              }
               prepareNormalWrite();
             }
             result = await writeBackend.submitTurn({
@@ -23115,8 +23126,29 @@ async function spawnCli(
     if (backend !== observedBackend) return;
     send({ type: 'remote_usage', usage });
   });
+  // Remote Runner startup milestones (sandbox create, CLI start, …) relabel the
+  // daemon's card while the turn is still preparing; the busy acknowledgement
+  // clears the label so the card says 「工作中」 only once the prompt is in.
+  backend.onStartupProgress?.((stage) => {
+    if (backend !== observedBackend) return;
+    log(`Remote runner startup stage: ${stage}`);
+    send({
+      type: 'remote_startup_progress',
+      stage,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+  });
   backend.onActiveTurnAccepted?.(() => {
     if (backend !== observedBackend) return;
+    if (backend.reportsStartupProgress?.()) {
+      send({
+        type: 'remote_startup_progress',
+        stage: null,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
+    }
     if (pendingMessages[0]?.activeTurnSteer === true) void flushPending();
   });
   backend.onReady?.(() => {

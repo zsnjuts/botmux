@@ -22,6 +22,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { REMOTE_RUNNER_STARTUP_STAGES } from '../../adapters/backend/remote-runner-protocol.js';
 import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
@@ -842,8 +843,17 @@ export interface BackgroundWaitCardLabel {
   backgroundTasks: number;
 }
 
-/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
-export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel;
+/** Remote Runner 已接到本轮、但 prompt 还没提交（provider 未回 busy）时所处的
+ *  启动阶段，取值见 REMOTE_RUNNER_STARTUP_STAGES。starting 与 working 都可能带它：
+ *  worker 把输入交给 Runner 就会报 working，而 Runner 可能还在建沙箱、启动 CLI，
+ *  此时卡头显示「启动中 · 正在创建沙箱」，等 busy 后才显示「工作中」。 */
+export interface StartupStageCardLabel {
+  startupStage: string;
+}
+
+/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}、{@link BackgroundWaitCardLabel}
+ *  或 {@link StartupStageCardLabel}。 */
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | StartupStageCardLabel;
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
@@ -855,8 +865,15 @@ function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardL
 /** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
 function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
   if (status !== 'working' && status !== 'idle') return undefined;
-  if (!label || typeof label !== 'object' || !(label.backgroundTasks > 0)) return undefined;
+  if (!label || typeof label !== 'object' || !('backgroundTasks' in label) || !(label.backgroundTasks > 0)) return undefined;
   return label.backgroundTasks;
+}
+
+/** Remote Runner 启动阶段；仅当标签是 {@link StartupStageCardLabel} 且状态为 starting/working 时有值。 */
+function startupStageOf(status: StreamStatus, label: boolean | StreamCardLabel | undefined): string | undefined {
+  if (status !== 'starting' && status !== 'working') return undefined;
+  if (!label || typeof label !== 'object' || !('startupStage' in label)) return undefined;
+  return label.startupStage;
 }
 
 /** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
@@ -870,6 +887,13 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
   const backgroundTasks = backgroundWaitCount(status, idleLabel);
   if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
+  const startupStage = startupStageOf(status, idleLabel);
+  if (startupStage !== undefined) {
+    // 新版 provider 可能报出本版不认识的阶段，按通用「启动中…」显示。
+    return (REMOTE_RUNNER_STARTUP_STAGES as readonly string[]).includes(startupStage)
+      ? t('card.status.starting_stage', { stage: t(`card.startup_stage.${startupStage}`, undefined, locale) }, locale)
+      : t('card.status.starting', undefined, locale);
+  }
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
@@ -1023,7 +1047,10 @@ export function buildStreamingCard(
     stream_card_version: STREAMING_CARD_PATCH_VERSION,
     ...(cardNonce ? { card_nonce: cardNonce } : {}),
   };
-  const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
+  const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready'
+    // 启动阶段还没提交 prompt：即使 worker 已报 working，卡头颜色也保持 starting。
+    : startupStageOf(status, silentIdle) !== undefined ? 'starting'
+      : status;
   const backgroundWait = backgroundWaitCount(status, silentIdle) !== undefined;
 
   const elements: any[] = [];

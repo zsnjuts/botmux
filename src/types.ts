@@ -2475,6 +2475,9 @@ export type WorkerToDaemon =
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }
   | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string; turnId?: string; dispatchAttempt?: number }
+  /** Remote Runner startup milestone for the card header; `stage: null` clears
+   *  it once the provider acknowledged the turn (busy). Display-only. */
+  | { type: 'remote_startup_progress'; stage: string | null; turnId?: string; dispatchAttempt?: number }
   | { type: 'riff_task_id'; taskId: string | null }
   | { type: 'remote_backend_state'; state: RemoteRunnerBackendState }
   | { type: 'remote_orphan_verdict'; verdict: RemoteRunnerOrphanVerdict }
