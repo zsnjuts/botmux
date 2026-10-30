@@ -144,6 +144,19 @@ describe('admin API (dashboard layer)', () => {
     });
   });
 
+  it('relays an accepted-but-unfinished close as 202 so the CLI can poll instead of failing', async () => {
+    const pending = { ok: true, outcome: 'closing', pending: true, operationId: 'op-1' };
+    const { request } = await start({
+      daemon: call => call.path.endsWith('/close')
+        ? { status: 202, body: pending }
+        : { status: 200, body: { ok: true } },
+    });
+    await expect(request('sessions/s_1/close', { method: 'POST', body: '{}' })).resolves.toEqual({
+      status: 202,
+      body: pending,
+    });
+  });
+
   it('rejects unknown routes and malformed session ids', async () => {
     const { request, calls } = await start();
     await expect(request('config/delete', { method: 'POST' })).resolves.toMatchObject({ status: 404 });

@@ -11,6 +11,7 @@ import {
   closeResidualIsLocal,
   describeCloseResidual,
   hasCloseResidual,
+  parseClosePending,
   parseCloseResidual,
 } from '../src/core/close-residual.js';
 
@@ -93,5 +94,30 @@ describe('local vs remote residual copy (round-7 finding-4)', () => {
     const localClause = closeResidualClause({ reason: 'local_subtree_unprovable_on_platform' });
     expect(localClause).toContain('本地');
     expect(localClause).not.toContain('远端会话未取消');
+  });
+});
+
+describe('parseClosePending', () => {
+  it('reads an accepted-but-unfinished close', () => {
+    expect(parseClosePending({ ok: true, outcome: 'closing', pending: true, operationId: 'op-1' }))
+      .toEqual({ operationId: 'op-1' });
+    expect(parseClosePending({ ok: true, outcome: 'closing', pending: true })).toEqual({});
+  });
+
+  it('never reads a finished close, a residual or an error as pending', () => {
+    for (const body of [
+      undefined,
+      null,
+      'closing',
+      { ok: true, outcome: 'closed' },
+      { ok: true, outcome: 'closed_with_residual', residual: {} },
+      { ok: false, error: 'durable_control_timeout' },
+      { ok: false, outcome: 'closing', pending: true },
+      { ok: true, outcome: 'closing' },
+    ]) {
+      expect(parseClosePending(body)).toBeUndefined();
+    }
+    // A pending close is not a residual either: nothing was left behind yet.
+    expect(parseCloseResidual({ ok: true, outcome: 'closing', pending: true })).toBeUndefined();
   });
 });

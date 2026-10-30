@@ -4080,7 +4080,15 @@ describe('handleCommand', () => {
       expect(replies).toContain('worktree 未删除');
     });
 
-    it('`/close wt --yes` preserves the worktree when a cross-daemon sibling leaves a residual', async () => {
+    it.each([
+      ['leaves a residual', 200, {
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'remote_cancel_unverified', taskId: 'remote-task-1' },
+      }],
+      // 202 closing：关闭已受理但会话仍在，不能据此删除共享 worktree。
+      ['is still closing', 202, { ok: true, outcome: 'closing', pending: true, operationId: 'op-sibling' }],
+    ])('`/close wt --yes` preserves the worktree when a cross-daemon sibling %s', async (_shape, status, body) => {
       const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
       ds.session.workingDir = '/home/testuser/project-wt-task';
       const deps = makeDeps(ds);
@@ -4094,11 +4102,7 @@ describe('handleCommand', () => {
       vi.mocked(isTeamBot).mockReturnValueOnce(true);
       const dd = await import('../src/utils/daemon-discovery.js');
       vi.mocked(dd.findOnlineDaemon).mockReturnValueOnce({ larkAppId: 'app-2', ipcPort: 9999 });
-      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-        ok: true,
-        outcome: 'closed_with_residual',
-        residual: { reason: 'remote_cancel_unverified', taskId: 'remote-task-1' },
-      }), { status: 200, headers: { 'content-type': 'application/json' } })));
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })));
 
       try {
         await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-remote'])}`), deps, LARK_APP_ID);
