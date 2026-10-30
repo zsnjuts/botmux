@@ -1528,6 +1528,89 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     });
   });
 
+  it('steers into a turn recovered by a replacement worker, restoring its owner from the durable commit', async () => {
+    const anchor = 'om_thread_primary_recovered_turn_steer';
+    const turnId = 'om_primary_recovered_turn_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    // The previous owner committed the turn (worker generation 11) and kept
+    // activeInteractiveTurn only in its memory; this daemon took it over.
+    ds.activeInteractiveTurn = undefined;
+    ds.session.durablePrimaryInputCommits = [{
+      version: 1,
+      turnId: 'om_primary_active_owner',
+      workerGeneration: 11,
+      committedAt: NOW,
+      dispatchAttempt: 3,
+      caller: activeCaller,
+    }];
+    __testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId: 'om_primary_active_owner',
+      dispatchAttempt: 3,
+      durablePrimaryInbox: true,
+    }, 12);
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId: 'om_primary_active_owner',
+      caller: activeCaller,
+    });
+
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 4, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = vi.fn();
+    await handleThreadReply(makeEventData(turnId, 'also cover the edge case', anchor), ctx);
+
+    const submitted = workerSend.mock.calls.map(([message]) => message)
+      .find(message => message.type === 'message');
+    expect(submitted).toMatchObject({ turnId, activeTurnSteer: true, trustedCaller: activeCaller });
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('records the turn owner on commit but never restores it from a same-generation or ownerless record', () => {
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds } = seedActiveRemoteRunnerSession('om_thread_primary_commit_owner', activeCaller);
+    ds.session.durablePrimaryInputCommits = [];
+    __testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId: 'om_primary_active_owner',
+      durablePrimaryInbox: true,
+    }, 12);
+    expect(ds.session.durablePrimaryInputCommits).toEqual([
+      expect.objectContaining({ turnId: 'om_primary_active_owner', caller: activeCaller }),
+    ]);
+
+    // Same worker generation re-acknowledging: not a takeover.
+    ds.activeInteractiveTurn = undefined;
+    __testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId: 'om_primary_active_owner',
+      durablePrimaryInbox: true,
+    }, 12);
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+
+    // A record written before owners were persisted: nothing to trust.
+    ds.session.durablePrimaryInputCommits = [{
+      version: 1,
+      turnId: 'om_primary_active_owner',
+      workerGeneration: 11,
+      committedAt: NOW,
+    }];
+    __testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId: 'om_primary_active_owner',
+      durablePrimaryInbox: true,
+    }, 12);
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+  });
+
   it('keeps a different peer bot serial even when it explicitly requests @steer', async () => {
     const bot = getBot(APP);
     bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];

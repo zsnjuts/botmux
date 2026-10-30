@@ -23638,6 +23638,9 @@ function recordDurablePrimaryInputCommit(
     if (steered.size > 64) steered.delete(steered.values().next().value!);
   }
   const previous = ds.session.durablePrimaryInputCommits ?? [];
+  const owner = !receipt.activeTurnSteer && ds.activeInteractiveTurn?.turnId === receipt.turnId
+    ? ds.activeInteractiveTurn
+    : undefined;
   const appended = appendDurablePrimaryInputCommit(previous, {
     turnId: receipt.turnId,
     workerGeneration,
@@ -23645,10 +23648,14 @@ function recordDurablePrimaryInputCommit(
     ...(receipt.dispatchAttempt !== undefined
       ? { dispatchAttempt: receipt.dispatchAttempt }
       : {}),
+    ...(owner ? { caller: { ...owner.caller } } : {}),
+    ...(owner?.controller ? { controller: { ...owner.controller } } : {}),
   }, DURABLE_PRIMARY_INPUT_COMMIT_LIMIT);
   if (appended.added) {
     ds.session.durablePrimaryInputCommits = appended.history;
     sessionStore.updateSession(ds.session);
+  } else {
+    restoreRecoveredActiveInteractiveTurn(ds, receipt, workerGeneration, previous);
   }
   const key = durablePrimaryInputCommitKey(ds.session.sessionId, receipt.turnId);
   const waiters = durablePrimaryInputCommitWaiters.get(key);
@@ -23659,6 +23666,34 @@ function recordDurablePrimaryInputCommit(
     waiter.signal.removeEventListener('abort', waiter.onAbort);
     waiter.resolve();
   }
+}
+
+/** A replacement owner (rolling restart / takeover) re-adopts a provider turn
+ * that an earlier worker generation committed. activeInteractiveTurn is
+ * in-memory only, so without this the recovered turn has no owner on this
+ * daemon and every follow-up queues behind it instead of steering. Restore it
+ * only from the daemon's own durable commit record — never from a worker claim
+ * — and only for exactly that signature: an existing record from an older
+ * generation, re-acknowledged by the live worker generation. */
+function restoreRecoveredActiveInteractiveTurn(
+  ds: DaemonSession,
+  receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
+  workerGeneration: number,
+  history: readonly NonNullable<Session['durablePrimaryInputCommits']>[number][],
+): void {
+  if (receipt.activeTurnSteer || ds.activeInteractiveTurn) return;
+  if (workerGeneration !== ds.session.workerGeneration) return;
+  const record = history.find(item => item.turnId === receipt.turnId);
+  if (!record?.caller || record.workerGeneration === workerGeneration) return;
+  ds.activeInteractiveTurn = {
+    turnId: receipt.turnId,
+    caller: { ...record.caller },
+    ...(record.controller ? { controller: { ...record.controller } } : {}),
+  };
+  logger.info(
+    `[${tag(ds)}] Restored active turn owner ${receipt.turnId.slice(0, 12)} `
+    + `committed by worker generation ${record.workerGeneration}`,
+  );
 }
 
 export const __testOnly_recordDurablePrimaryInputCommit = recordDurablePrimaryInputCommit;

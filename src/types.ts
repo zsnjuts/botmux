@@ -668,6 +668,12 @@ export interface Session {
     workerGeneration: number;
     committedAt: string;
     dispatchAttempt?: number;
+    /** The daemon-authenticated owner of this interactive turn, copied from
+     * activeInteractiveTurn when the turn committed. A replacement owner that
+     * takes over the still-running provider turn restores its in-memory
+     * activeInteractiveTurn from here, so active-turn steer keeps working. */
+    caller?: TrustedCaller;
+    controller?: TrustedCaller;
   }>;
   /** Explicit opt-in lease for one authorization-inheriting long-running task.
    * The field name is retained for persisted-state compatibility. */
