@@ -127,9 +127,10 @@ import {
 
 export { getAttachmentsDir } from './attachment-path.js';
 
+/** Starts a background CLI version refresh; never waits for the probe. */
 type RefreshCliVersion = (
   botConfig: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>,
-) => boolean;
+) => void;
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();

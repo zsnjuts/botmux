@@ -7,7 +7,8 @@ import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
-import { execFileSync, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
+import { createCliVersionRefresher } from './core/cli-version-refresh.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
@@ -5524,40 +5525,48 @@ function cliRuntimeVersionKey(cfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cli
   });
 }
 
-function refreshCliVersion(botCfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>): boolean {
-  const now = Date.now();
-  const key = cliRuntimeVersionKey(botCfg);
-  const cached = cliVersionCache.get(key);
-  if (cached && now - cached.lastCheckAt < VERSION_CHECK_INTERVAL) return false;
-
-  try {
-    const adapter = createCliAdapterSync(botCfg.cliId, botCfg.cliPathOverride);
-    // Remote backends (riff) have no local binary to version-check — skip.
-    if (!adapter.resolvedBin && !adapter.versionCommand) return false;
-    const versionCommand = adapter.versionCommand?.() ?? { bin: adapter.resolvedBin, args: ['--version'] };
-    const raw = execFileSync(versionCommand.bin, versionCommand.args, {
-      encoding: 'utf-8',
-      timeout: 5_000,
-    }).trim();
-    const newVersion = raw.replace(/^[^0-9]*/, '');
-
-    if (newVersion === 'unknown' || !newVersion) return false;
-
-    const oldVersion = cached?.version;
-    cliVersionCache.set(key, { version: newVersion, lastCheckAt: now });
-    setCurrentCliVersion(newVersion, key);
-
-    if (oldVersion && oldVersion !== newVersion) {
-      logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
-      return true;
+// `<cli> --version` runs as an async child process: a synchronous probe froze
+// the whole daemon event loop (every bot, every session) for its duration.
+const cliVersionRefresher = createCliVersionRefresher({
+  intervalMs: VERSION_CHECK_INTERVAL,
+  cache: cliVersionCache,
+  onVersion(key, version, previous, probe) {
+    setCurrentCliVersion(version, key);
+    if (previous && previous !== version) {
+      logger.info(`CLI version updated: ${previous} → ${version} (${probe.label})`);
+    } else {
+      logger.info(`CLI version: ${version} (${probe.label})`);
     }
+  },
+  onError(_key, error, probe) {
+    logger.warn(`Failed to get CLI version${probe ? ` for ${probe.label}` : ''}: ${error instanceof Error ? error.message : String(error)}`);
+  },
+});
 
-    logger.info(`CLI version: ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
-    return false;
-  } catch (err: any) {
-    logger.warn(`Failed to get CLI version for ${botCfg.cliRuntime?.displayName ?? botCfg.cliId}: ${err.message}`);
-    return false;
-  }
+type CliVersionConfig = Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>;
+
+/** Probe the CLI version when the cached one is stale. Resolves once the probe
+ * settled (true = version changed); see refreshCliVersion for the
+ * fire-and-forget form used on the message path. */
+function refreshCliVersionNow(botCfg: CliVersionConfig): Promise<boolean> {
+  return cliVersionRefresher.refresh(cliRuntimeVersionKey(botCfg), () => {
+    const label = botCfg.cliRuntime?.displayName ?? botCfg.cliId;
+    try {
+      const adapter = createCliAdapterSync(botCfg.cliId, botCfg.cliPathOverride);
+      // Remote backends (riff) have no local binary to version-check — skip.
+      if (!adapter.resolvedBin && !adapter.versionCommand) return undefined;
+      const versionCommand = adapter.versionCommand?.() ?? { bin: adapter.resolvedBin, args: ['--version'] };
+      return { ...versionCommand, label: botCfg.cliRuntime?.displayName ?? adapter.id };
+    } catch (err) {
+      throw new Error(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+}
+
+/** Start a background version refresh and return at once. Callers keep using
+ * the cached version (seeded at boot) until the probe lands. */
+function refreshCliVersion(botCfg: CliVersionConfig): void {
+  void refreshCliVersionNow(botCfg);
 }
 
 /** Host Codex binaries configured across every bot process. The probe is
@@ -31768,8 +31777,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   for (const bot of getAllBots()) {
     const cfg = bot.config;
 
-    // Refresh CLI version per bot's cliId
-    refreshCliVersion(cfg);
+    // Seed the CLI version per bot's cliId before any session reads it.
+    await refreshCliVersionNow(cfg);
 
     // sidecar 同时承载 allowedUsers 与 blockedUsers 的 raw→ou_ 缓存：任一侧
     // 写缓存时 retainKeys 必须是两侧原始条目的并集，否则一次 allowed 解析写回
