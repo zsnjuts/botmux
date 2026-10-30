@@ -443,6 +443,8 @@ import {
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
+  postPreReadyStartingCard,
+  parkPreReadyStartingCard,
   reconcileBotStreamingCardPins,
   reconcileRestoredStreamingCardPins,
   reconcileRestoredStreamingCardStatus,
@@ -5997,6 +5999,9 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   ds.streamingCardForced = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
+  // A Remote Runner opening card posted before the worker was ready is not
+  // frozen below (that needs an initialized worker); park it for the new card.
+  parkPreReadyStartingCard(ds);
   if (ds.streamCardId && workerHasInitialized(ds)) {
     const readUrl = readableTerminalUrlFor(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
@@ -21150,6 +21155,10 @@ function forkReservedInitialSession(
   if (turnId && trustedCaller) {
     setActiveInteractiveTurn(ds, turnId, trustedCaller);
   }
+  // Remote Runner: the opening is accepted and the worker forked — show the
+  // 「启动中」 card now instead of after the provider's startup. No-op for any
+  // other backend (their card keeps coming from the worker's ready).
+  if (turnId) void postPreReadyStartingCard(ds);
   ds.pendingTurnId = undefined;
   // A no-project pendingRepo fallback enters forkWorker with `session.queued`
   // still set. forkWorker materializes the exact opening as a tokened
