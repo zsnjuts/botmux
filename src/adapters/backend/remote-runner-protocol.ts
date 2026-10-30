@@ -52,6 +52,10 @@ export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
   /** The provider can prove that a previously submitted turn has lost its
    * bound remote resource without replaying the turn. */
   'orphan_reconciliation',
+  /** With `orphan_reconciliation`, the provider may answer an orphan proof
+   * with a structured "not an orphan" verdict (the remote is alive or the
+   * Session is dormant but resumable) instead of failing the proof. */
+  'orphan_reconciliation_verdict',
 ] as const;
 
 /** Optional in-turn user steering. The steer augments one already-active
@@ -69,7 +73,26 @@ export const REMOTE_RUNNER_TURN_STEER_CAPABILITIES = [
 export const REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES = [
   'turn_steer',
   'terminal_input',
+  'orphan_reconciliation_verdict',
 ] as const;
+
+/** Structured answer to an `orphan-reconcile` resume when the Session is not
+ * an orphan. Only sent after `orphan_reconciliation_verdict` was negotiated. */
+export interface RemoteRunnerOrphanVerdict {
+  verdict: 'not_orphan';
+  reason: 'remote_alive' | 'remote_resumable';
+}
+
+export function normalizeRemoteRunnerOrphanVerdict(
+  raw: unknown,
+): RemoteRunnerOrphanVerdict | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  if (Object.keys(value).some(key => key !== 'verdict' && key !== 'reason')) return undefined;
+  if (value.verdict !== 'not_orphan') return undefined;
+  if (value.reason !== 'remote_alive' && value.reason !== 'remote_resumable') return undefined;
+  return { verdict: 'not_orphan', reason: value.reason };
+}
 
 export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_BASE_CAPABILITIES,
@@ -402,6 +425,7 @@ export type RemoteRunnerEvent =
       requestId: string;
       state: RemoteRunnerBackendState;
       recoveredTurn?: RemoteRunnerRecoveredTurn;
+      orphanReconciliation?: RemoteRunnerOrphanVerdict;
     })
   | (RemoteRunnerEventBase & {
       type: 'progress';
@@ -1035,9 +1059,14 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         ? undefined
         : normalizeRecoveredTurn(raw.recoveredTurn);
       if (!id || (raw.recoveredTurn !== undefined && !recoveredTurn)) return undefined;
+      const orphanReconciliation = raw.orphanReconciliation === undefined
+        ? undefined
+        : normalizeRemoteRunnerOrphanVerdict(raw.orphanReconciliation);
+      if (raw.orphanReconciliation !== undefined && !orphanReconciliation) return undefined;
       return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
         type: 'ready', requestId: id, state,
-        ...(recoveredTurn ? { recoveredTurn } : {}) };
+        ...(recoveredTurn ? { recoveredTurn } : {}),
+        ...(orphanReconciliation ? { orphanReconciliation } : {}) };
     }
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'lineage_changed', state };

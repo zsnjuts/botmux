@@ -25,6 +25,11 @@ import {
   commitDurableLarkSessionControl,
   parseDurablePrimarySessionRecord,
 } from './durable-session-primary.js';
+import {
+  durableRemoteOrphanScanEpoch,
+  parseDurableRemoteOrphanOperationId,
+} from './durable-remote-orphan-reconciler.js';
+import type { RemoteRunnerOrphanVerdict } from '../adapters/backend/remote-runner-protocol.js';
 
 interface CloseResult {
   ok: boolean;
@@ -50,6 +55,14 @@ const TERMINAL_RESUME_REFUSALS = new Set([
   'resume_cancelled',
 ]);
 const TRUSTED_HANDOFF_HORIZON_MS = 5 * 60_000;
+
+/**
+ * A display toggle that keeps failing to reach its target mode (for example on
+ * a frozen Session) is not worth retrying forever: every retry re-renders the
+ * card and head-of-line blocks later close/resume controls in the same
+ * partition. After this many claims it settles as an explicit no-op.
+ */
+const PRESENTATION_CONTROL_MAX_ATTEMPTS = 8;
 
 export interface DurableLarkSessionControlRuntimeOptions {
   larkAppId: string;
@@ -95,6 +108,9 @@ export interface DurableLarkSessionControlRuntimeOptions {
   buildActiveCard(session: DaemonSession): string;
   buildPendingCard?(action: 'close' | 'resume', session: Session): string;
   buildOrphanedCard?(session: DaemonSession | Session): string;
+  /** The verdict an `orphan-reconcile` provider reported for this proof owner
+   * when the Session turned out not to be an orphan. */
+  orphanReconciliationVerdict?(owner: DaemonSession): RemoteRunnerOrphanVerdict | undefined;
   orphanedNoticeText?(): string;
   closeResidualText(residual: { reason?: string; taskId?: string }): string;
   closeRefusedText(error: string, taskId?: string): string;
@@ -429,6 +445,21 @@ export function createDurableLarkSessionControlRuntime(
         && (!orphanBaselineState?.remoteSessionId || orphanBaselineState.generation < 1)) {
       return { kind: 'ignored', reason: 'canonical Session has no submitted remote lineage' };
     }
+    if (control.action === 'terminalize_orphan' && orphanBaselineState) {
+      const pinned = parseDurableRemoteOrphanOperationId(control.operationId);
+      if (pinned && pinned.generation !== orphanBaselineState.generation) {
+        return terminalIgnore('canonical remote generation advanced since the orphan scan');
+      }
+      if (pinned?.revision !== undefined && canonical?.revision !== pinned.revision) {
+        return terminalIgnore('canonical Session changed since the orphan scan');
+      }
+      if (pinned?.epoch !== undefined
+          && durableRemoteOrphanScanEpoch(now()) - pinned.epoch > 1) {
+        // A later scan epoch already owns this lineage; do not let an old,
+        // still-retrying proof run alongside it.
+        return terminalIgnore('orphan control was superseded by a newer scan');
+      }
+    }
     if (control.action === 'terminalize_orphan' && live) {
       if (canonicalSession.lastFailedTurn?.recoveredRemoteTurn === true
           && options.abandonOrphanTakeover) {
@@ -453,10 +484,11 @@ export function createDurableLarkSessionControlRuntime(
           'active presentation target is owned by another replica',
         );
       }
-      return {
-        kind: 'ignored',
-        reason: 'stale presentation control no longer has a local active target',
-      };
+      return terminalIgnore('stale presentation control no longer has a local active target');
+    }
+    if (control.action === 'toggle_display'
+        && context.claim.attempts > PRESENTATION_CONTROL_MAX_ATTEMPTS) {
+      return terminalIgnore('presentation control did not converge within its retry budget');
     }
     if (control.action === 'close' && canonicalSession.status === 'active') {
       if (!live) {
@@ -841,6 +873,22 @@ export function createDurableLarkSessionControlRuntime(
               }
               await wait(Math.min(resumeReadinessPollMs, deadline - now()), signal);
             }
+            const verdict = options.orphanReconciliationVerdict?.(proofOwner);
+            if (verdict?.verdict === 'not_orphan') {
+              // The provider proved this lineage is alive or dormant-but-
+              // resumable. Retire only the proof owner; canonical stays active
+              // so the next message or takeover resumes it normally, and the
+              // control settles instead of retrying an impossible proof.
+              await options.abandonOrphanTakeover?.(control.sessionId, proofOwner);
+              return {
+                kind: 'completed',
+                result: result('active', undefined, {
+                  applied: false,
+                  ignored: true,
+                  reason: `not_orphan:${verdict.reason}`,
+                }),
+              };
+            }
             const provedState = normalizeRemoteRunnerBackendState(
               proofOwner.session.remoteBackendState,
             );
@@ -1028,13 +1076,20 @@ export function createDurableLarkSessionControlRuntime(
               || (control.action === 'handoff'
                 && status !== 'active'
                 && !(handoffNeverStartedRemote && status === 'closed'))
-              || (control.action === 'terminalize_orphan' && status !== 'closed')
+              || (control.action === 'terminalize_orphan'
+                && status !== 'closed'
+                && !(status === 'active' && parsed.applied === false && parsed.ignored === true))
               || (control.action === 'toggle_display'
                 && (status !== 'active'
                   || (parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
               || (parsed.cardJson !== undefined && typeof parsed.cardJson !== 'string')
               || (parsed.noticeText !== undefined && typeof parsed.noticeText !== 'string')) {
             throw new Error('durable lifecycle control result is invalid');
+          }
+          if (control.action === 'terminalize_orphan' && status === 'active') {
+            // A not-orphan verdict changes nothing: canonical keeps its active
+            // lineage and no card is sent. Settling the operation is the effect.
+            return;
           }
           const current = options.getPersistedSession(control.sessionId);
           if (!current || current.status !== status) {

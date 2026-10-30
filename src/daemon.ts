@@ -32297,8 +32297,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               errorCode: 'remote_runner_orphan_terminalized',
               reason: tr('worker.remote_orphan_terminalized', undefined, localeForBot(cfg.larkAppId)),
               retryOffer: 'none',
+              advice: 'fresh_session',
               locale: localeForBot(cfg.larkAppId),
             }),
+            orphanReconciliationVerdict: ds => ds.remoteOrphanVerdict,
             orphanedNoticeText: () => tr(
               'worker.remote_orphan_terminalized',
               undefined,

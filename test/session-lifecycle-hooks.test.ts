@@ -559,6 +559,29 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(reconcile).not.toHaveBeenCalled();
   });
 
+  it('records a not-orphan verdict only for the current orphan-proof worker', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    __testOnly_setupWorkerHandlers(ds, worker, { ready: true, failureNotified: false } as any);
+    const verdict = { verdict: 'not_orphan', reason: 'remote_alive' };
+
+    // Outside an orphan proof the verdict is meaningless and must be dropped.
+    worker.emit('message', { type: 'remote_orphan_verdict', verdict });
+    await flush();
+    expect(ds.remoteOrphanVerdict).toBeUndefined();
+
+    ds.initConfig = { remoteResumeMode: 'orphan-reconcile' } as any;
+    worker.emit('message', { type: 'remote_orphan_verdict', verdict: { verdict: 'not_orphan', reason: 'x' } });
+    await flush();
+    expect(ds.remoteOrphanVerdict).toBeUndefined();
+
+    worker.emit('message', { type: 'remote_orphan_verdict', verdict });
+    await flush();
+    expect(ds.remoteOrphanVerdict).toEqual(verdict);
+  });
+
   it('retires an exited remote provider after canonical commit without replaying startup rollback', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({

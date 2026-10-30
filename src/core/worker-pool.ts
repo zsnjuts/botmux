@@ -141,6 +141,7 @@ import { resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import {
   normalizeRemoteRunnerBackendState,
+  normalizeRemoteRunnerOrphanVerdict,
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
 import {
@@ -17877,6 +17878,20 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'remote_orphan_verdict': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored remote orphan verdict from stale worker generation`);
+          break;
+        }
+        const verdict = normalizeRemoteRunnerOrphanVerdict(msg.verdict);
+        if (!verdict || ds.initConfig?.remoteResumeMode !== 'orphan-reconcile') {
+          logger.error(`[${t}] Ignored remote orphan verdict outside an orphan proof`);
+          break;
+        }
+        ds.remoteOrphanVerdict = verdict;
+        logger.info(`[${t}] Remote Runner proved the Session is not an orphan (${verdict.reason})`);
+        break;
+      }
       case 'remote_backend_state': {
         if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
           logger.warn(`[${t}] Ignored remote backend state from stale worker generation`);

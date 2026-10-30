@@ -1928,6 +1928,10 @@ export interface TurnFailedCardOpts {
   /** Retry affordance, decided by `turnRetryOffer` — the handler enforces the
    *  same policy, so `none` must not render a button. */
   retryOffer: TurnRetryOffer;
+  /** Replaces the retry advice when the failure has a known next step that is
+   *  neither a retry nor "send something different" — e.g. a retired orphan
+   *  Session whose next message simply starts a fresh Session. */
+  advice?: 'fresh_session';
   /** Pins the button to one specific failed turn; a stale card fails closed. */
   retryTurnId?: string;
   /** Human to @-mention in the body. Omitted → no mention (never @ a bot). */
@@ -1996,7 +2000,9 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
 
   // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
   const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
-  const adviceKey = o.retryOffer === 'none'
+  const adviceKey = o.advice === 'fresh_session'
+    ? 'card.turn_failed.fresh_session'
+    : o.retryOffer === 'none'
     ? 'card.turn_failed.no_retry'
     : !o.retryTurnId
       ? 'card.turn_failed.no_input'

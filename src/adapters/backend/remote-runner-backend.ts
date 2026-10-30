@@ -27,6 +27,7 @@ import {
   type RemoteRunnerEvent,
   type RemoteRunnerOutboundMessage,
   type RemoteRunnerOutboundMessageResult,
+  type RemoteRunnerOrphanVerdict,
   type RemoteRunnerRecoveredTurn,
   type RemoteRunnerSessionToolOperation,
   type RemoteRunnerSessionToolResult,
@@ -155,6 +156,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   ) => void) | null = null;
   private turnFailureCb: ((failure: BackendTurnFailure) => void) | null = null;
   private recoveredTurn: RemoteRunnerRecoveredTurn | null = null;
+  private orphanVerdictCb?: (verdict: RemoteRunnerOrphanVerdict) => void;
   private recoveredTurnHostContextPending = false;
   private deferredRecoveredEvents: RemoteRunnerEvent[] = [];
   private turnRecoveredCb: ((turn: RemoteRunnerRecoveredTurn) => void) | null = null;
@@ -487,6 +489,9 @@ export class RemoteRunnerBackend implements SessionBackend {
     this.stateCb = cb;
     if (this.state) queueMicrotask(() => cb(this.state!));
   }
+  onOrphanReconciliationVerdict(cb: (verdict: RemoteRunnerOrphanVerdict) => void): void {
+    this.orphanVerdictCb = cb;
+  }
   onUsageSnapshot(cb: (usage: RemoteRunnerUsageReport) => void): void {
     this.usageCb = cb;
   }
@@ -700,7 +705,21 @@ export class RemoteRunnerBackend implements SessionBackend {
         && ready.state.generation <= this.state.generation) {
       throw new Error('remote runner rebuild did not advance the backend generation');
     }
-    if (opts.remoteResumeMode === 'orphan-reconcile'
+    const orphanVerdict = opts.remoteResumeMode === 'orphan-reconcile'
+        && this.providerCapabilities.has('orphan_reconciliation_verdict')
+      ? ready.orphanReconciliation
+      : undefined;
+    if (orphanVerdict) {
+      // Not an orphan: the provider kept this exact lineage (alive, or dormant
+      // but resumable). Report the verdict before publishing readiness so the
+      // control that requested the proof can settle instead of retrying.
+      if (this.state
+          && (ready.state.provider !== this.state.provider
+            || ready.state.generation !== this.state.generation)) {
+        throw new Error('remote runner orphan verdict changed the backend lineage');
+      }
+      this.orphanVerdictCb?.(orphanVerdict);
+    } else if (opts.remoteResumeMode === 'orphan-reconcile'
         && this.state
         && (ready.state.provider !== this.state.provider
           || ready.state.generation <= this.state.generation

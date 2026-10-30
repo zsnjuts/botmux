@@ -160,6 +160,26 @@ describe('remote runner protocol', () => {
     expect(REMOTE_RUNNER_CAPABILITIES).toContain('turn_steer');
   });
 
+  it('accepts only a well-formed not-orphan verdict on ready', () => {
+    const ready = (orphanReconciliation: unknown) => parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-orphan',
+      state: { version: 1, provider: 'reference', generation: 3, remoteSessionId: 'remote-live' },
+      orphanReconciliation,
+    }));
+    for (const reason of ['remote_alive', 'remote_resumable']) {
+      expect(ready({ verdict: 'not_orphan', reason })).toMatchObject({
+        type: 'ready',
+        orphanReconciliation: { verdict: 'not_orphan', reason },
+      });
+    }
+    expect(ready({ verdict: 'orphan', reason: 'remote_alive' })).toBeUndefined();
+    expect(ready({ verdict: 'not_orphan', reason: 'guess' })).toBeUndefined();
+    expect(ready({ verdict: 'not_orphan', reason: 'remote_alive', extra: true })).toBeUndefined();
+  });
+
   it('validates a generation-fenced recovered turn on ready', () => {
     const recovered = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
