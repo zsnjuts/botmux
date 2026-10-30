@@ -1067,9 +1067,12 @@ export interface WorkerPoolCallbacks {
     receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
     context: { workerGeneration: number },
   ) => void;
-  /** Worker-authoritative deterministic rejection handoff. Returning true
-   * means the daemon durably took ownership, so the original delivery record
-   * may be cleared without emitting the ambiguous-failure terminal. */
+  /** A replacement worker re-adopted this provider turn, which is still
+   * running. Lets the daemon restore the turn's owner from its own record. */
+  onRecoveredTurnAcknowledged?: (
+    ds: DaemonSession,
+    receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
+  ) => void;
   /** Every worker `turn_input_rejected` (ordinary IM or not), for owners that
    * wait on the input outside the ordinary IM delivery ledger. */
   onTurnInputRejected?: (
@@ -1077,6 +1080,9 @@ export interface WorkerPoolCallbacks {
     rejection: Extract<WorkerToDaemon, { type: 'turn_input_rejected' }>,
     context: { workerGeneration: number },
   ) => void;
+  /** Worker-authoritative deterministic rejection handoff. Returning true
+   * means the daemon durably took ownership, so the original delivery record
+   * may be cleared without emitting the ambiguous-failure terminal. */
   onOrdinaryImInputRejected?: (
     ds: DaemonSession,
     context: {
@@ -15701,6 +15707,16 @@ function setupWorkerHandlers(
           } catch (err) {
             logger.warn(
               `[${t}] durable-primary input commit handler failed: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        if (msg.recoveredTurn) {
+          try {
+            cb.onRecoveredTurnAcknowledged?.(ds, msg);
+          } catch (err) {
+            logger.warn(
+              `[${t}] recovered turn owner restore failed: `
               + `${err instanceof Error ? err.message : String(err)}`,
             );
           }

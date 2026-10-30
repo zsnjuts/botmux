@@ -19936,6 +19936,47 @@ function onQueuedActivationSubmitted(ds: DaemonSession, activationToken?: string
 
 export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitted;
 
+const ACTIVE_TURN_OWNER_LIMIT = 16;
+
+/** Persist the daemon-authenticated owner of a started interactive turn so a
+ * replacement owner can restore it (see Session.activeTurnOwners). */
+function rememberActiveTurnOwner(
+  ds: DaemonSession,
+  turnId: string,
+  caller: TrustedCaller,
+  controller: TrustedCaller | undefined,
+): void {
+  const previous = (ds.session.activeTurnOwners ?? []).filter(item => item.turnId !== turnId);
+  ds.session.activeTurnOwners = [...previous, {
+    turnId,
+    caller: { ...caller },
+    ...(controller ? { controller: { ...controller } } : {}),
+    recordedAt: new Date().toISOString(),
+  }].slice(-ACTIVE_TURN_OWNER_LIMIT);
+  sessionStore.updateSession(ds.session);
+}
+
+/** A replacement worker re-adopted a still-running provider turn. Restore its
+ * owner from the daemon's own record (never from the worker), so follow-ups
+ * steer into it instead of queuing behind it. */
+function restoreRecoveredTurnOwner(
+  ds: DaemonSession,
+  receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
+): void {
+  if (receipt.activeTurnSteer || ds.activeInteractiveTurn) return;
+  const record = ds.session.activeTurnOwners?.find(item => item.turnId === receipt.turnId);
+  if (!record) return;
+  ds.activeInteractiveTurn = {
+    turnId: receipt.turnId,
+    caller: { ...record.caller },
+    ...(record.controller ? { controller: { ...record.controller } } : {}),
+  };
+  logger.info(`[${tag(ds)}] Restored owner of recovered turn ${receipt.turnId.slice(0, 12)}`);
+}
+
+export const __testOnly_restoreRecoveredTurnOwner = restoreRecoveredTurnOwner;
+export const __testOnly_setActiveInteractiveTurn = setActiveInteractiveTurn;
+
 function setActiveInteractiveTurn(
   ds: DaemonSession,
   turnId: string,
@@ -19949,6 +19990,7 @@ function setActiveInteractiveTurn(
     ...(userPrompt?.trim() ? { userPrompt } : {}),
     ...(controller ? { controller } : {}),
   };
+  rememberActiveTurnOwner(ds, turnId, caller, controller);
   ensureAutomaticTaskContinuationLease(ds);
   if (ds.session.principalLane) {
     ds.principalLaneRunningTurn = {
@@ -30999,6 +31041,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         proposer,
         message: envelope,
       });
+    },
+    onRecoveredTurnAcknowledged(ds, receipt) {
+      restoreRecoveredTurnOwner(ds, receipt);
     },
     onTurnInputRejected(ds, rejection, context) {
       handleWorkerTurnInputRejected(ds, rejection, context.workerGeneration);
