@@ -15,7 +15,8 @@ import { adminJwtOptionsFromEnv, type AdminJwtIdentity, type JwtVerifyResult } f
 
 export const ADMIN_API_PREFIX = '/api/admin/v1/';
 
-const MAX_BODY_BYTES = 64 * 1024;
+// 批量授权一次最多 2000 个邮箱，64 KiB 会卡在边上。
+const MAX_BODY_BYTES = 256 * 1024;
 const SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const APP_ID = /^cli_[A-Za-z0-9]{4,64}$/;
 
@@ -70,8 +71,12 @@ async function relay(res: ServerResponse, response: Response): Promise<void> {
   send(res, response.status, body);
 }
 
+type AdminOp =
+  | 'whoami' | 'config-get' | 'config-set' | 'config-unset' | 'config-cas'
+  | 'grants-list' | 'grants-add' | 'grants-remove' | 'grants-prune';
+
 type Route =
-  | { kind: 'op'; op: 'whoami' | 'config-get' | 'config-set' | 'config-unset' | 'config-cas'; method: 'GET' | 'POST' }
+  | { kind: 'op'; op: AdminOp; method: 'GET' | 'POST' }
   | { kind: 'sessions'; method: 'GET' }
   | { kind: 'session'; method: 'GET'; sessionId: string }
   | { kind: 'session-close'; method: 'POST'; sessionId: string };
@@ -82,6 +87,10 @@ function matchRoute(method: string, tail: string): Route | undefined {
   if (method === 'POST' && tail === 'config/set') return { kind: 'op', op: 'config-set', method };
   if (method === 'POST' && tail === 'config/unset') return { kind: 'op', op: 'config-unset', method };
   if (method === 'GET' && tail === 'config/cas') return { kind: 'op', op: 'config-cas', method };
+  if (method === 'GET' && tail === 'grants') return { kind: 'op', op: 'grants-list', method };
+  if (method === 'POST' && tail === 'grants/add') return { kind: 'op', op: 'grants-add', method };
+  if (method === 'POST' && tail === 'grants/remove') return { kind: 'op', op: 'grants-remove', method };
+  if (method === 'POST' && tail === 'grants/prune') return { kind: 'op', op: 'grants-prune', method };
   if (method === 'GET' && tail === 'sessions') return { kind: 'sessions', method };
   const session = tail.match(/^sessions\/([^/]+)(\/close)?$/);
   if (session && SESSION_ID.test(session[1])) {
@@ -106,6 +115,20 @@ function pickBot(url: URL, online: string[]): { ok: true; larkAppId: string } | 
 
 function identityBody(identity: AdminJwtIdentity): { email: string; username: string } {
   return { email: identity.email, username: identity.username };
+}
+
+/** The fields each op forwards to the daemon; everything else in the request body is dropped. */
+function opBody(op: AdminOp, url: URL, body: Record<string, unknown>): Record<string, unknown> {
+  switch (op) {
+    case 'config-cas': return { scope: url.searchParams.get('scope') ?? 'bots' };
+    case 'config-set':
+    case 'config-unset': return { field: body.field, value: body.value, confirm: body.confirm };
+    case 'grants-list': return { names: url.searchParams.get('names') !== '0' };
+    case 'grants-add': return { subjects: body.subjects, durationMs: body.durationMs, quota: body.quota, dryRun: body.dryRun };
+    case 'grants-remove': return { subjects: body.subjects, dryRun: body.dryRun };
+    case 'grants-prune': return { dryRun: body.dryRun };
+    default: return {};
+  }
 }
 
 /** Handles every request under {@link ADMIN_API_PREFIX}; never falls through to the Dashboard auth gate. */
@@ -137,11 +160,7 @@ export async function handleAdminApi(req: IncomingMessage, res: ServerResponse, 
   });
 
   if (route.kind === 'op') {
-    const extra: Record<string, unknown> = route.op === 'config-cas'
-      ? { scope: url.searchParams.get('scope') ?? 'bots' }
-      : route.op === 'config-set' || route.op === 'config-unset'
-        ? { field: body.field, value: body.value, confirm: body.confirm }
-        : {};
+    const extra = opBody(route.op, url, body);
     deps.log?.(`[admin-api] ${route.op} bot=${target.larkAppId} by=${identity.email}`);
     return relay(res, await callOp(route.op, extra));
   }

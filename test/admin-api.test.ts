@@ -102,6 +102,32 @@ describe('admin API (dashboard layer)', () => {
     expect(JSON.stringify(calls)).not.toContain('header.payload.signature');
   });
 
+  it('forwards grant ops with only their own fields and the verified identity', async () => {
+    const { request, calls } = await start();
+    const identity = { email: 'alice@example.com', username: 'alice' };
+    await request('grants?names=0');
+    await request('grants/add', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        subjects: { chats: ['oc_team'] }, durationMs: null, quota: 5, dryRun: true,
+        allowedUsers: ['ou_mallory'], identity: { email: 'mallory@example.com' },
+      }),
+    });
+    await request('grants/remove', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ subjects: { openIds: ['ou_x'] }, quota: 9 }),
+    });
+    await request('grants/prune', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(calls.map(c => [c.path, c.body])).toEqual([
+      ['/api/admin/v1/grants-list', { names: false, identity }],
+      ['/api/admin/v1/grants-add', { subjects: { chats: ['oc_team'] }, durationMs: null, quota: 5, dryRun: true, identity }],
+      ['/api/admin/v1/grants-remove', { subjects: { openIds: ['ou_x'] }, identity }],
+      ['/api/admin/v1/grants-prune', { identity }],
+    ]);
+  });
+
   it('asks for the bot when several daemons are online and rejects unknown ones', async () => {
     const { request } = await start({ onlineBots: () => [APP, OTHER_APP] });
     await expect(request('config')).resolves.toMatchObject({ status: 400, body: { error: 'bot_required', bots: [APP, OTHER_APP] } });

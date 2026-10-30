@@ -142,6 +142,7 @@ import type {
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
 import { adminConfigCas, adminConfigSet, adminConfigSnapshot, adminConfigUnset, authorizeAdmin, createEmailOpenIdCache, parseAdminIdentity, parseConfigScope } from '../services/admin-api.js';
+import { adminGrantsAdd, adminGrantsList, adminGrantsPrune, adminGrantsRemove } from '../services/admin-grants.js';
 import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
@@ -848,6 +849,16 @@ const resolveAdminOpenId = createEmailOpenIdCache(async (larkAppId, email) => {
   return result.map.get(email);
 });
 
+/** 批量授权写一行人数摘要进日志，不打印名单本身。 */
+function summarizeGrantResult(result: object): string {
+  const r = result as Record<string, unknown>;
+  const len = (key: string) => (Array.isArray(r[key]) ? (r[key] as unknown[]).length : 0);
+  if (r.counts && typeof r.counts === 'object') {
+    return Object.entries(r.counts as Record<string, number>).map(([k, v]) => `${k}=${v}`).join(' ');
+  }
+  return ['removed', 'absent', 'invalid', 'unresolved'].filter(k => k in r).map(k => `${k}=${len(k)}`).join(' ');
+}
+
 ipcRoute('POST', '/api/admin/v1/:op', requireBoundBot(async (req, res, params) => {
   if (!isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, error: 'admin_api_requires_host' });
@@ -892,6 +903,31 @@ ipcRoute('POST', '/api/admin/v1/:op', requireBoundBot(async (req, res, params) =
         const scope = parseConfigScope(body.scope);
         if (!scope) return jsonRes(res, 400, { ok: false, error: 'invalid_scope' });
         return jsonRes(res, 200, { ok: true, ...await adminConfigCas(scope, durableConfigPath(scope)) });
+      }
+      case 'grants-list': {
+        const result = await adminGrantsList(larkAppId, { names: body.names !== false });
+        if (!result.ok) {
+          const { status, ...rest } = result;
+          return jsonRes(res, status, rest);
+        }
+        return jsonRes(res, 200, { ...result, bot: botView });
+      }
+      case 'grants-add':
+      case 'grants-remove':
+      case 'grants-prune': {
+        const input = { larkAppId, identity: identity!, body };
+        const result = params.op === 'grants-add'
+          ? await adminGrantsAdd(input)
+          : params.op === 'grants-remove'
+            ? await adminGrantsRemove(input)
+            : await adminGrantsPrune(input);
+        logger.info(`[admin-api:${larkAppId}] ${params.op}${body.dryRun === true ? ' (dry run)' : ''} by ${identity!.email}: `
+          + (result.ok ? summarizeGrantResult(result) : result.error));
+        if (!result.ok) {
+          const { status, ...rest } = result;
+          return jsonRes(res, status, rest);
+        }
+        return jsonRes(res, 200, { ...result, bot: botView });
       }
       default:
         return jsonRes(res, 404, { ok: false, error: 'unknown_admin_op' });
