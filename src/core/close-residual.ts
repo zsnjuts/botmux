@@ -97,3 +97,28 @@ export function closeResidualClause(residual: ParsedCloseResidual | undefined): 
     ? `本地可能残留带凭证的子进程未确认终止（${describeCloseResidual(residual)}），需人工核查该主机进程`
     : `远端会话未取消（${describeCloseResidual(residual)}），需人工清理`;
 }
+
+/**
+ * A close the daemon ACCEPTED but has not finished yet (HTTP 202,
+ * `{ ok: true, outcome: 'closing', pending: true }`). In durable-primary mode a
+ * Remote Runner close with a running turn deletes the remote compute and takes a
+ * snapshot, which can outlast the daemon's wait window; the operation is already
+ * enqueued and will commit later.
+ *
+ * Callers must treat this as NEITHER a failure (the close will succeed) NOR a
+ * verified teardown (the session is still active right now): show "closing",
+ * then poll the session status. Anything that needs proof the session is gone
+ * before a destructive follow-up (disband, worktree removal) must not proceed.
+ */
+export interface ParsedClosePending {
+  operationId?: string;
+}
+
+export function parseClosePending(body: unknown): ParsedClosePending | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const record = body as Record<string, unknown>;
+  if (record.ok !== true || record.outcome !== 'closing' || record.pending !== true) return undefined;
+  return typeof record.operationId === 'string' && record.operationId
+    ? { operationId: record.operationId }
+    : {};
+}

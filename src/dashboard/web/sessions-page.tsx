@@ -18,7 +18,8 @@ import {
   type CSSProperties,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
+import { closeResidualIsLocal, describeCloseResidual, parseClosePending, parseCloseResidual } from '../../core/close-residual.js';
+import { waitForSessionsClosed } from './close-pending-poll.js';
 import { daemonVersionDiffersFromDisk, stripBotmuxVersionPrefix } from '../../utils/daemon-version-display.js';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
@@ -2149,6 +2150,9 @@ function Drawer(props: {
   const terminal = row ? terminalHref(row) : null;
   const closed = !!row && row.status === 'closed';
   const canTakeover = !!row && !closed && !!terminal;
+  // 关闭可能持续一两分钟（远端 compute 删除 + 快照），按钮在整个过程中显示「关闭中…」。
+  const [closingSessionId, setClosingSessionId] = useState<string | null>(null);
+  const closing = !!row && closingSessionId === row.sessionId;
   return (
     <ModalDialog
       id="drawer"
@@ -2215,9 +2219,18 @@ function Drawer(props: {
                     id="close-btn"
                     type="button"
                     className="drawer-btn-danger"
-                    onClick={async event => { if (await props.closeSession(row, event.currentTarget)) props.onClose(); }}
+                    disabled={closing}
+                    onClick={async event => {
+                      const sessionId = row.sessionId;
+                      setClosingSessionId(sessionId);
+                      try {
+                        if (await props.closeSession(row, event.currentTarget)) props.onClose();
+                      } finally {
+                        setClosingSessionId(current => current === sessionId ? null : current);
+                      }
+                    }}
                   >
-                    {t('sessions.close')}
+                    {closing ? t('sessions.closing') : t('sessions.close')}
                   </button>
                 </>
               )}
@@ -3229,6 +3242,24 @@ function SessionsPage(): React.JSX.Element {
         if (r.status !== 401) toast(`Close failed: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
+      // 202 closing：关闭已持久受理，只是还没提交（远端 compute 删除 + 快照常超过
+      // daemon 的等待窗口）。不是失败——显示「关闭中」并轮询，直到会话真的 closed。
+      if (parseClosePending(body)) {
+        toast(t('sessions.closePending'), { kind: 'info', duration: 8000 });
+        const { pending } = await waitForSessionsClosed([String(row.sessionId)]);
+        refresh();
+        if (pending.length > 0) {
+          toast(t('sessions.closePendingTimeout'), { kind: 'warning', duration: 12000 });
+          return false;
+        }
+        toast(t('sessions.closePendingDone'), { kind: 'success' });
+        setSelected(prev => {
+          const next = new Set(prev);
+          next.delete(row.sessionId);
+          return next;
+        });
+        return true;
+      }
       if (body?.archiveError) {
         const detail = body.archiveError === 'codex_archive_target_unverified'
           ? t('sessions.codexArchiveTargetUnverified') : body.archiveError === 'codex_archive_target_invalid'
@@ -3422,6 +3453,8 @@ function SessionsPage(): React.JSX.Element {
     // never be folded into the silent success total.
     const residualIds: string[] = [];
     const archiveErrors: string[] = [];
+    // 已受理、仍在关闭（202 closing）：既不算失败也不算已关，批量结束后统一轮询。
+    const pendingIds: string[] = [];
     const queue = [...ids];
     async function worker() {
       while (queue.length) {
@@ -3431,6 +3464,8 @@ function SessionsPage(): React.JSX.Element {
           const body = await r.json().catch(() => ({}));
           if (!r.ok || body?.ok === false) {
             failed += 1;
+          } else if (parseClosePending(body)) {
+            pendingIds.push(sid);
           } else {
             if (body?.archiveError) archiveErrors.push(String(body.archiveError));
             const residual = parseCloseResidual(body);
@@ -3449,6 +3484,17 @@ function SessionsPage(): React.JSX.Element {
     setSelected(new Set());
     refresh();
     if (failed > 0) toast(`Failed: ${failed}/${ids.length}`, { kind: 'error' });
+    if (pendingIds.length > 0) {
+      toast(t('sessions.closePendingBulk', { count: pendingIds.length }), { kind: 'info', duration: 8000 });
+      void waitForSessionsClosed(pendingIds).then(({ pending }) => {
+        refresh();
+        if (pending.length > 0) {
+          toast(t('sessions.closePendingBulkTimeout', { count: pending.length, ids: pending.join(', ') }), { kind: 'warning', duration: 12000 });
+        } else {
+          toast(t('sessions.closePendingBulkDone', { count: pendingIds.length }), { kind: 'success' });
+        }
+      });
+    }
     if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.join(', ') }), { kind: 'warning' });
     if (residualIds.length > 0) {
       // Fires even when nothing failed — otherwise an all-residual batch is

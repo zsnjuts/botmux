@@ -92,6 +92,26 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(closeSpy).not.toHaveBeenCalled();
   });
 
+  it('answers 202 for a durable close that was accepted but has not committed yet', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-primary-slow' },
+      larkAppId: 'app-1',
+    } as any);
+    const pending = {
+      ok: true as const,
+      outcome: 'closing' as const,
+      pending: true as const,
+      operationId: 'trusted-host.session-control:app-1:s-primary-slow:3:close',
+    };
+    setDurableSessionLifecycleHandler(vi.fn(async () => pending));
+
+    const res = await postClose('s-primary-slow', { auth: 'signed', authRequired: true });
+
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual(pending);
+  });
+
   it('forwards a trusted routing anchor when the upgraded replica has no local row', async () => {
     process.env.BOTMUX_COORDINATION_MODE = 'primary';
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
