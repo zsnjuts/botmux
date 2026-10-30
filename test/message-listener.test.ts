@@ -158,6 +158,10 @@ describe('message listener evaluation', () => {
     expect(match?.messageText).toBe('会议资料\n智能纪要：测试会议 (https://example.feishu.cn/docx/DEMO_TOKEN)');
   });
 
+  it('unwraps the rich-text editor <p> paragraphs of a text body', () => {
+    expect(extractListenerMessageText(textMessage({ content: JSON.stringify({ text: '<p>告警：服务异常</p><p>请排查</p>' }) }))).toBe('告警：服务异常\n请排查');
+  });
+
   it('separates post title and body for keyword matching', () => {
     expect(extractListenerMessageText(textMessage({ message_type: 'post', content: JSON.stringify({ title: '智能', content: [[{ tag: 'text', text: '纪要' }]] }) }))).toBe('智能\n纪要');
   });
