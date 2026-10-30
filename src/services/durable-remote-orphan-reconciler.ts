@@ -5,6 +5,18 @@ import { parseDurablePrimarySessionRecord } from './durable-session-primary.js';
 
 const DEFAULT_PAGE_LIMIT = 40;
 const OPERATION_PREFIX = 'trusted-host.remote-orphan';
+/**
+ * A Session the provider proved is not an orphan (alive, or dormant but
+ * resumable) settles its control. It must still be re-examined later — a
+ * paused compute can expire while nobody writes the canonical record — so the
+ * control id also carries a coarse scan epoch: an unchanged lineage is
+ * re-proved at most once per epoch instead of never or on every scan.
+ */
+export const DURABLE_REMOTE_ORPHAN_RESCAN_EPOCH_MS = 6 * 60 * 60_000;
+
+export function durableRemoteOrphanScanEpoch(nowMs: number): number {
+  return Math.floor(nowMs / DURABLE_REMOTE_ORPHAN_RESCAN_EPOCH_MS);
+}
 const DEFAULT_PAGE_SIZE = 256;
 const DEFAULT_LEASE_MS = 60_000;
 
@@ -65,6 +77,7 @@ export function durableRemoteOrphanOperationId(input: {
   sessionId: string;
   generation: number;
   revision: number;
+  epoch: number;
 }): string {
   return [
     OPERATION_PREFIX,
@@ -72,26 +85,33 @@ export function durableRemoteOrphanOperationId(input: {
     input.sessionId,
     String(input.generation),
     `r${input.revision}`,
+    `e${input.epoch}`,
   ].join(':');
 }
 
 export function parseDurableRemoteOrphanOperationId(
   operationId: string,
-): { generation: number; revision?: number } | undefined {
+): { generation: number; revision?: number; epoch?: number } | undefined {
   if (!operationId.startsWith(`${OPERATION_PREFIX}:`)) return undefined;
   const parts = operationId.split(':');
-  let revision: number | undefined;
-  const last = parts[parts.length - 1] ?? '';
-  if (/^r\d+$/.test(last)) {
-    revision = Number(last.slice(1));
+  const take = (marker: string): number | undefined => {
+    const last = parts[parts.length - 1] ?? '';
+    if (!new RegExp(`^${marker}\\d+$`).test(last)) return undefined;
     parts.pop();
-  }
+    return Number(last.slice(1));
+  };
+  const epoch = take('e');
+  const revision = take('r');
+  if (epoch !== undefined && revision === undefined) return undefined;
   const generationText = parts[parts.length - 1] ?? '';
   if (parts.length < 4 || !/^\d+$/.test(generationText)) return undefined;
   const generation = Number(generationText);
-  if (!Number.isSafeInteger(generation)
-      || (revision !== undefined && !Number.isSafeInteger(revision))) return undefined;
-  return revision === undefined ? { generation } : { generation, revision };
+  if (![generation, revision ?? 0, epoch ?? 0].every(Number.isSafeInteger)) return undefined;
+  return {
+    generation,
+    ...(revision !== undefined ? { revision } : {}),
+    ...(epoch !== undefined ? { epoch } : {}),
+  };
 }
 
 function hasStrandedRecoveredTurn(session: ReturnType<typeof parseDurablePrimarySessionRecord>['session']): boolean {
@@ -168,6 +188,7 @@ export async function scanDurableRemoteOrphans(
           sessionId: currentParsed.session.sessionId,
           generation: remote.generation,
           revision: current.revision,
+          epoch: durableRemoteOrphanScanEpoch(now()),
         });
         const inserted = await options.store.enqueueInboxWithLease({
           lease: acquired.lease,

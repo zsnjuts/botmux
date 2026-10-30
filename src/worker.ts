@@ -23107,6 +23107,10 @@ async function spawnCli(
     if (backend !== observedBackend) return;
     send({ type: 'remote_backend_state', state });
   });
+  backend.onOrphanReconciliationVerdict?.((verdict) => {
+    if (backend !== observedBackend) return;
+    send({ type: 'remote_orphan_verdict', verdict });
+  });
   backend.onUsageSnapshot?.((usage) => {
     if (backend !== observedBackend) return;
     send({ type: 'remote_usage', usage });

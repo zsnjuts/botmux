@@ -9,6 +9,7 @@ import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { RemoteRunnerConfig } from './adapters/backend/remote-runner-config.js';
 import type {
   RemoteRunnerBackendState,
+  RemoteRunnerOrphanVerdict,
   RemoteRunnerUsageReport,
 } from './adapters/backend/remote-runner-protocol.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
@@ -2476,6 +2477,7 @@ export type WorkerToDaemon =
   | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'riff_task_id'; taskId: string | null }
   | { type: 'remote_backend_state'; state: RemoteRunnerBackendState }
+  | { type: 'remote_orphan_verdict'; verdict: RemoteRunnerOrphanVerdict }
   | { type: 'remote_usage'; usage: RemoteRunnerUsageReport }
   | {
       type: 'remote_shutdown_result';

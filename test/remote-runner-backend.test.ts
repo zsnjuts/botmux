@@ -902,6 +902,67 @@ describe('RemoteRunnerBackend', () => {
     expect(backend.getBackendState()).toEqual(initialState);
   });
 
+  it('publishes a negotiated not-orphan verdict without advancing the lineage', async () => {
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'orphan-proof',
+      generation: 4,
+      remoteSessionId: 'remote-still-present',
+      providerState: { sessionKey: 'logical-session' },
+    };
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'orphan-proof',
+      requiredCapabilities: ['orphan_reconciliation'],
+    }, 'session-alive-orphan-proof', initialState);
+    children.push(backend);
+    const verdicts: unknown[] = [];
+    backend.onOrphanReconciliationVerdict(verdict => verdicts.push(verdict));
+    const ready = once<void>(cb => backend.onReady(cb));
+    backend.spawn(process.execPath, [orphanProofRunner], {
+      cwd: process.cwd(),
+      cols: 120,
+      rows: 40,
+      env: { ...process.env, ORPHAN_PROOF_VERDICT: '1' } as Record<string, string>,
+      remoteResumeMode: 'orphan-reconcile',
+    });
+    await ready;
+    expect(verdicts).toEqual([{ verdict: 'not_orphan', reason: 'remote_alive' }]);
+    expect(backend.getBackendState()).toMatchObject({
+      generation: 4,
+      remoteSessionId: 'remote-still-present',
+    });
+  });
+
+  it('ignores a not-orphan verdict from a provider that did not negotiate it', async () => {
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'orphan-proof',
+      generation: 4,
+      remoteSessionId: 'remote-still-present',
+      providerState: { sessionKey: 'logical-session' },
+    };
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'orphan-proof',
+      requiredCapabilities: ['orphan_reconciliation'],
+    }, 'session-alive-orphan-proof', initialState);
+    children.push(backend);
+    const verdicts: unknown[] = [];
+    backend.onOrphanReconciliationVerdict(verdict => verdicts.push(verdict));
+    const exited = once<void>(cb => backend.onExit(() => cb()));
+    const env = { ...process.env } as Record<string, string>;
+    delete env.ORPHAN_PROOF_VERDICT;
+    backend.spawn(process.execPath, [orphanProofRunner], {
+      cwd: process.cwd(),
+      cols: 120,
+      rows: 40,
+      env,
+      remoteResumeMode: 'orphan-reconcile',
+    });
+    await exited;
+    expect(verdicts).toEqual([]);
+    expect(backend.getBackendState()).toEqual(initialState);
+  });
+
   it('confirms provider cancellation before reporting a successful close', async () => {
     const backend = createBackend();
     const ready = once<void>(cb => backend.onReady(cb));

@@ -1,5 +1,6 @@
 import type {
   RemoteRunnerBackendState,
+  RemoteRunnerOrphanVerdict,
   RemoteRunnerOutboundMessage,
   RemoteRunnerOutboundMessageResult,
   RemoteRunnerSessionToolOperation,
@@ -409,6 +410,8 @@ export interface SessionBackend {
   waitUntilReady?(): Promise<void>;
   /** Durable, provider-neutral lineage/runtime state changed. */
   onBackendState?(cb: (state: RemoteRunnerBackendState) => void): void;
+  /** An `orphan-reconcile` resume proved the Session is not an orphan. */
+  onOrphanReconciliationVerdict?(cb: (verdict: RemoteRunnerOrphanVerdict) => void): void;
   /** Provider-native usage observed at a generation-fenced turn boundary. */
   onUsageSnapshot?(cb: (usage: RemoteRunnerUsageReport) => void): void;
   /** Remote-session lineage updates — the worker forwards these to the daemon

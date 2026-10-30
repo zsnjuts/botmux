@@ -19,6 +19,7 @@ import {
   parseDurableSessionControlClaim,
 } from '../src/services/durable-lark-session-control.js';
 import { createDurableLarkSessionControlRuntime } from '../src/services/durable-lark-session-control-runtime.js';
+import { DURABLE_REMOTE_ORPHAN_RESCAN_EPOCH_MS } from '../src/services/durable-remote-orphan-reconciler.js';
 import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
 import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
 import { admitDurableLarkSession, parseDurablePrimarySessionRecord } from '../src/services/durable-session-primary.js';
@@ -1953,6 +1954,168 @@ describe('durable Lark session control runtime', () => {
     expect(takeOverActiveSession).not.toHaveBeenCalled();
     expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!).session)
       .toMatchObject({ status: 'active' });
+    await facade.stop();
+    await store.close();
+  });
+
+  it('settles an orphan control without closing when the provider proves the Session is not an orphan', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-orphan-verdict-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    const canonical = session({
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+        remoteSessionId: 'remote-paused',
+        providerState: { sessionKey: 'logical-session' },
+      },
+    });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: canonical });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'orphan-owner' });
+    let active: DaemonSession | undefined;
+    const takeOverActiveSession = vi.fn(async (_key: string, value: Session) => {
+      active = {
+        session: structuredClone(value),
+        larkAppId: 'cli_test',
+        chatId: 'oc_chat',
+        streamCardId: 'om_card',
+        worker: { killed: false },
+        workerReady: true,
+        initConfig: { remoteResumeMode: 'orphan-reconcile' },
+        remoteOrphanVerdict: { verdict: 'not_orphan', reason: 'remote_resumable' },
+      } as unknown as DaemonSession;
+      return { session: active.session, owner: active };
+    });
+    const abandonOrphanTakeover = vi.fn(async () => { active = undefined; });
+    const terminalizeOrphanSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => active ? [active] : [],
+      findActiveSession: () => active,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      takeOverActiveSession,
+      abandonOrphanTakeover,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'ordinary close must not run' }),
+      terminalizeOrphanSession,
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      isResumeReady: ds => !!ds.worker && !ds.worker.killed && ds.workerReady === true,
+      orphanReconciliationVerdict: ds => ds.remoteOrphanVerdict,
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      buildOrphanedCard: () => '{"orphan":"terminal"}',
+      orphanedNoticeText: () => 'orphan terminalized',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    // A control enqueued by an older daemon (legacy id) settles the same way.
+    const input = directControl('trusted-host', 'terminalize_orphan');
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(abandonOrphanTakeover).toHaveBeenCalledTimes(1);
+    expect(terminalizeOrphanSession).not.toHaveBeenCalled();
+    expect(await store.readControlOperation(input.control.operationId)).toMatchObject({
+      state: 'completed',
+      result: { status: 'active', applied: false, ignored: true, reason: 'not_orphan:remote_resumable' },
+    });
+    const after = parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!);
+    expect(after.session).toMatchObject({
+      status: 'active',
+      remoteBackendState: { generation: 2, remoteSessionId: 'remote-paused' },
+    });
+    expect(after.controls ?? []).toEqual([]);
+    const digest = createHash('sha256').update(input.control.operationId).digest('hex');
+    expect(await store.readOutbox(`control_update_${digest}`)).toBeUndefined();
+    await facade.stop();
+    await store.close();
+  });
+
+  it('retires an orphan control from a stale scan epoch without another proof', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-orphan-epoch-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    await admitDurableLarkSession({
+      facade: setupFacade,
+      message: message(),
+      session: session({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+        remoteBackendState: {
+          version: 1,
+          provider: 'reference',
+          generation: 2,
+          remoteSessionId: 'remote-live',
+          providerState: { sessionKey: 'logical-session' },
+        },
+      }),
+    });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'orphan-owner' });
+    const takeOverActiveSession = vi.fn();
+    const epochMs = DURABLE_REMOTE_ORPHAN_RESCAN_EPOCH_MS;
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      takeOverActiveSession,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not called' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+      now: () => 5 * epochMs + 1,
+    });
+    const revision = (await store.readSession('om_root::cli_test'))!.revision;
+    const resolveWith = async (epoch: number) => {
+      const operationId = `trusted-host.remote-orphan:cli_test:session-1:2:r${revision}:e${epoch}`;
+      const input = directControl('trusted-host', 'terminalize_orphan');
+      const event = { ...input.claim.event, eventId: operationId, payload: {
+        ...(input.claim.event.payload as Record<string, unknown>),
+        operationId,
+      } };
+      const claim = { ...input.claim, event } as typeof input.claim;
+      return runtime.resolve(parseDurableSessionControlClaim(claim), {
+        claim,
+        signal: new AbortController().signal,
+      });
+    };
+
+    await expect(resolveWith(3)).resolves.toMatchObject({
+      kind: 'ignored',
+      reason: 'orphan control was superseded by a newer scan',
+    });
+    await expect(resolveWith(4)).resolves.toMatchObject({ kind: 'target' });
+    await expect(resolveWith(5)).resolves.toMatchObject({ kind: 'target' });
+    expect(takeOverActiveSession).not.toHaveBeenCalled();
     await facade.stop();
     await store.close();
   });

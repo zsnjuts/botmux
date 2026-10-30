@@ -13,6 +13,7 @@ import {
 } from '../src/services/durable-lark-session-control.js';
 import { admitDurableLarkSession } from '../src/services/durable-session-primary.js';
 import {
+  DURABLE_REMOTE_ORPHAN_RESCAN_EPOCH_MS,
   durableRemoteOrphanOperationId,
   parseDurableRemoteOrphanOperationId,
   scanDurableRemoteOrphans,
@@ -91,6 +92,17 @@ describe('durable Remote Runner orphan reconciler', () => {
     });
     expect(second).toMatchObject({ scanned: 1, candidates: 1, enqueued: 0, duplicates: 1 });
 
+    // An unchanged lineage is re-examined once per scan epoch, so a Session
+    // settled as "not an orphan" is still revisited if it later expires.
+    const nextEpoch = await scanDurableRemoteOrphans({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'orphan-owner',
+      hasLocalOwner: () => false,
+      now: () => clock + DURABLE_REMOTE_ORPHAN_RESCAN_EPOCH_MS,
+    });
+    expect(nextEpoch).toMatchObject({ scanned: 1, candidates: 1, enqueued: 1, duplicates: 0 });
+
     const claim = await store.claimNextInbox({
       workerId: 'control-worker',
       lane: 'session-control',
@@ -99,7 +111,7 @@ describe('durable Remote Runner orphan reconciler', () => {
     });
     const revision = (await store.readSession('om_root::cli_test'))!.revision;
     expect(claim?.event).toMatchObject({
-      eventId: `trusted-host.remote-orphan:cli_test:session-orphan:2:r${revision}`,
+      eventId: `trusted-host.remote-orphan:cli_test:session-orphan:2:r${revision}:e0`,
       payload: {
         source: 'trusted-host',
         action: 'terminalize_orphan',
@@ -220,6 +232,7 @@ describe('durable Remote Runner orphan reconciler', () => {
       sessionId: 'session-legacy-conflict',
       generation: 2,
       revision: (await store.readSession('om_a_root::cli_test'))!.revision,
+      epoch: 0,
     });
     const legacyEvent = durableDirectSessionControlEvent({
       source: 'trusted-host',
@@ -269,6 +282,7 @@ describe('durable Remote Runner orphan reconciler', () => {
       sessionId: 'session-later',
       generation: 2,
       revision: (await store.readSession('om_b_root::cli_test'))!.revision,
+      epoch: 0,
     }));
 
     await facade.stop();
@@ -352,8 +366,12 @@ describe('durable Remote Runner orphan reconciler', () => {
     await store.close();
   });
   it('parses both pinned and legacy orphan operation ids', () => {
+    expect(parseDurableRemoteOrphanOperationId('trusted-host.remote-orphan:cli_a:s-1:3:r17:e9'))
+      .toEqual({ generation: 3, revision: 17, epoch: 9 });
     expect(parseDurableRemoteOrphanOperationId('trusted-host.remote-orphan:cli_a:s-1:3:r17'))
       .toEqual({ generation: 3, revision: 17 });
+    expect(parseDurableRemoteOrphanOperationId('trusted-host.remote-orphan:cli_a:s-1:3:e9'))
+      .toBeUndefined();
     expect(parseDurableRemoteOrphanOperationId('trusted-host.remote-orphan:cli_a:s-1:3'))
       .toEqual({ generation: 3 });
     expect(parseDurableRemoteOrphanOperationId('trusted-host.session-control:cli_a:s-1:1:close'))

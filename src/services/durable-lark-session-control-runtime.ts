@@ -25,7 +25,11 @@ import {
   commitDurableLarkSessionControl,
   parseDurablePrimarySessionRecord,
 } from './durable-session-primary.js';
-import { parseDurableRemoteOrphanOperationId } from './durable-remote-orphan-reconciler.js';
+import {
+  durableRemoteOrphanScanEpoch,
+  parseDurableRemoteOrphanOperationId,
+} from './durable-remote-orphan-reconciler.js';
+import type { RemoteRunnerOrphanVerdict } from '../adapters/backend/remote-runner-protocol.js';
 
 interface CloseResult {
   ok: boolean;
@@ -104,6 +108,9 @@ export interface DurableLarkSessionControlRuntimeOptions {
   buildActiveCard(session: DaemonSession): string;
   buildPendingCard?(action: 'close' | 'resume', session: Session): string;
   buildOrphanedCard?(session: DaemonSession | Session): string;
+  /** The verdict an `orphan-reconcile` provider reported for this proof owner
+   * when the Session turned out not to be an orphan. */
+  orphanReconciliationVerdict?(owner: DaemonSession): RemoteRunnerOrphanVerdict | undefined;
   orphanedNoticeText?(): string;
   closeResidualText(residual: { reason?: string; taskId?: string }): string;
   closeRefusedText(error: string, taskId?: string): string;
@@ -445,6 +452,12 @@ export function createDurableLarkSessionControlRuntime(
       }
       if (pinned?.revision !== undefined && canonical?.revision !== pinned.revision) {
         return terminalIgnore('canonical Session changed since the orphan scan');
+      }
+      if (pinned?.epoch !== undefined
+          && durableRemoteOrphanScanEpoch(now()) - pinned.epoch > 1) {
+        // A later scan epoch already owns this lineage; do not let an old,
+        // still-retrying proof run alongside it.
+        return terminalIgnore('orphan control was superseded by a newer scan');
       }
     }
     if (control.action === 'terminalize_orphan' && live) {
@@ -860,6 +873,22 @@ export function createDurableLarkSessionControlRuntime(
               }
               await wait(Math.min(resumeReadinessPollMs, deadline - now()), signal);
             }
+            const verdict = options.orphanReconciliationVerdict?.(proofOwner);
+            if (verdict?.verdict === 'not_orphan') {
+              // The provider proved this lineage is alive or dormant-but-
+              // resumable. Retire only the proof owner; canonical stays active
+              // so the next message or takeover resumes it normally, and the
+              // control settles instead of retrying an impossible proof.
+              await options.abandonOrphanTakeover?.(control.sessionId, proofOwner);
+              return {
+                kind: 'completed',
+                result: result('active', undefined, {
+                  applied: false,
+                  ignored: true,
+                  reason: `not_orphan:${verdict.reason}`,
+                }),
+              };
+            }
             const provedState = normalizeRemoteRunnerBackendState(
               proofOwner.session.remoteBackendState,
             );
@@ -1047,13 +1076,20 @@ export function createDurableLarkSessionControlRuntime(
               || (control.action === 'handoff'
                 && status !== 'active'
                 && !(handoffNeverStartedRemote && status === 'closed'))
-              || (control.action === 'terminalize_orphan' && status !== 'closed')
+              || (control.action === 'terminalize_orphan'
+                && status !== 'closed'
+                && !(status === 'active' && parsed.applied === false && parsed.ignored === true))
               || (control.action === 'toggle_display'
                 && (status !== 'active'
                   || (parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
               || (parsed.cardJson !== undefined && typeof parsed.cardJson !== 'string')
               || (parsed.noticeText !== undefined && typeof parsed.noticeText !== 'string')) {
             throw new Error('durable lifecycle control result is invalid');
+          }
+          if (control.action === 'terminalize_orphan' && status === 'active') {
+            // A not-orphan verdict changes nothing: canonical keeps its active
+            // lineage and no card is sent. Settling the operation is the effect.
+            return;
           }
           const current = options.getPersistedSession(control.sessionId);
           if (!current || current.status !== status) {
