@@ -31,6 +31,8 @@ export type ControlAuditAction =
   | 'terminal.release'
   | 'terminal.expired'
   | 'terminal.disconnected'
+  /** 有人在飞书卡片上点「获取操作链接」领了一次写链接（记领取人，不记链接）。 */
+  | 'terminal.write_link_issued'
   | 'terminal.input'
   | 'preview.unlock'
   | 'preview.activity'

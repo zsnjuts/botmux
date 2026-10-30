@@ -164,6 +164,14 @@ import {
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
 import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
+import {
+  bridgeRemoteWebTerminal,
+  fetchRemoteWebTerminalPage,
+  readPlatformCredential,
+  remoteWebTerminalHostAllowed,
+  withRemoteWebTerminalPage,
+} from './core/remote-web-terminal.js';
+import { writeLinkIssuedTo } from './core/terminal-write-link-issuance.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup, shouldDeferInitialPromptForReattach, judgeStartupCommandAck, STARTUP_COMMAND_ACK_TIMEOUT_MS } from './core/startup-commands.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
@@ -2628,7 +2636,14 @@ function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerm
   // grant next to explicit query capabilities; this ordering makes the
   // guarantee hold regardless of proxy behavior, not by accident of it.)
   if (safeTerminalTokenEqual(url.searchParams.get('token'), writeToken)) {
-    return { hasRead: true, hasWrite: true, platformReadonly: false };
+    // 「获取操作链接」发出的链接带签名的领取人，只用于输入审计，不影响授权。
+    const issuedTo = sessionId ? writeLinkIssuedTo(url.searchParams, sessionId) : undefined;
+    return {
+      hasRead: true,
+      hasWrite: true,
+      platformReadonly: false,
+      ...(issuedTo ? { auditUser: issuedTo } : {}),
+    };
   }
   // `?viewToken=` read capability, three accepted forms (P1-5):
   //   • this worker's per-boot random token — plain equality; dies with the
@@ -10994,6 +11009,33 @@ function relayHerdrWebSnapshot(snapshot: string): void {
     }
     ws.send(payload);
   }
+}
+
+/** A failed ttyd page probe waits out its timeout; skip the probe for a few
+ *  seconds afterwards so repeated opens fall back to the snapshot page at once. */
+const REMOTE_PAGE_RETRY_MS = 5_000;
+let remotePageRetryAt = 0;
+/** Concurrent ttyd bridges per session: each one is an attach client in the sandbox. */
+const MAX_REMOTE_WEB_TERMINAL_BRIDGES = 16;
+let remoteWebTerminalBridges = 0;
+
+/** Phones get the snapshot terminal: it has the mobile input bar, and a whole
+ *  provider pane squeezed to phone width is unreadable. */
+function isPhoneUserAgent(ua: string | undefined): boolean {
+  return typeof ua === 'string' && /iPhone|iPod|Android.*Mobile|Mobile.*Android|Windows Phone/i.test(ua);
+}
+
+/** The provider's real terminal for the current remote session, if any. */
+function currentRemoteWebTerminal():
+  import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerWebTerminal | undefined {
+  if (effectiveBackendType !== 'remote-runner' || !backend) return undefined;
+  const remote = backend as { getBackendState?: () => import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerBackendState | undefined };
+  const terminal = remote.getBackendState?.()?.webTerminal;
+  if (!terminal || !remoteWebTerminalHostAllowed(terminal.writeUrl)
+      || !remoteWebTerminalHostAllowed(terminal.readUrl)) {
+    return undefined;
+  }
+  return terminal;
 }
 
 /** Replace, rather than append, one Remote Runner full-screen snapshot.
@@ -23917,6 +23959,15 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         res.end('Bad Request');
         return;
       }
+      const remoteTerminal = currentRemoteWebTerminal();
+      // ttyd's page fetches `<page>/token` without the link's query string. It
+      // only carries ttyd's own basic-auth token, which is never configured;
+      // answer it locally instead of exposing the upstream unauthenticated.
+      if (remoteTerminal && url.pathname === '/token') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end('{"token": ""}');
+        return;
+      }
       const { hasRead, hasWrite, platformReadonly } = resolveTerminalAccessForReq(req, url);
       if (!hasRead) {
         const body = terminalStatusHtml('forbidden');
@@ -23951,34 +24002,79 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         : '';
       const loginUrl = headerLoginUrl
         || (sessionId ? deriveTerminalLoginUrl(sessionId) : '');
-      // Herdr snapshots contain screen cells but not terminal mode state. On a
-      // refreshed page an alt-screen CLI would otherwise look like an empty
-      // normal buffer until resize causes a redraw. Preserve that mode so
-      // scroll gestures continue to target the CLI's own transcript.
-      const forceRemoteScroll = effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true;
-      const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
-      // The wheel burst cap throttles backends where a forwarded wheel is
-      // EXPENSIVE or has no local terminal to drive:
-      //   • Herdr — each forwarded wheel → pane send-text + snapshot re-render.
-      //   • Riff  — has NO drivable terminal; writes become remote task/follow-up
-      //             creations (handleTermAction even rejects ANSI to Riff), so an
-      //             uncapped spin would flood remote task creation.
-      // This is a BACKEND property, independent of the adapter's declared
-      // altScreen: an altScreen:false CLI (Claude/Codex) that enters the
-      // alternate buffer at runtime (vim/less, or the CLI's own alt-screen) still
-      // forwards via _fwdScroll and must inherit its backend's cap. So gate the
-      // cap on a POSITIVE allowlist of cheap, locally-drivable terminal backends
-      // (pty/tmux/zellij); every other backend — Herdr, Riff, and any future one
-      // — stays safely capped by default.
-      const localTerminalBackend = effectiveBackendType === 'pty'
-        || effectiveBackendType === 'tmux'
-        || effectiveBackendType === 'zellij';
-      // 避免手机 Webview 或浏览器缓存包含动态首态（如动态 initialMobileInputMode）的 HTML
-      res.writeHead(200, {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store',
-      });
-      res.end(getTerminalHtml(hasWrite, platformReadonly || platformReadonlyHint, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
+      const serveSnapshotTerminal = () => {
+        // Herdr snapshots contain screen cells but not terminal mode state. On a
+        // refreshed page an alt-screen CLI would otherwise look like an empty
+        // normal buffer until resize causes a redraw. Preserve that mode so
+        // scroll gestures continue to target the CLI's own transcript.
+        const forceRemoteScroll = effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true;
+        const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
+        // The wheel burst cap throttles backends where a forwarded wheel is
+        // EXPENSIVE or has no local terminal to drive:
+        //   • Herdr — each forwarded wheel → pane send-text + snapshot re-render.
+        //   • Riff  — has NO drivable terminal; writes become remote task/follow-up
+        //             creations (handleTermAction even rejects ANSI to Riff), so an
+        //             uncapped spin would flood remote task creation.
+        // This is a BACKEND property, independent of the adapter's declared
+        // altScreen: an altScreen:false CLI (Claude/Codex) that enters the
+        // alternate buffer at runtime (vim/less, or the CLI's own alt-screen) still
+        // forwards via _fwdScroll and must inherit its backend's cap. So gate the
+        // cap on a POSITIVE allowlist of cheap, locally-drivable terminal backends
+        // (pty/tmux/zellij); every other backend — Herdr, Riff, and any future one
+        // — stays safely capped by default.
+        const localTerminalBackend = effectiveBackendType === 'pty'
+          || effectiveBackendType === 'tmux'
+          || effectiveBackendType === 'zellij';
+        // 避免手机 Webview 或浏览器缓存包含动态首态（如动态 initialMobileInputMode）的 HTML
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+        });
+        res.end(getTerminalHtml(hasWrite, platformReadonly || platformReadonlyHint, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
+      };
+      // Remote Runner with a real terminal: serve ttyd's page (writable or
+      // read-only by the same verdict as above) and bridge its `/ws` below.
+      // The page fetch doubles as the liveness probe — until ttyd is up, or on
+      // an old Runtime without it, the snapshot terminal is served as before.
+      // `?classic=1` keeps the snapshot page reachable; phones get it too (the
+      // ttyd page has no mobile input bar, and a whole pane at phone width is
+      // unreadable).
+      if (remoteTerminal && url.pathname === '/' && url.searchParams.get('classic') !== '1'
+          && !isPhoneUserAgent(req.headers['user-agent']) && Date.now() >= remotePageRetryAt) {
+        const credential = readPlatformCredential();
+        if (credential) {
+          fetchRemoteWebTerminalPage(
+            hasWrite ? remoteTerminal.writeUrl : remoteTerminal.readUrl,
+            credential,
+            { log },
+          ).then((page) => {
+            if (res.writableEnded || res.destroyed) return;
+            if (page === undefined) {
+              // 失败的探活要等满超时；几秒内的后续打开直接给截屏页。
+              remotePageRetryAt = Date.now() + REMOTE_PAGE_RETRY_MS;
+              serveSnapshotTerminal();
+              return;
+            }
+            const paneSize = (backend as { getPaneSize?: () => { cols: number; rows: number } | null } | null)
+              ?.getPaneSize?.();
+            res.writeHead(200, {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+              'Referrer-Policy': 'no-referrer',
+            });
+            res.end(withRemoteWebTerminalPage(page, {
+              pane: paneSize,
+              readOnly: !hasWrite,
+              platformReadonly: platformReadonly || platformReadonlyHint,
+              loginUrl,
+            }));
+          }).catch(() => {
+            if (!res.writableEnded && !res.destroyed) serveSnapshotTerminal();
+          });
+          return;
+        }
+      }
+      serveSnapshotTerminal();
     });
 
     wss = new WebSocketServer({
@@ -23998,6 +24094,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         }
         if (!resolveTerminalAccessForReq(req, url).hasRead) {
           done(false, 403, 'Forbidden');
+          return;
+        }
+        // ttyd 的前端对握手后的非 1000 关闭会立刻重连；不可用时在握手阶段就拒绝，
+        // 浏览器按连接失败处理，停在「按回车重连」。
+        if (url.pathname === '/ws' && (!currentRemoteWebTerminal() || !readPlatformCredential()
+            || remoteWebTerminalBridges >= MAX_REMOTE_WEB_TERMINAL_BRIDGES)) {
+          done(false, 503, 'Terminal Unavailable');
           return;
         }
         done(true);
@@ -24037,6 +24140,52 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       if (!hasRead || (controlExpiresAt !== undefined && controlExpiresAt <= Date.now())) {
         log('WS client refused at the connection re-check: capability no longer valid');
         ws.close(4003, 'authorization expired');
+        return;
+      }
+      if (url.pathname === '/ws') {
+        // ttyd page's socket. It never joins wsClients: the snapshot relay,
+        // history seed and input path all belong to the snapshot page.
+        const remoteTerminal = currentRemoteWebTerminal();
+        const credential = remoteTerminal ? readPlatformCredential() : undefined;
+        if (!remoteTerminal || !credential || remoteWebTerminalBridges >= MAX_REMOTE_WEB_TERMINAL_BRIDGES) {
+          ws.terminate();
+          return;
+        }
+        remoteWebTerminalBridges++;
+        // 输入审计按连接聚合，几秒一条，不逐键记录。
+        let inputBytes = 0;
+        const flushInputAudit = () => {
+          if (inputBytes === 0) return;
+          appendControlAudit(controlAuditRecord(auditUser ?? 'legacy-capability', sessionId, 'terminal.input', {
+            bytes: inputBytes,
+          }));
+          inputBytes = 0;
+        };
+        const auditTimer = hasWrite ? setInterval(flushInputAudit, 5_000) : undefined;
+        auditTimer?.unref?.();
+        log(`Remote web terminal client connected (write: ${hasWrite})`);
+        const bridge = bridgeRemoteWebTerminal(
+          ws,
+          hasWrite ? remoteTerminal.writeUrl : remoteTerminal.readUrl,
+          credential,
+          {
+            log,
+            readOnly: !hasWrite,
+            onInput: hasWrite ? (bytes) => { inputBytes += bytes; } : undefined,
+          },
+        );
+        const expiry = controlExpiresAt !== undefined
+          ? setTimeout(
+            () => bridge.close(4003, hasWrite ? 'control expired' : 'view expired'),
+            Math.max(0, controlExpiresAt - Date.now()),
+          )
+          : undefined;
+        ws.on('close', () => {
+          remoteWebTerminalBridges--;
+          clearTimeout(expiry);
+          clearInterval(auditTimer);
+          flushInputAudit();
+        });
         return;
       }
       wsClients.add(ws);
