@@ -12,7 +12,11 @@ import {
   durableRemoteOrphanControlPartition,
 } from '../src/services/durable-lark-session-control.js';
 import { admitDurableLarkSession } from '../src/services/durable-session-primary.js';
-import { scanDurableRemoteOrphans } from '../src/services/durable-remote-orphan-reconciler.js';
+import {
+  durableRemoteOrphanOperationId,
+  parseDurableRemoteOrphanOperationId,
+  scanDurableRemoteOrphans,
+} from '../src/services/durable-remote-orphan-reconciler.js';
 
 const tempDirs: string[] = [];
 
@@ -93,8 +97,9 @@ describe('durable Remote Runner orphan reconciler', () => {
       partitionKeys: [durableRemoteOrphanControlPartition('cli_test', 'session-orphan')],
       leaseDurationMs: 60_000,
     });
+    const revision = (await store.readSession('om_root::cli_test'))!.revision;
     expect(claim?.event).toMatchObject({
-      eventId: 'trusted-host.remote-orphan:cli_test:session-orphan:2',
+      eventId: `trusted-host.remote-orphan:cli_test:session-orphan:2:r${revision}`,
       payload: {
         source: 'trusted-host',
         action: 'terminalize_orphan',
@@ -210,10 +215,16 @@ describe('durable Remote Runner orphan reconciler', () => {
       await facade.releaseLease(`${session.rootMessageId}::cli_test`);
     }
 
+    const legacyOperationId = durableRemoteOrphanOperationId({
+      larkAppId: 'cli_test',
+      sessionId: 'session-legacy-conflict',
+      generation: 2,
+      revision: (await store.readSession('om_a_root::cli_test'))!.revision,
+    });
     const legacyEvent = durableDirectSessionControlEvent({
       source: 'trusted-host',
       larkAppId: 'cli_test',
-      operationId: 'trusted-host.remote-orphan:cli_test:session-legacy-conflict:2',
+      operationId: legacyOperationId,
       action: 'terminalize_orphan',
       sessionId: 'session-legacy-conflict',
       rootId: 'om_a_root',
@@ -244,8 +255,7 @@ describe('durable Remote Runner orphan reconciler', () => {
     });
     expect(errors).toHaveLength(1);
     expect(errors[0]).toEqual(expect.objectContaining({
-      message: 'durable orphan reconciliation conflict '
-        + 'trusted-host.remote-orphan:cli_test:session-legacy-conflict:2',
+      message: `durable orphan reconciliation conflict ${legacyOperationId}`,
     }));
 
     const later = await store.claimNextInbox({
@@ -254,7 +264,12 @@ describe('durable Remote Runner orphan reconciler', () => {
       partitionKeys: [durableRemoteOrphanControlPartition('cli_test', 'session-later')],
       leaseDurationMs: 100,
     });
-    expect(later?.event.eventId).toBe('trusted-host.remote-orphan:cli_test:session-later:2');
+    expect(later?.event.eventId).toBe(durableRemoteOrphanOperationId({
+      larkAppId: 'cli_test',
+      sessionId: 'session-later',
+      generation: 2,
+      revision: (await store.readSession('om_b_root::cli_test'))!.revision,
+    }));
 
     await facade.stop();
     await store.close();
@@ -335,5 +350,15 @@ describe('durable Remote Runner orphan reconciler', () => {
 
     await facade.stop();
     await store.close();
+  });
+  it('parses both pinned and legacy orphan operation ids', () => {
+    expect(parseDurableRemoteOrphanOperationId('trusted-host.remote-orphan:cli_a:s-1:3:r17'))
+      .toEqual({ generation: 3, revision: 17 });
+    expect(parseDurableRemoteOrphanOperationId('trusted-host.remote-orphan:cli_a:s-1:3'))
+      .toEqual({ generation: 3 });
+    expect(parseDurableRemoteOrphanOperationId('trusted-host.session-control:cli_a:s-1:1:close'))
+      .toBeUndefined();
+    expect(parseDurableRemoteOrphanOperationId('trusted-host.remote-orphan:cli_a:s-1:x:r1'))
+      .toBeUndefined();
   });
 });

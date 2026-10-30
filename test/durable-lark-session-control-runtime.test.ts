@@ -921,9 +921,62 @@ describe('durable Lark session control runtime', () => {
     await expect(runtime.resolve(input.control, {
       claim: { ...input.claim, attempts: 3 },
       signal: new AbortController().signal,
-    })).resolves.toEqual({
+    })).resolves.toMatchObject({
       kind: 'ignored',
       reason: 'stale presentation control no longer has a local active target',
+      settleExistingOperation: expect.any(Object),
+    });
+    await facade.stop();
+    await store.close();
+  });
+
+  it('settles a live display control that never reaches its target mode after a bounded budget', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-display-budget-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    await admitDurableLarkSession({ facade, message: message(), session: session() });
+    const live = {
+      session: session(),
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      streamCardId: 'om_card',
+      displayMode: 'hidden',
+    } as unknown as DaemonSession;
+    const handlePresentationControl = vi.fn(async () => undefined);
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [live],
+      findActiveSession: () => live,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not called' }),
+      handlePresentationControl,
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = displayControl();
+
+    await expect(runtime.resolve(input.control, {
+      claim: { ...input.claim, attempts: 8 },
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ kind: 'target' });
+    await expect(runtime.resolve(input.control, {
+      claim: { ...input.claim, attempts: 9 },
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({
+      kind: 'ignored',
+      reason: 'presentation control did not converge within its retry budget',
+      settleExistingOperation: expect.any(Object),
     });
     await facade.stop();
     await store.close();
@@ -1821,6 +1874,85 @@ describe('durable Lark session control runtime', () => {
           providerUuid: `bcf_${digest.slice(0, 40)}`,
         },
       });
+    await facade.stop();
+    await store.close();
+  });
+
+  it('settles an orphan control pinned to an older remote generation without proof', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-orphan-generation-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    await admitDurableLarkSession({
+      facade: setupFacade,
+      message: message(),
+      session: session({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+        remoteBackendState: {
+          version: 1,
+          provider: 'reference',
+          generation: 2,
+          remoteSessionId: 'remote-live',
+          providerState: { sessionKey: 'logical-session' },
+        },
+      }),
+    });
+    await setupFacade.stop();
+    const facade = createDurableSessionFacade({ store, ownerId: 'orphan-owner' });
+    const takeOverActiveSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      takeOverActiveSession,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not called' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const revision = (await store.readSession('om_root::cli_test'))!.revision;
+    const resolveWith = async (operationId: string) => {
+      const input = directControl('trusted-host', 'terminalize_orphan');
+      const event = { ...input.claim.event, eventId: operationId, payload: {
+        ...(input.claim.event.payload as Record<string, unknown>),
+        operationId,
+      } };
+      const claim = { ...input.claim, event } as typeof input.claim;
+      return runtime.resolve(parseDurableSessionControlClaim(claim), {
+        claim,
+        signal: new AbortController().signal,
+      });
+    };
+
+    await expect(resolveWith('trusted-host.remote-orphan:cli_test:session-1:1'))
+      .resolves.toMatchObject({
+        kind: 'ignored',
+        reason: 'canonical remote generation advanced since the orphan scan',
+        settleExistingOperation: expect.any(Object),
+      });
+    await expect(resolveWith(`trusted-host.remote-orphan:cli_test:session-1:2:r${revision + 1}`))
+      .resolves.toMatchObject({
+        kind: 'ignored',
+        reason: 'canonical Session changed since the orphan scan',
+      });
+    await expect(resolveWith(`trusted-host.remote-orphan:cli_test:session-1:2:r${revision}`))
+      .resolves.toMatchObject({ kind: 'target' });
+    await expect(resolveWith('trusted-host.remote-orphan:cli_test:session-1:2'))
+      .resolves.toMatchObject({ kind: 'target' });
+    expect(takeOverActiveSession).not.toHaveBeenCalled();
+    expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!).session)
+      .toMatchObject({ status: 'active' });
     await facade.stop();
     await store.close();
   });

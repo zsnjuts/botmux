@@ -1369,7 +1369,8 @@ export const messages: Record<string, string> = {
   'card.turn_failed.retry_safe': 'This turn\'s input never reached the CLI, so **nothing was executed**. Retrying is safe.',
   'card.turn_failed.retry_caveated': '⚠️ This turn **may have partially executed** (edited files, commits, messages sent). Continue does NOT replay it verbatim: the CLI is asked to **inspect the current state first**, work out how far it got, and resume from there — stopping and handing back to you if it cannot tell. Still worth a glance at the Web Terminal.',
   'card.turn_failed.no_retry': 'Re-sending the same input cannot succeed for this error. Check the cause, then send a new message.',
-  'worker.remote_orphan_terminalized': 'The platform confirmed that the remote execution resource expired or no longer exists. The original task may have partially run, so it was not replayed; this session was safely terminated.',
+  'card.turn_failed.fresh_session': 'Just keep messaging in this topic and a new session starts automatically. If your latest message gets a reply shortly, there is no need to resend it.',
+  'worker.remote_orphan_terminalized': 'The platform confirmed that the remote execution resource expired or no longer exists, so the old session has ended. The original task may have partially run, so it was not replayed.',
   'card.turn_failed.no_input': 'No re-sendable input was recorded for this turn (it stopped before submission). Send a new message instead.',
 
   'card.action.retry_turn_missing': '⚠️ No input record found for this turn, so it cannot be retried. Send a new message instead.',

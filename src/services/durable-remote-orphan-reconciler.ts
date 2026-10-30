@@ -4,6 +4,7 @@ import { durableDirectSessionControlEvent } from './durable-lark-session-control
 import { parseDurablePrimarySessionRecord } from './durable-session-primary.js';
 
 const DEFAULT_PAGE_LIMIT = 40;
+const OPERATION_PREFIX = 'trusted-host.remote-orphan';
 const DEFAULT_PAGE_SIZE = 256;
 const DEFAULT_LEASE_MS = 60_000;
 
@@ -48,6 +49,49 @@ function candidateForApp(
   if (!remote?.remoteSessionId || remote.generation < 1) return undefined;
   if (session.title?.startsWith('Adopt:') || session.adoptedFrom) return undefined;
   return parsed;
+}
+
+/**
+ * Orphan controls are pinned to the canonical lineage they were scanned from:
+ * the remote generation and the canonical record revision. A control whose
+ * Session moved on (a local owner took over and committed, or the remote was
+ * replaced) is stale and must settle as a no-op instead of terminalizing a
+ * Session that is no longer orphaned. The revision also keeps a later orphan
+ * of the same generation from colliding with an earlier, settled control.
+ * Controls enqueued by older daemons carry only the generation.
+ */
+export function durableRemoteOrphanOperationId(input: {
+  larkAppId: string;
+  sessionId: string;
+  generation: number;
+  revision: number;
+}): string {
+  return [
+    OPERATION_PREFIX,
+    input.larkAppId,
+    input.sessionId,
+    String(input.generation),
+    `r${input.revision}`,
+  ].join(':');
+}
+
+export function parseDurableRemoteOrphanOperationId(
+  operationId: string,
+): { generation: number; revision?: number } | undefined {
+  if (!operationId.startsWith(`${OPERATION_PREFIX}:`)) return undefined;
+  const parts = operationId.split(':');
+  let revision: number | undefined;
+  const last = parts[parts.length - 1] ?? '';
+  if (/^r\d+$/.test(last)) {
+    revision = Number(last.slice(1));
+    parts.pop();
+  }
+  const generationText = parts[parts.length - 1] ?? '';
+  if (parts.length < 4 || !/^\d+$/.test(generationText)) return undefined;
+  const generation = Number(generationText);
+  if (!Number.isSafeInteger(generation)
+      || (revision !== undefined && !Number.isSafeInteger(revision))) return undefined;
+  return revision === undefined ? { generation } : { generation, revision };
 }
 
 function hasStrandedRecoveredTurn(session: ReturnType<typeof parseDurablePrimarySessionRecord>['session']): boolean {
@@ -119,12 +163,12 @@ export async function scanDurableRemoteOrphans(
             || (options.hasLocalOwner(parsed.session.sessionId)
               && !hasStrandedRecoveredTurn(currentParsed.session))) continue;
         const remote = normalizeRemoteRunnerBackendState(currentParsed.session.remoteBackendState)!;
-        const operationId = [
-          'trusted-host.remote-orphan',
-          options.larkAppId,
-          currentParsed.session.sessionId,
-          String(remote.generation),
-        ].join(':');
+        const operationId = durableRemoteOrphanOperationId({
+          larkAppId: options.larkAppId,
+          sessionId: currentParsed.session.sessionId,
+          generation: remote.generation,
+          revision: current.revision,
+        });
         const inserted = await options.store.enqueueInboxWithLease({
           lease: acquired.lease,
           event: durableDirectSessionControlEvent({

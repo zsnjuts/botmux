@@ -25,6 +25,7 @@ import {
   commitDurableLarkSessionControl,
   parseDurablePrimarySessionRecord,
 } from './durable-session-primary.js';
+import { parseDurableRemoteOrphanOperationId } from './durable-remote-orphan-reconciler.js';
 
 interface CloseResult {
   ok: boolean;
@@ -50,6 +51,14 @@ const TERMINAL_RESUME_REFUSALS = new Set([
   'resume_cancelled',
 ]);
 const TRUSTED_HANDOFF_HORIZON_MS = 5 * 60_000;
+
+/**
+ * A display toggle that keeps failing to reach its target mode (for example on
+ * a frozen Session) is not worth retrying forever: every retry re-renders the
+ * card and head-of-line blocks later close/resume controls in the same
+ * partition. After this many claims it settles as an explicit no-op.
+ */
+const PRESENTATION_CONTROL_MAX_ATTEMPTS = 8;
 
 export interface DurableLarkSessionControlRuntimeOptions {
   larkAppId: string;
@@ -429,6 +438,15 @@ export function createDurableLarkSessionControlRuntime(
         && (!orphanBaselineState?.remoteSessionId || orphanBaselineState.generation < 1)) {
       return { kind: 'ignored', reason: 'canonical Session has no submitted remote lineage' };
     }
+    if (control.action === 'terminalize_orphan' && orphanBaselineState) {
+      const pinned = parseDurableRemoteOrphanOperationId(control.operationId);
+      if (pinned && pinned.generation !== orphanBaselineState.generation) {
+        return terminalIgnore('canonical remote generation advanced since the orphan scan');
+      }
+      if (pinned?.revision !== undefined && canonical?.revision !== pinned.revision) {
+        return terminalIgnore('canonical Session changed since the orphan scan');
+      }
+    }
     if (control.action === 'terminalize_orphan' && live) {
       if (canonicalSession.lastFailedTurn?.recoveredRemoteTurn === true
           && options.abandonOrphanTakeover) {
@@ -453,10 +471,11 @@ export function createDurableLarkSessionControlRuntime(
           'active presentation target is owned by another replica',
         );
       }
-      return {
-        kind: 'ignored',
-        reason: 'stale presentation control no longer has a local active target',
-      };
+      return terminalIgnore('stale presentation control no longer has a local active target');
+    }
+    if (control.action === 'toggle_display'
+        && context.claim.attempts > PRESENTATION_CONTROL_MAX_ATTEMPTS) {
+      return terminalIgnore('presentation control did not converge within its retry budget');
     }
     if (control.action === 'close' && canonicalSession.status === 'active') {
       if (!live) {

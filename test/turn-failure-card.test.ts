@@ -351,6 +351,15 @@ describe('buildTurnFailedCard', () => {
     expect(bodyText(card)).toContain('无法成功');
   });
 
+  it('tells a retired orphan Session that the next message starts a fresh Session', () => {
+    const card = build({ retryOffer: 'none', advice: 'fresh_session' });
+    expect(actions(card).find((a: any) => a.value?.action === 'retry_turn')).toBeUndefined();
+    // The orphan card must swap the "this will never work" advice for the
+    // fresh-Session next step; compare the rendered advice keys, not wording.
+    expect(bodyText(card)).toContain(t('card.turn_failed.fresh_session'));
+    expect(bodyText(card)).not.toContain(t('card.turn_failed.no_retry'));
+  });
+
   it('omits the retry button when there is no input to re-send', () => {
     // buildFailedTurnRecord returns undefined for a turn that died before its
     // prompt was wrapped — a button would 100% fail on click.
