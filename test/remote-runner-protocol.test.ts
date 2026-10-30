@@ -728,3 +728,36 @@ describe('remote runner protocol', () => {
     }
   });
 });
+
+describe('remote runner web terminal state', () => {
+  const base = { version: 1, provider: 'tae-traex', generation: 3, remoteSessionId: 'sbx0test' };
+  const gateway = {
+    kind: 'ttyd',
+    writeUrl: 'https://port-7681-sbx0test.sandbox.example.test/',
+    readUrl: 'https://port-7682-sbx0test.sandbox.example.test/',
+  };
+
+  it('keeps ttyd endpoints for the current remote session', () => {
+    expect(normalizeRemoteRunnerBackendState({ ...base, webTerminal: gateway })?.webTerminal)
+      .toEqual(gateway);
+  });
+
+  it.each([
+    ['plain http', { writeUrl: 'http://port-7681-sbx0test.sandbox.example.test/' }],
+    ['an explicit port', { writeUrl: 'https://port-7681-sbx0test.sandbox.example.test:8443/' }],
+    ['a path', { writeUrl: 'https://port-7681-sbx0test.sandbox.example.test/x' }],
+    ['credentials in the URL', { writeUrl: 'https://u:p@port-7681-sbx0test.sandbox.example.test/' }],
+    ['identical endpoints', { readUrl: gateway.writeUrl }],
+    ['another kind', { kind: 'gotty' }],
+  ])('drops the web terminal (but keeps the state) for %s', (_label, patch) => {
+    const state = normalizeRemoteRunnerBackendState({ ...base, webTerminal: { ...gateway, ...patch } });
+    expect(state?.remoteSessionId).toBe('sbx0test');
+    expect(state?.webTerminal).toBeUndefined();
+  });
+
+  it('has no web terminal without a remote session', () => {
+    const { remoteSessionId: _omit, ...withoutSession } = base;
+    expect(normalizeRemoteRunnerBackendState({ ...withoutSession, webTerminal: gateway })?.webTerminal)
+      .toBeUndefined();
+  });
+});

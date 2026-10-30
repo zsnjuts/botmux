@@ -98,6 +98,20 @@ export interface RemoteRunnerBackendState {
   remoteSessionId?: string;
   agentThreadId?: string;
   providerState?: JsonObject;
+  webTerminal?: RemoteRunnerWebTerminal;
+}
+
+/**
+ * A real terminal the provider runs next to the current remote session: two
+ * ttyd endpoints behind the platform gateway (writable / read-only). The host
+ * proxies them under its own `/s/<id>` route with the platform credential, and
+ * only for hosts the deployment allowlists (see remote-web-terminal.ts) — the
+ * protocol layer checks shape only. Whether ttyd is up is probed per page load.
+ */
+export interface RemoteRunnerWebTerminal {
+  kind: 'ttyd';
+  writeUrl: string;
+  readUrl: string;
 }
 
 /**
@@ -509,6 +523,32 @@ function optionalId(value: unknown): string | undefined | null {
   return id && ID_RE.test(id) ? id : null;
 }
 
+const DNS_HOST_RE = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+function webTerminalUrl(value: unknown): string | undefined {
+  const raw = nonEmptyString(value, 512);
+  if (!raw) return undefined;
+  let url: URL;
+  try { url = new URL(raw); } catch { return undefined; }
+  if (url.protocol !== 'https:' || url.username || url.password || url.port
+      || url.pathname !== '/' || url.search || url.hash
+      || !DNS_HOST_RE.test(url.hostname)) {
+    return undefined;
+  }
+  return url.toString();
+}
+
+/** Invalid or foreign web terminal data is dropped, never fatal: the session
+ * keeps working with the snapshot terminal. */
+function normalizeWebTerminal(value: unknown): RemoteRunnerWebTerminal | undefined {
+  const raw = record(value);
+  if (!raw || raw.kind !== 'ttyd') return undefined;
+  const writeUrl = webTerminalUrl(raw.writeUrl);
+  const readUrl = webTerminalUrl(raw.readUrl);
+  if (!writeUrl || !readUrl || writeUrl === readUrl) return undefined;
+  return { kind: 'ttyd', writeUrl, readUrl };
+}
+
 export function normalizeRemoteRunnerBackendState(
   value: unknown,
 ): RemoteRunnerBackendState | undefined {
@@ -530,6 +570,7 @@ export function normalizeRemoteRunnerBackendState(
     }
     providerState = candidate as JsonObject;
   }
+  const webTerminal = remoteSessionId ? normalizeWebTerminal(raw.webTerminal) : undefined;
 
   return {
     version: REMOTE_RUNNER_PROTOCOL_VERSION,
@@ -538,6 +579,7 @@ export function normalizeRemoteRunnerBackendState(
     ...(remoteSessionId ? { remoteSessionId } : {}),
     ...(agentThreadId ? { agentThreadId } : {}),
     ...(providerState ? { providerState } : {}),
+    ...(webTerminal ? { webTerminal } : {}),
   };
 }
 

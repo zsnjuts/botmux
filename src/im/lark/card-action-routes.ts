@@ -214,6 +214,11 @@ export interface SensitiveCardActionMeta {
    * 所有后续会话），属管理动作，必须走 canOperate。
    */
   readonly pendingRepoOwnerException?: true;
+  /**
+   * 会话发起人（`ownerOpenId`）不过 canOperate 也可以对自己的会话执行——目前只给
+   * 「获取操作链接」：员工自己开的话题，自己就能拿到可写终端。黑名单用户仍被拒。
+   */
+  readonly sessionOwnerException?: true;
 }
 
 const NO_META: SensitiveCardActionMeta = {};
@@ -229,7 +234,7 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['worktree_toggle_mode', NO_META],
   ['retry_last_task', NO_META],
   ['retry_turn', NO_META],
-  ['get_write_link', { denyToastKey: 'card.action.write_link_no_permission' }],
+  ['get_write_link', { denyToastKey: 'card.action.write_link_no_permission', sessionOwnerException: true }],
   ['open_local_terminal', { denyToastKey: 'card.action.local_terminal_no_permission' }],
   ['open_local_cli', { denyToastKey: 'card.action.local_cli_no_permission' }],
   ['toggle_stream', NO_META],
