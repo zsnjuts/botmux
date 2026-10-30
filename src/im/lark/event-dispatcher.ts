@@ -6398,11 +6398,20 @@ export function createLarkEventDispatcherRuntime(
       const rawMessage = data?.message;
       const ingressAnchor = rawMessageIngressAnchor(larkAppId, rawMessage);
       if (runtimeOptions.enqueuePrimary) {
+        const receivedAtMs = Date.now();
         return enqueuePrimaryInArrivalOrder(() => ({
           eventId: eventKey,
           partitionKey: ingressAnchor,
           data,
-        })).then(() => undefined);
+        })).then(() => {
+          // 入站计时：飞书消息创建 → daemon 收到 → 写进 PG 收件箱，用于定位「卡片晚出来」。
+          const createdAtMs = Number(rawMessage?.create_time);
+          logger.info(
+            `[ingress:${larkAppId}] message enqueued msg=${String(messageIdForKey ?? '-').slice(0, 18)}`
+            + ` lark_to_receive_ms=${Number.isFinite(createdAtMs) ? receivedAtMs - createdAtMs : -1}`
+            + ` enqueue_ms=${Date.now() - receivedAtMs}`,
+          );
+        });
       }
       let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
       // Reserve the app/chat ingress lane before any routing await. Canonical
