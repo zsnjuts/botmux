@@ -378,19 +378,62 @@ function inlineCode(s: string): string {
   return `\`${s.replace(/[`\r\n]+/g, '')}\``;
 }
 
+/** HTML/XML-style tag: `<` or `</`, a letter-led name, then attributes, an
+ *  optional self-closing `/`, and `>`. The name must follow `<` directly, so
+ *  prose like `a < b`, `<3`, `<-` or `x->y` never looks like a tag. */
+const MARKUP_TAG_RE = /<(\/?)([A-Za-z][\w:.-]*)((?:\s+[^\s"'<>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>=`]+))?)*)\s*(\/?)>/g;
+
+/** HTML elements recognised as markup even when no closing tag follows (void
+ *  elements, or a paragraph cut off by the title's length cap). Other bare
+ *  `<Name>` tokens — `Promise<void>`, `List<String>`, `x<b>y` — stay as prose
+ *  unless their `</Name>` also appears, which is why the one-letter inline
+ *  elements (`a` `b` `i` `s` `u`) are not listed. */
+const HTML_ELEMENT_NAMES = new Set([
+  'blockquote', 'br', 'code', 'del', 'div', 'em', 'font', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr',
+  'img', 'ins', 'li', 'ol', 'p', 'pre', 'span', 'strong', 'sub', 'sup', 'table', 'tbody', 'td', 'th',
+  'thead', 'tr', 'ul',
+]);
+
+/** Block-level elements separate words; inline formatting must not split them. */
+const BLOCK_ELEMENT_NAMES = new Set([
+  'blockquote', 'br', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'li', 'ol', 'p', 'pre', 'table',
+  'tbody', 'td', 'th', 'thead', 'tr', 'ul',
+]);
+
+/** Remove HTML/XML-style tags, keeping the text between them. Closing tags,
+ *  self-closing tags and tags carrying `key=value` attributes are always markup;
+ *  a bare `<name>` only when it is a known HTML element or is closed later in
+ *  the same string. Anything else, including `a<b and c>d`, is left as typed. */
+function stripMarkupTags(s: string): string {
+  const closedNames = new Set(
+    [...s.matchAll(/<\/([A-Za-z][\w:.-]*)\s*>/g)].map(m => m[1].toLowerCase()),
+  );
+  return s.replace(MARKUP_TAG_RE, (tag, closing: string, name: string, attrs: string, selfClosing: string) => {
+    const lower = name.toLowerCase();
+    const isMarkup = closing === '/'
+      || selfClosing === '/'
+      || attrs.includes('=')
+      || (attrs.trim() === '' && (HTML_ELEMENT_NAMES.has(lower) || closedNames.has(lower)));
+    if (!isMarkup) return tag;
+    return BLOCK_ELEMENT_NAMES.has(lower) ? ' ' : '';
+  });
+}
+
 /** Sanitize a user-derived string for a `plain_text` HEADER title. Unlike
  *  {@link escapeMd} (for `lark_md` bodies), a plain_text field renders literally
- *  — so markdown-escaping would surface visible backslashes, and a raw
- *  `<at id=…></at>` carried over from the seeding message shows as the literal
- *  tag text (both seen leaking in the header). Strip mention markup entirely (a
- *  title should never carry a mention), collapse the whitespace it leaves, and
- *  drop stray angle brackets so no tag-like text survives. No backslashes: the
+ *  — so markdown-escaping would surface visible backslashes, and markup carried
+ *  over from the seeding message shows as literal tag text (a raw
+ *  `<at id=…></at>`, or the `<p>…</p>` paragraphs of a rich-text body). Strip
+ *  mention markup entirely (a title should never carry a mention), drop other
+ *  tags while keeping their text, and collapse the whitespace left behind.
+ *  Angle brackets that are not part of a tag stay as typed. No backslashes: the
  *  field is not markdown. */
 function plainTitle(s: string): string {
-  return s
-    .replace(/<at\b[^>]*>.*?<\/at>/gis, '') // drop <at ...>…</at> mention markup
-    .replace(/<at\b[^>]*\/?>/gis, '')       // drop any unbalanced <at ...> too
-    .replace(/[<>]/g, '')                    // no stray angle brackets in plain_text
+  return stripMarkupTags(
+    s
+      .replace(/<at\b[^>]*>.*?<\/at>/gis, '') // drop <at ...>…</at> mention markup
+      .replace(/<at\b[^>]*\/?>/gis, ''),      // drop any unbalanced <at ...> too
+  )
     .replace(/\s{2,}/g, ' ')
     .trim();
 }

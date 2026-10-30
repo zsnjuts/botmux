@@ -21,7 +21,7 @@ import { commandSpec } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, type MentionIdentity } from './message-parser.js';
+import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, unwrapRichTextParagraphs, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions } from './mention-targets.js';
 import { recordObservedBotsShared, listObservedBots } from '../../services/observed-bots-store.js';
@@ -2882,12 +2882,12 @@ function unwrapEditedTextContent(rawContent: string): string {
     return rawContent;
   }
   const text = parsed?.text;
-  if (typeof text !== 'string' || !text.includes('<p>')) return rawContent;
-  const paragraphs = [...text.matchAll(/<p>([\s\S]*?)<\/p>/g)].map(m => m[1]);
-  // 去掉所有 <p>…</p> 后若还有非空白残留，说明 <p> 只是正文的一部分，保持原样。
-  const residual = text.replace(/<p>[\s\S]*?<\/p>/g, '').trim();
-  if (paragraphs.length === 0 || residual !== '') return rawContent;
-  return JSON.stringify({ ...parsed, text: paragraphs.join('\n') });
+  if (typeof text !== 'string') return rawContent;
+  // 判定与解包规则与解析层同源（unwrapRichTextParagraphs）：去掉所有 <p>…</p>
+  // 后若还有非空白残留，说明 <p> 只是正文的一部分，保持原样。
+  const unwrapped = unwrapRichTextParagraphs(text);
+  if (unwrapped === text) return rawContent;
+  return JSON.stringify({ ...parsed, text: unwrapped });
 }
 
 function larkReceiveEventFromHistoryMessage(
@@ -3593,7 +3593,9 @@ export function extractMessageTextForRouting(message: any): string | null {
     // before parseTopicHeader sees the content. Mirrors the
     // resolveMentions logic in parseEventMessage.
     if (typeof obj?.text === 'string') {
-      let text: string = obj.text;
+      // 富文本编辑器存的 <p> 段落形态与解析层同样解包，否则 `<p>/cmd</p>`
+      // 的斜杠命令 / 话题指令头在路由窥视里认不出来。
+      let text: string = unwrapRichTextParagraphs(obj.text);
       const mentions = message?.mentions;
       if (Array.isArray(mentions)) {
         for (const m of mentions) {

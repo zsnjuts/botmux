@@ -12866,6 +12866,23 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     }));
   });
 
+  // 富文本编辑器把 text 正文存成 <p> 段落：路由窥视要与解析层一样解包，
+  // 否则 `<p>/solve …</p>` 不以 `/` 开头，免@ 命令整条失灵。
+  it('recognises a command whose text body is wrapped in rich-text <p> paragraphs', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('<p>/solve 修一下登录超时</p>');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+      commandTrigger: expect.objectContaining({ cmd: '/solve', args: '修一下登录超时' }),
+    }));
+  });
+
   // 模板是命令的行为定义；dispatcher 只负责把「命中的条目 + 本条消息的参数」下发，
   // 真正的渲染在 daemon 侧（renderCommandTriggerPrompt）。
   it('carries the configured template and the parsed args on the routing context', async () => {
@@ -12994,6 +13011,23 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-cmd',
+    }));
+  });
+
+  // <p> 段落形态下命令同样排在 @ 之前：位置判定要先解包，否则 `<p>/solve …`
+  // 不以 `/` 开头，命令自带的 @ 参数会被当成「先点名别人」而让路。
+  it('still fires for a rich-text <p> body whose @mention comes after the command', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = fire('<p>/solve @_user_1 看看这个</p>', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      commandTrigger: expect.objectContaining({ cmd: '/solve' }),
     }));
   });
 

@@ -1,4 +1,5 @@
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
+import { unwrapRichTextParagraphs } from '../im/lark/message-parser.js';
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 
 interface ManagerAuthorizationInput {
@@ -53,6 +54,9 @@ export async function authorizeHumanManager(input: ManagerAuthorizationInput): P
   try { text = JSON.parse(message.body?.content ?? '{}').text; }
   catch { return { ok: false, error: 'explicit_manager_instruction_required' }; }
   if (message.msg_type !== 'text' || typeof text !== 'string') return { ok: false, error: 'explicit_manager_instruction_required' };
+  // The REST read returns rich-text editor bodies as `<p>` paragraphs; judge the
+  // same text the message parser hands the session.
+  text = unwrapRichTextParagraphs(text);
   for (const mention of message.mentions ?? []) {
     const id = typeof mention.id === 'string' ? mention.id : mention.id?.open_id;
     if (!input.targetOpenId || id !== input.targetOpenId || !mention.key) return { ok: false, error: 'ambiguous_manager_target' };

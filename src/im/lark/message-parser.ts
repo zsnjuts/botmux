@@ -1137,11 +1137,28 @@ export function extractAuthoredMessageText(msgType: string, rawContent: string, 
   return title ? `${title}\n${body}` : body;
 }
 
+/**
+ * Feishu's rich-text editor stores a `text` body as HTML paragraphs —
+ * `{"text":"<p>@_user_1 正文</p>"}`, one `<p>` per line — while ordinary live
+ * events carry `{"text":"@_user_1 正文"}`. When the whole body is exactly a run
+ * of `<p>…</p>` blocks (only whitespace between them), return the paragraphs
+ * joined by newlines; otherwise return the text unchanged, so a message that
+ * merely mentions `<p>` keeps its literal text.
+ */
+export function unwrapRichTextParagraphs(text: string): string {
+  if (!text.includes('<p>')) return text;
+  const paragraphs = [...text.matchAll(/<p>([\s\S]*?)<\/p>/g)].map(m => m[1]);
+  const residual = text.replace(/<p>[\s\S]*?<\/p>/g, '').trim();
+  if (paragraphs.length === 0 || residual !== '') return text;
+  return paragraphs.join('\n');
+}
+
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
     if (msgType === 'text') {
       const parsed = JSON.parse(rawContent);
-      return resolveMentions(parsed.text ?? rawContent, mentions);
+      const text = parsed.text ?? rawContent;
+      return resolveMentions(typeof text === 'string' ? unwrapRichTextParagraphs(text) : text, mentions);
     }
     if (msgType === 'post') {
       const parsed = JSON.parse(rawContent);

@@ -1,5 +1,5 @@
 import { getAllBots, type BotState, type MessageListenerConfig } from '../bot-registry.js';
-import { extractCardContent, extractPostListenerText, unwrapUserDslContent } from '../im/lark/message-parser.js';
+import { extractCardContent, extractPostListenerText, unwrapRichTextParagraphs, unwrapUserDslContent } from '../im/lark/message-parser.js';
 import { resolveCurrentChatBotOpenIdsByLarkAppIds } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { resolveListenerDocumentTitles } from './message-listener-document-titles.js';
@@ -108,7 +108,7 @@ export function extractListenerMessageText(message: any): string {
   }
   try {
     const obj = JSON.parse(content);
-    if (typeof obj?.text === 'string') return obj.text.trim();
+    if (typeof obj?.text === 'string') return unwrapRichTextParagraphs(obj.text).trim();
     if (msgType === 'post') return extractPostListenerText(obj);
   } catch {
     return '';

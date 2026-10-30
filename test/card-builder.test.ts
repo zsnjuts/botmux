@@ -1458,6 +1458,65 @@ describe('buildStreamingCard', () => {
     });
   });
 
+  // ── Header title sanitisation ──────────────────────────────────────────
+  // The header is a plain_text field: markup carried in from the seeding
+  // message renders literally, so tags must go while their text and ordinary
+  // angle brackets stay.
+
+  describe('header title markup', () => {
+    const headerFor = (title: string): string =>
+      parse(buildStreamingCard(SID, ROOT, URL, title, '', 'starting', 'remote-runner')).header.title.content;
+
+    // Compared against the header built from the bare text, so the assertions
+    // hold whatever the surrounding header chrome looks like.
+    it('drops rich-text <p> paragraphs and keeps their text', () => {
+      const header = headerFor('<p>@OpsBot+ 排查一下</p>');
+      expect(header).toBe(headerFor('@OpsBot+ 排查一下'));
+      expect(header).not.toMatch(/[<>]/);
+    });
+
+    it('separates paragraphs with a space instead of gluing them together', () => {
+      expect(headerFor('<p>第一段</p><p>第二段</p>')).toBe(headerFor('第一段 第二段'));
+    });
+
+    it('drops a paragraph cut off before its closing tag by the title length cap', () => {
+      expect(headerFor('<p>告警持续 10 分钟，帮忙看一下')).toBe(headerFor('告警持续 10 分钟，帮忙看一下'));
+    });
+
+    it('drops tags with attributes, closing tags and self-closing tags', () => {
+      expect(headerFor(`<font color='red'>告警</font> 已恢复<br/>请 <b>复核</b>`))
+        .toBe(headerFor('告警 已恢复 请 复核'));
+    });
+
+    it('still removes mention markup together with the mentioned name', () => {
+      const header = headerFor('<p><at user_id="ou_x">Bot</at> 看看 <at id=ou_y></at>这个</p>');
+      expect(header).toBe(headerFor('看看 这个'));
+      expect(header).not.toContain('ou_');
+    });
+
+    it.each([
+      'a < b',
+      'x->y',
+      'I <3 it',
+      'a<b and c>d',
+      'x<b>y',
+      'Promise<void>',
+      'List<String>',
+      'Map<K, V>',
+      '<- back',
+      'p >= 0',
+    ])('leaves angle brackets that are not markup intact: %s', text => {
+      expect(headerFor(`修复 ${text} 问题`)).toContain(`修复 ${text} 问题`);
+    });
+
+    it('applies the same sanitisation to the session card header', () => {
+      const sessionHeader = (title: string): string =>
+        parse(buildSessionCard('sess-001', 'om_root', URL, title)).header.title.content;
+      expect(sessionHeader('<p>a < b</p>')).toBe(sessionHeader('a < b'));
+      expect(sessionHeader('a < b')).toContain('a < b');
+    });
+  });
+
   // ── Hidden display mode ────────────────────────────────────────────────
 
   describe('hidden display mode', () => {
