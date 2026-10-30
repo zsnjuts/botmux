@@ -113,6 +113,22 @@ describe('remote startup stage on the live card', () => {
     expect(patchedHeaders().at(-1)).toContain('工作中');
   });
 
+  it('holds a follow-up stage that arrives under the previous idle until working repaints', async () => {
+    ds.currentTurnId = 'om_turn';
+    ds.lastScreenStatus = 'idle';
+    await send({ type: 'remote_startup_progress', stage: 'submitting', turnId: 'om_turn' });
+    expect(ds.remoteStartupStage).toEqual({ stage: 'submitting', turnId: 'om_turn' });
+    // Repainting now would put 「等待输入」 on the new turn's card.
+    expect(mocks.patch).not.toHaveBeenCalled();
+
+    await send({ type: 'screen_update', content: 'screen', status: 'working', turnId: 'om_turn' });
+    expect(patchedHeaders().at(-1)).toContain('启动中…');
+    expect(patchedHeaders().every(header => !header.includes('工作中'))).toBe(true);
+
+    await send({ type: 'remote_startup_progress', stage: 'cli_start', turnId: 'om_turn' });
+    expect(patchedHeaders().at(-1)).toContain('启动中 · 正在启动远端 CLI');
+  });
+
   it('drops the stage once the turn leaves working, and ignores another turn', async () => {
     ds.currentTurnId = 'om_turn';
     await send({ type: 'remote_startup_progress', stage: 'tools_prepare', turnId: 'om_turn' });

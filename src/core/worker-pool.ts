@@ -18121,6 +18121,11 @@ function setupWorkerHandlers(
         }
         logger.info(`[${t}] Remote runner startup stage: ${msg.stage ?? 'turn accepted'}`);
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        // A follow-up's stage can arrive while the status is still the previous
+        // turn's idle; repainting then would show 「等待输入」 on the new card.
+        // Keep it — the working screen_update that follows renders it.
+        if (ds.lastScreenStatus !== undefined && ds.lastScreenStatus !== 'starting'
+          && ds.lastScreenStatus !== 'working') break;
         scheduleRemoteStartupStagePatch(ds, msg.turnId ?? startupState.initTurnId);
         break;
       }

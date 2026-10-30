@@ -500,6 +500,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   /** Display-only startup milestones (`startup_progress`), reported while a
    * start/resume request or a not-yet-acknowledged turn is still preparing. */
   onStartupProgress(cb: (stage: string) => void): void { this.startupProgressCb = cb; }
+  reportsStartupProgress(): boolean { return this.providerCapabilities.has('startup_progress'); }
 
   captureCurrentScreen(): string { return this.terminalSnapshot || this.outputBuffer; }
   getPaneSize(): { cols: number; rows: number } | null {

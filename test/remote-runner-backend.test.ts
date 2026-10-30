@@ -67,6 +67,7 @@ describe('RemoteRunnerBackend', () => {
     // are all dropped without failing the protocol.
     expect(stages).toEqual(['sandbox_resume', 'sandbox_create', 'provider_future_stage']);
     expect(accepted).toEqual(['sandbox_resume,sandbox_create,provider_future_stage']);
+    expect(backend.reportsStartupProgress()).toBe(true);
   });
 
   it('ignores startup_progress from a provider that did not advertise it', async () => {
@@ -81,6 +82,7 @@ describe('RemoteRunnerBackend', () => {
     await expect(backend.submitTurn({ turnId: 'turn-1', content: 'hello' })).resolves.toEqual({ submitted: true });
     await expect(final).resolves.toBe('turn-1');
     expect(stages).toEqual([]);
+    expect(backend.reportsStartupProgress()).toBe(false);
   });
 
   it('steers a negotiated active turn without changing final ownership', async () => {
