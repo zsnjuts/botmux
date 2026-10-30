@@ -668,12 +668,17 @@ export interface Session {
     workerGeneration: number;
     committedAt: string;
     dispatchAttempt?: number;
-    /** The daemon-authenticated owner of this interactive turn, copied from
-     * activeInteractiveTurn when the turn committed. A replacement owner that
-     * takes over the still-running provider turn restores its in-memory
-     * activeInteractiveTurn from here, so active-turn steer keeps working. */
-    caller?: TrustedCaller;
+  }>;
+  /** Bounded, daemon-authenticated owners of recently started interactive
+   * turns, keyed by turn id. activeInteractiveTurn is in-memory only; when a
+   * replacement owner (rolling restart / takeover) re-adopts a provider turn
+   * that is still running, it restores the owner from here so active-turn
+   * steer keeps working. Never written from a worker claim. */
+  activeTurnOwners?: Array<{
+    turnId: string;
+    caller: TrustedCaller;
     controller?: TrustedCaller;
+    recordedAt: string;
   }>;
   /** Explicit opt-in lease for one authorization-inheriting long-running task.
    * The field name is retained for persisted-state compatibility. */
@@ -2132,7 +2137,7 @@ export type WorkerToDaemon =
   /** The exact inbound turn is now durably owned by this worker generation's
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
-  | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true; activeTurnSteer?: true }
+  | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true; activeTurnSteer?: true; recoveredTurn?: true }
   /** Native write observation for display timing; never an admission or completion receipt. */
   | { type: 'turn_execution_started'; turnId: string; dispatchAttempt?: number; startedAtMs: number }
   /** The native CLI accepted this exact dispatched input into its own

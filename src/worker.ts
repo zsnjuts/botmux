@@ -23007,6 +23007,10 @@ async function spawnCli(
         turn.dispatchAttempt !== undefined && turn.turnId.startsWith('om_')
           ? true
           : undefined,
+        undefined,
+        // Lets a replacement daemon owner restore this turn's owner from its
+        // own durable record; the worker names the turn, never the identity.
+        true,
       );
       publishSandboxRelayCapability();
       log(
@@ -26256,6 +26260,7 @@ function acknowledgeTurnInputCommitted(
   dispatchAttempt?: number,
   durablePrimaryInbox?: true,
   activeTurnSteer?: true,
+  recoveredTurn?: true,
 ): void {
   if (!turnId) return;
   ordinaryImTurnDedupe.commit(turnId);
@@ -26265,6 +26270,7 @@ function acknowledgeTurnInputCommitted(
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
     ...(activeTurnSteer ? { activeTurnSteer: true } : {}),
+    ...(recoveredTurn ? { recoveredTurn: true } : {}),
   });
 }
 

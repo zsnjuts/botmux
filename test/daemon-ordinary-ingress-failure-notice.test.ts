@@ -3,6 +3,8 @@ import {
   __testOnly_handleDocComment,
   __testOnly_recordDurablePrimaryInputCommit,
   __testOnly_handleWorkerTurnInputRejected,
+  __testOnly_restoreRecoveredTurnOwner,
+  __testOnly_setActiveInteractiveTurn,
   __testOnly_submitDurablePrimaryRetryTurn,
 } from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
@@ -1528,7 +1530,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     });
   });
 
-  it('steers into a turn recovered by a replacement worker, restoring its owner from the durable commit', async () => {
+  it('restores the owner of a turn re-adopted by a replacement worker, so a follow-up steers into it', async () => {
     const anchor = 'om_thread_primary_recovered_turn_steer';
     const turnId = 'om_primary_recovered_turn_follow_up';
     const activeCaller = {
@@ -1537,23 +1539,18 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       senderType: 'user' as const,
     };
     const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
-    // The previous owner committed the turn (worker generation 11) and kept
-    // activeInteractiveTurn only in its memory; this daemon took it over.
+    // The previous owner started the turn and recorded its owner durably.
+    __testOnly_setActiveInteractiveTurn(ds, 'om_primary_active_owner', activeCaller);
+    expect(ds.session.activeTurnOwners).toEqual([
+      expect.objectContaining({ turnId: 'om_primary_active_owner', caller: activeCaller }),
+    ]);
+    // This daemon took the session over: the in-memory owner is gone.
     ds.activeInteractiveTurn = undefined;
-    ds.session.durablePrimaryInputCommits = [{
-      version: 1,
-      turnId: 'om_primary_active_owner',
-      workerGeneration: 11,
-      committedAt: NOW,
-      dispatchAttempt: 3,
-      caller: activeCaller,
-    }];
-    __testOnly_recordDurablePrimaryInputCommit(ds, {
+    __testOnly_restoreRecoveredTurnOwner(ds, {
       type: 'turn_input_committed',
       turnId: 'om_primary_active_owner',
-      dispatchAttempt: 3,
-      durablePrimaryInbox: true,
-    }, 12);
+      recoveredTurn: true,
+    });
     expect(ds.activeInteractiveTurn).toMatchObject({
       turnId: 'om_primary_active_owner',
       caller: activeCaller,
@@ -1570,44 +1567,34 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ctx.ingressAdmission).toEqual({ admitted: true });
   });
 
-  it('records the turn owner on commit but never restores it from a same-generation or ownerless record', () => {
+  it('restores a recovered turn owner only from its own record and never over a live owner', () => {
     const activeCaller = {
       requestLarkAppId: APP,
       requestUserOpenId: OWNER,
       senderType: 'user' as const,
     };
-    const { ds } = seedActiveRemoteRunnerSession('om_thread_primary_commit_owner', activeCaller);
-    ds.session.durablePrimaryInputCommits = [];
-    __testOnly_recordDurablePrimaryInputCommit(ds, {
-      type: 'turn_input_committed',
+    const { ds } = seedActiveRemoteRunnerSession('om_thread_primary_owner_restore_guard', activeCaller);
+    const recovered = {
+      type: 'turn_input_committed' as const,
       turnId: 'om_primary_active_owner',
-      durablePrimaryInbox: true,
-    }, 12);
-    expect(ds.session.durablePrimaryInputCommits).toEqual([
-      expect.objectContaining({ turnId: 'om_primary_active_owner', caller: activeCaller }),
-    ]);
-
-    // Same worker generation re-acknowledging: not a takeover.
+      recoveredTurn: true as const,
+    };
+    // No durable owner record for the turn: nothing to trust.
     ds.activeInteractiveTurn = undefined;
-    __testOnly_recordDurablePrimaryInputCommit(ds, {
-      type: 'turn_input_committed',
-      turnId: 'om_primary_active_owner',
-      durablePrimaryInbox: true,
-    }, 12);
+    ds.session.activeTurnOwners = [];
+    __testOnly_restoreRecoveredTurnOwner(ds, recovered);
     expect(ds.activeInteractiveTurn).toBeUndefined();
 
-    // A record written before owners were persisted: nothing to trust.
-    ds.session.durablePrimaryInputCommits = [{
-      version: 1,
-      turnId: 'om_primary_active_owner',
-      workerGeneration: 11,
-      committedAt: NOW,
-    }];
-    __testOnly_recordDurablePrimaryInputCommit(ds, {
-      type: 'turn_input_committed',
-      turnId: 'om_primary_active_owner',
-      durablePrimaryInbox: true,
-    }, 12);
+    // A live owner is never replaced.
+    const other = { requestLarkAppId: APP, requestUserOpenId: 'ou_other_owner', senderType: 'user' as const };
+    ds.session.activeTurnOwners = [{ turnId: 'om_primary_active_owner', caller: other, recordedAt: NOW }];
+    ds.activeInteractiveTurn = { turnId: 'om_primary_active_owner', caller: activeCaller };
+    __testOnly_restoreRecoveredTurnOwner(ds, recovered);
+    expect(ds.activeInteractiveTurn.caller).toEqual(activeCaller);
+
+    // A steer acknowledgement is not the recovered turn.
+    ds.activeInteractiveTurn = undefined;
+    __testOnly_restoreRecoveredTurnOwner(ds, { ...recovered, activeTurnSteer: true });
     expect(ds.activeInteractiveTurn).toBeUndefined();
   });
 
