@@ -2691,7 +2691,13 @@ export interface RoutingContext {
    *  （`{ ...ctx, scope, anchor }`），box 引用随拷贝共享，接纳发生在拷贝之后
    *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
    *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
-  ingressAdmission?: { admitted: boolean; retryReason?: string };
+  ingressAdmission?: {
+    admitted: boolean;
+    retryReason?: string;
+    /** Durable-primary only: the retry waits for this local condition (e.g. a
+     * Session finishing its turn) and is redelivered as soon as it holds. */
+    retryWakeKey?: string;
+  };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
@@ -4724,7 +4730,10 @@ export function createLarkEventDispatcherRuntime(
     primary: PrimaryProcessContext,
   ): DurableLarkCanonicalHandlerResult => {
     const retryReason = ctx.ingressAdmission?.retryReason?.trim();
-    if (retryReason) return { kind: 'retry', reason: retryReason };
+    if (retryReason) {
+      const wakeKey = ctx.ingressAdmission?.retryWakeKey;
+      return { kind: 'retry', reason: retryReason, ...(wakeKey ? { wakeKey } : {}) };
+    }
     if (!ctx.ingressAdmission?.admitted) {
       return { kind: 'ignored', reason: 'canonical handler completed without task admission' };
     }
@@ -4767,6 +4776,7 @@ export function createLarkEventDispatcherRuntime(
       if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
         ctx.ingressAdmission ??= { admitted: false };
         ctx.ingressAdmission.retryReason = takeover.reason;
+        ctx.ingressAdmission.retryWakeKey = undefined;
         return 'retry';
       }
       local = handlers.resolveDurableSession?.(ctx);

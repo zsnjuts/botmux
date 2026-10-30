@@ -29,16 +29,21 @@ export function durablePrimaryExistingTurnDisposition(
   if (state.session.durablePrimaryInputCommits?.some(item => item.turnId === turnId)) {
     return 'committed';
   }
+  return durablePrimarySessionAdmitsTurns(state) ? 'ready' : 'retry';
+}
+
+/** Whether the Session would admit a not-yet-committed turn right now. A
+ * turn retried because this was false becomes deliverable once it is true. */
+export function durablePrimarySessionAdmitsTurns(state: DurablePrimaryTurnRuntimeState): boolean {
   if (!state.worker || state.worker.killed) {
     // A dead/missing worker is recoverable through the existing cold-refork
     // path. Treating it as merely busy would leave the durable Inbox row in an
     // unbounded retry loop while this replica keeps renewing the Session lease.
     // Only an already-owned start boundary must remain retry-only.
-    return state.workerStartBlocker ? 'retry' : 'ready';
+    return !state.workerStartBlocker;
   }
-  if (state.allowActiveTurnSteer) return 'ready';
-  if (!state.cliReady || state.activeInteractiveTurn) return 'retry';
-  return 'ready';
+  if (state.allowActiveTurnSteer) return true;
+  return !!state.cliReady && !state.activeInteractiveTurn;
 }
 
 /** A primary Inbox claim cannot settle until the worker proves input acceptance. */

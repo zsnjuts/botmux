@@ -16,7 +16,11 @@ import {
 export type DurableInboxPrimaryDispatchResult =
   | { kind: 'committed'; receipt: DurableLarkAdmissionReceipt }
   | { kind: 'ignored'; reason: string }
-  | { kind: 'retry'; reason: string };
+  /** `wakeKey`: the event waits for a condition this process can observe
+   * (e.g. one Session finishing its turn). It is redelivered as soon as
+   * {@link DurableInboxPrimaryConsumer.wakeRetry} names that key, and no later
+   * than the ordinary retry delay. */
+  | { kind: 'retry'; reason: string; wakeKey?: string };
 
 export interface DurableInboxPrimaryDispatchContext {
   claim: InboxClaim;
@@ -46,6 +50,12 @@ export interface DurableInboxPrimaryStopResult {
 export interface DurableInboxPrimaryConsumer {
   readonly workerId: string;
   ready: Promise<void>;
+  /** Claim now instead of on the next poll tick (e.g. right after this process
+   * enqueued an event). Same claim path, fencing and FIFO as the tick. */
+  wake(): void;
+  /** Redeliver retried events that are waiting on `wakeKey` now instead of at
+   * their retry delay. Unknown keys are a no-op. */
+  wakeRetry(wakeKey: string): void;
   stop(timeoutMs?: number): Promise<DurableInboxPrimaryStopResult>;
   terminate(): void;
 }
@@ -82,6 +92,26 @@ interface Slot {
   index: number;
   running?: Promise<void>;
 }
+
+/** A retried claim that waits for its wake key. It stays claimed — and so keeps
+ * its partition blocked exactly like a queued, not-yet-visible retry — until it
+ * is handed back to the queue by a wake, its retry deadline, or shutdown. */
+interface ParkedRetry {
+  claim: InboxClaim;
+  message: DurableLarkMessageClaim;
+  result: Extract<DurableInboxPrimaryDispatchResult, { kind: 'retry' }>;
+  wakeKey: string;
+  /** When the ordinary retry would have become visible. */
+  deadline: number;
+  /** Resolves once the claim lease was cut to the retry window. */
+  leased: Promise<'applied' | 'stale' | 'unknown'>;
+  timer?: NodeJS.Timeout;
+  released?: Promise<void>;
+}
+
+/** Slack between a parked retry's deadline and its shortened claim lease, so a
+ * slightly late hand-back still owns the claim. */
+const PARKED_RETRY_LEASE_SLACK_MS = 2_000;
 
 function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
@@ -151,6 +181,12 @@ export function startDurableInboxPrimaryConsumer(
   const now = options.now ?? Date.now;
   const slots: Slot[] = Array.from({ length: concurrency }, (_, index) => ({ index }));
   const controllers = new Set<AbortController>();
+  const parked = new Map<string, ParkedRetry>();
+  // A crash while parked must not hide the row much longer than the retry it
+  // replaces: cut the claim lease to the retry window (plus slack). A retry
+  // delay that does not fit in one lease keeps the plain queued retry.
+  const parkedLeaseMs = retryDelayMs + PARKED_RETRY_LEASE_SLACK_MS;
+  const canParkRetries = parkedLeaseMs <= leaseDurationMs;
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
   let stopPromise: Promise<DurableInboxPrimaryStopResult> | undefined;
@@ -207,6 +243,16 @@ export function startDurableInboxPrimaryConsumer(
         const reason = result.reason.trim();
         if (!reason || reason.length > 512) {
           throw new Error('durable inbox primary retry result requires a bounded reason');
+        }
+        if (result.wakeKey !== undefined) {
+          const wakeKey = result.wakeKey.trim();
+          if (!wakeKey || wakeKey.length > 512) {
+            throw new Error('durable inbox primary retry wakeKey must be bounded');
+          }
+          if (!stopped && canParkRetries) {
+            parkRetry(claim, message, { ...result, wakeKey }, wakeKey);
+            return;
+          }
         }
         const retried = await options.store.retryInboxClaim({
           claim,
@@ -298,6 +344,70 @@ export function startDurableInboxPrimaryConsumer(
     }
   };
 
+  /** Hand a parked claim back to the queue, visible at `visibleAt`. */
+  const releaseParked = (entry: ParkedRetry, visibleAt: number): Promise<void> => {
+    if (entry.released) return entry.released;
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = undefined;
+    entry.released = (async () => {
+      try {
+        const leased = await entry.leased;
+        if (leased === 'stale') return;
+        const retried = await options.store.retryInboxClaim({ claim: entry.claim, visibleAt });
+        if (retried.kind === 'stale') {
+          reportError(new Error(`durable inbox primary retry lost claim ${entry.claim.event.eventId}`));
+          return;
+        }
+        try {
+          await options.onRetried?.({ message: entry.message, result: entry.result });
+        } catch (error) {
+          reportError(new Error(
+            `durable inbox primary retry observer failed for ${entry.claim.event.eventId}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ));
+        }
+      } catch (error) {
+        reportError(error);
+      } finally {
+        if (parked.get(entry.claim.event.eventId) === entry) parked.delete(entry.claim.event.eventId);
+      }
+    })();
+    return entry.released;
+  };
+
+  const parkRetry = (
+    claim: InboxClaim,
+    message: DurableLarkMessageClaim,
+    result: Extract<DurableInboxPrimaryDispatchResult, { kind: 'retry' }>,
+    wakeKey: string,
+  ): void => {
+    const deadline = now() + retryDelayMs;
+    const entry: ParkedRetry = {
+      claim,
+      message,
+      result,
+      wakeKey,
+      deadline,
+      leased: options.store.renewInboxClaim({ claim, leaseDurationMs: parkedLeaseMs }).then(
+        renewed => {
+          if (renewed.kind !== 'stale') return 'applied' as const;
+          reportError(new Error(`durable inbox primary retry lost claim ${claim.event.eventId}`));
+          return 'stale' as const;
+        },
+        error => {
+          // The claim keeps its previous lease; the hand-back is still owned.
+          reportError(error);
+          return 'unknown' as const;
+        },
+      ),
+    };
+    parked.set(claim.event.eventId, entry);
+    entry.timer = setTimeout(() => {
+      void releaseParked(entry, now()).then(() => tick()).catch(reportError);
+    }, retryDelayMs);
+    entry.timer.unref?.();
+  };
+
   const drainSlot = async (slot: Slot): Promise<void> => {
     const slotWorkerId = `${workerId}:${slot.index}`;
     for (let index = 0; index < batchSize && !stopped; index++) {
@@ -346,10 +456,30 @@ export function startDurableInboxPrimaryConsumer(
     reportError(error);
   }).finally(installInterval);
 
+  const wake = (): void => {
+    if (stopped) return;
+    void tick().catch(reportError);
+  };
+
+  const wakeRetry = (wakeKey: string): void => {
+    if (stopped) return;
+    for (const entry of [...parked.values()]) {
+      if (entry.wakeKey !== wakeKey || entry.released) continue;
+      void releaseParked(entry, now()).then(() => tick()).catch(reportError);
+    }
+  };
+
   const terminate = (): void => {
     stopped = true;
     if (timer) clearInterval(timer);
     timer = undefined;
+    // Parked claims keep their shortened lease and become claimable when it
+    // expires, like a retry whose visibility time passed.
+    for (const entry of parked.values()) {
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = undefined;
+    }
+    parked.clear();
     for (const controller of controllers) {
       controller.abort(new Error('durable inbox primary consumer terminated'));
     }
@@ -358,6 +488,8 @@ export function startDurableInboxPrimaryConsumer(
   return {
     workerId,
     ready,
+    wake,
+    wakeRetry,
     terminate,
     stop: (timeoutMs = shutdownMs) => {
       if (stopPromise) return stopPromise;
@@ -365,8 +497,14 @@ export function startDurableInboxPrimaryConsumer(
       if (timer) clearInterval(timer);
       timer = undefined;
       const budget = boundedInteger(timeoutMs, 'timeoutMs', 0, 300_000);
+      // Parked retries go back to the queue exactly as the ordinary retry
+      // would have: visible at their original deadline.
+      const handedBack = [...parked.values()].map(entry => releaseParked(entry, entry.deadline));
       stopPromise = (async () => {
-        const running = slots.flatMap(slot => slot.running ? [slot.running] : []);
+        const running = [
+          ...slots.flatMap(slot => slot.running ? [slot.running] : []),
+          ...handedBack,
+        ];
         if (running.length === 0) return { kind: 'stopped', inFlight: 0 };
         if (budget === 0) {
           for (const controller of controllers) {

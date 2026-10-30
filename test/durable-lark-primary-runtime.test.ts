@@ -80,6 +80,31 @@ describe('durable Lark primary runtime', () => {
     expect(runtime.status()).toEqual({ kind: 'stopped' });
   });
 
+  it('claims a message this replica just enqueued without waiting for the inbox poll', async () => {
+    const order: string[] = [];
+    const durableStore = store(order);
+    const runtime = startDurableLarkPrimaryRuntime({
+      store: durableStore,
+      larkAppId: 'cli_test',
+      inboxIntervalMs: 60_000,
+      handleCanonical: async () => ({ kind: 'ignored', reason: 'fixture' }),
+      deliverOutbox: async () => ({ kind: 'ambiguous', error: 'fixture' }),
+    });
+    await runtime.ready;
+    const claim = durableStore.claimNextInbox as ReturnType<typeof vi.fn>;
+
+    for (const enqueue of [runtime.ingress.enqueueBeforeAck, runtime.ingress.enqueueClusterBeforeAck]) {
+      const claimsBefore = claim.mock.calls.length;
+      await expect(enqueue({
+        eventId: 'im.message.receive_v1:cli_test:om_message',
+        partitionKey: 'lark-message-routing:cli_test:oc_chat',
+        data: { message: { message_id: 'om_message' } },
+      })).resolves.toEqual({ kind: 'inserted' });
+      await vi.waitFor(() => expect(claim.mock.calls.length).toBeGreaterThan(claimsBefore));
+    }
+    await runtime.stop();
+  });
+
   it('validates the shared shutdown budget before stopping any component', async () => {
     const order: string[] = [];
     const runtime = startDurableLarkPrimaryRuntime({

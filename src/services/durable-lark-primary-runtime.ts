@@ -193,7 +193,7 @@ export function startDurableLarkPrimaryRuntime(
         onError: reportError,
       })
     : undefined;
-  const ingress = startDurableLarkPrimaryIngress({
+  const leaderIngress = startDurableLarkPrimaryIngress({
     store: options.store,
     larkAppId: options.larkAppId,
     ...(options.ingressOwnerId ? { ownerId: options.ingressOwnerId } : {}),
@@ -205,6 +205,17 @@ export function startDurableLarkPrimaryRuntime(
     onLeadershipLost: options.onLeadershipLost,
     onError: reportError,
   });
+  // A message this replica just persisted is claimed at once instead of on
+  // the inbox's next poll tick; other replicas keep polling as before.
+  const wakeInboxAfter = <T>(enqueued: Promise<T>): Promise<T> => enqueued.then(result => {
+    inbox.wake();
+    return result;
+  });
+  const ingress: DurableLarkPrimaryIngress = {
+    ...leaderIngress,
+    enqueueBeforeAck: input => wakeInboxAfter(leaderIngress.enqueueBeforeAck(input)),
+    enqueueClusterBeforeAck: input => wakeInboxAfter(leaderIngress.enqueueClusterBeforeAck(input)),
+  };
   let stopPromise: Promise<DurableLarkPrimaryRuntimeStopResult> | undefined;
   const ready = Promise.all([
     inbox.ready,

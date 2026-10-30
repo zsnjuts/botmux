@@ -30,7 +30,9 @@ export interface DurableLarkPostAdmissionOutput {
 export type DurableLarkCanonicalHandlerResult =
   | { kind: 'admitted'; session: Session }
   | { kind: 'ignored'; reason: string }
-  | { kind: 'retry'; reason: string };
+  /** `wakeKey`: see DurableInboxPrimaryDispatchResult — redeliver as soon as
+   * the consumer is woken for it. */
+  | { kind: 'retry'; reason: string; wakeKey?: string };
 
 export interface DurableLarkCanonicalHandlerContext extends DurableInboxPrimaryDispatchContext {
   /** Raw event data after the durable envelope identity has been validated. */
@@ -114,7 +116,11 @@ export function createDurableLarkCanonicalDispatch(
       if (!reason || reason.length > 512) {
         throw new Error('durable canonical retry result requires a bounded reason');
       }
-      return { kind: 'retry', reason };
+      const wakeKey = result.wakeKey?.trim();
+      if (wakeKey !== undefined && (!wakeKey || wakeKey.length > 512)) {
+        throw new Error('durable canonical retry wakeKey must be bounded');
+      }
+      return { kind: 'retry', reason, ...(wakeKey ? { wakeKey } : {}) };
     }
     if (result.kind === 'ignored') {
       if (outputs.length > 0 || controls.length > 0) {

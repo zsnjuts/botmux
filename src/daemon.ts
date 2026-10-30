@@ -558,6 +558,8 @@ import {
   appendDurablePrimaryInputCommit,
   durablePrimaryExistingTurnDisposition,
   durablePrimaryRejectedLiveSendDisposition,
+  durablePrimarySessionAdmitsTurns,
+  type DurablePrimaryTurnRuntimeState,
 } from './services/durable-primary-turn-admission.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
@@ -23604,7 +23606,14 @@ function durablePrimaryTurnDisposition(
   turnId: string,
   opts: { allowActiveTurnSteer?: boolean } = {},
 ): ReturnType<typeof durablePrimaryExistingTurnDisposition> {
-  return durablePrimaryExistingTurnDisposition({
+  return durablePrimaryExistingTurnDisposition(durablePrimaryTurnRuntimeState(ds, opts), turnId);
+}
+
+function durablePrimaryTurnRuntimeState(
+  ds: DaemonSession,
+  opts: { allowActiveTurnSteer?: boolean } = {},
+): DurablePrimaryTurnRuntimeState {
+  return {
     session: ds.session,
     worker: ds.worker,
     cliReady: ds.cliReady,
@@ -23618,7 +23627,7 @@ function durablePrimaryTurnDisposition(
       : ds.initialStartPending === true && ds.initialStartClaimToken !== undefined
         ? 'in-flight-claim'
         : undefined,
-  }, turnId);
+  };
 }
 
 /** A Remote Runner steer needs the live provider to have negotiated
@@ -23668,11 +23677,30 @@ function durablePrimaryActiveTurnSteerCaller(
     : undefined;
 }
 
-function retryDurablePrimaryIngress(ctx: RoutingContext, reason: string): boolean {
+function retryDurablePrimaryIngress(
+  ctx: RoutingContext,
+  reason: string,
+  /** The Session whose turn/readiness the retry waits for: the Inbox
+   * redelivers it as soon as wakeDurablePrimaryRetries() sees it admissible. */
+  waitFor?: DaemonSession,
+): boolean {
   if (!ctx.durablePrimaryDispatch) return false;
   ctx.ingressAdmission ??= { admitted: false };
   ctx.ingressAdmission.retryReason = reason;
+  ctx.ingressAdmission.retryWakeKey = waitFor ? durablePrimaryRetryWakeKey(waitFor) : undefined;
   return true;
+}
+
+function durablePrimaryRetryWakeKey(ds: DaemonSession): string {
+  return `session:${ds.session.sessionId}`;
+}
+
+/** The Inbox wake key for retries waiting on `ds`, once it admits turns again
+ * (CLI ready and no unfinished turn); undefined while it still would not. */
+function durablePrimaryAdmissibleRetryWakeKey(ds: DaemonSession): string | undefined {
+  return durablePrimarySessionAdmitsTurns(durablePrimaryTurnRuntimeState(ds))
+    ? durablePrimaryRetryWakeKey(ds)
+    : undefined;
 }
 
 function recordDurablePrimaryInputCommit(
@@ -23964,7 +23992,7 @@ async function submitDurablePrimaryRetryTurn(
     return { kind: 'accepted' };
   }
   if (disposition === 'retry') {
-    retryDurablePrimaryIngress(ctx, 'session has an unfinished turn');
+    retryDurablePrimaryIngress(ctx, 'session has an unfinished turn', ds);
     return { kind: 'retry', inputAccepted: false };
   }
 
@@ -27176,7 +27204,7 @@ async function handleThreadReplyAdmitted(
       return;
     }
     if (disposition === 'retry') {
-      retryDurablePrimaryIngress(ctx, 'session has an unfinished turn');
+      retryDurablePrimaryIngress(ctx, 'session has an unfinished turn', ds);
       logger.info(
         `[${tag(ds)}] Requeued durable-primary turn ${parsed.messageId.slice(0, 12)} `
         + 'behind the active session turn',
@@ -30320,6 +30348,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const durableRemoteOrphanReconcilers: DurableRemoteOrphanReconciler[] = [];
   const durableConfigReloadWatchers: DurableConfigReloadWatcher[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
+  /** A Session's CLI became ready or its turn ended: hand back now the Inbox
+   * retries that were waiting for it, instead of at their retry delay. */
+  const wakeDurablePrimaryRetries = (ds: DaemonSession): void => {
+    const runtime = durablePrimaryRuntimeByApp.get(ds.larkAppId);
+    if (!runtime) return;
+    const wakeKey = durablePrimaryAdmissibleRetryWakeKey(ds);
+    if (wakeKey) runtime.inbox.wakeRetry(wakeKey);
+  };
   const durablePrimaryControlRuntimeByApp = new Map<string, ReturnType<
     typeof createDurableLarkSessionControlRuntime
   >>();
@@ -31057,6 +31093,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onTurnInputRejected(ds, rejection, context) {
       handleWorkerTurnInputRejected(ds, rejection, context.workerGeneration);
     },
+    onCliPromptReady(ds) {
+      // A follow-up the Inbox requeued while the CLI was starting may run now.
+      wakeDurablePrimaryRetries(ds);
+    },
     onTurnInputCommitted(ds, receipt, context) {
       // A recovered Remote Runner turn can conservatively classify an
       // attempt-bearing Lark message as durable-primary. Keep that recovery
@@ -31128,6 +31168,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (principalLaneTerminalOwned
           && ds.activeInteractiveTurn?.turnId === terminal.turnId) {
         ds.activeInteractiveTurn = undefined;
+        // A follow-up the Inbox requeued behind this turn may run now.
+        wakeDurablePrimaryRetries(ds);
       }
       // Principal lanes are parallel across runtime keys but own a durable,
       // full-turn FIFO inside each key. Release/advance only on this exact

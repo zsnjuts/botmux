@@ -1084,6 +1084,9 @@ export interface WorkerPoolCallbacks {
     rejection: Extract<WorkerToDaemon, { type: 'turn_input_rejected' }>,
     context: { workerGeneration: number },
   ) => void;
+  /** The current worker's CLI reported prompt-ready (`ds.cliReady` was just
+   * set). Optional; used to redeliver input that waited for readiness. */
+  onCliPromptReady?: (ds: DaemonSession) => void;
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
    * may be cleared without emitting the ambiguous-failure terminal. */
@@ -16597,6 +16600,9 @@ function setupWorkerHandlers(
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
+        try { cb.onCliPromptReady?.(ds); } catch (err) {
+          logger.warn(`[${t}] prompt-ready observer failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
