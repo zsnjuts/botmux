@@ -2018,6 +2018,56 @@ describe('parseEventMessage: parentId surfacing', () => {
   });
 });
 
+// Feishu's rich-text editor stores a text body as `<p>` paragraphs. Everything
+// downstream of the parser (session/turn title, CLI prompt, command lane, history)
+// reads parsed.content, so the paragraphs must be unwrapped here.
+describe('text messages in rich-text paragraph form', () => {
+  const MENTIONS = [{ key: '@_user_1', name: 'OpsBot+', id: { open_id: 'ou_bot' }, id_type: 'open_id' }];
+
+  function textEvent(text: string) {
+    return {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_reply',
+        root_id: 'om_card_root',
+        thread_id: 'omt_thread',
+        message_type: 'text',
+        content: JSON.stringify({ text }),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+        mentions: MENTIONS,
+      },
+    };
+  }
+
+  it('unwraps a single paragraph and still resolves the mention placeholder', () => {
+    const { parsed } = parseEventMessage(textEvent('<p>@_user_1 排查一下</p>') as any);
+    expect(parsed.content).toBe('@OpsBot+ 排查一下');
+  });
+
+  it('yields the same content as the plain live-event form', () => {
+    const wrapped = parseEventMessage(textEvent('<p>@_user_1 排查一下</p>') as any).parsed.content;
+    const plain = parseEventMessage(textEvent('@_user_1 排查一下') as any).parsed.content;
+    expect(wrapped).toBe(plain);
+  });
+
+  it('joins multiple paragraphs with newlines', () => {
+    const { parsed } = parseEventMessage(textEvent('<p>@_user_1 第一行</p><p>第二行</p>') as any);
+    expect(parsed.content).toBe('@OpsBot+ 第一行\n第二行');
+  });
+
+  it('keeps a body that only mentions <p> literally', () => {
+    expect(parseEventMessage(textEvent('标签是 <p> 不是 <div>') as any).parsed.content).toBe('标签是 <p> 不是 <div>');
+    expect(parseEventMessage(textEvent('<p>一段</p> 之后还有正文') as any).parsed.content).toBe('<p>一段</p> 之后还有正文');
+  });
+
+  it('unwraps the REST (history / read-back) shape the same way', () => {
+    const msg = { ...makeMsg('text', { text: '<p>@_user_1 排查一下</p>' }), mentions: MENTIONS };
+    expect(parseApiMessage(msg, undefined, { resolveMentions: true }).content).toBe('@OpsBot+ 排查一下');
+  });
+});
+
 describe('parseEventMessage: shared resource numbering', () => {
   const makeImageEvent = (messageId: string, imageKey: string) => ({
     sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
