@@ -154,4 +154,56 @@ describe('trusted-host durable Session control request', () => {
     expect(listSessions).toHaveBeenCalledWith({ limit: 256 });
     expect(store.readSession).not.toHaveBeenCalled();
   });
+  describe('when the wait window ends before the control commits', () => {
+    const operationId = 'trusted-host.session-control:cli_test:session-1:7:close';
+    function harness(onWait: (tick: number) => void = () => {}) {
+      let clock = 0;
+      let tick = 0;
+      const store = {
+        readSession: vi.fn(async () => current.value),
+        enqueueInbox: vi.fn(async () => ({ kind: 'inserted' as const })),
+      } as unknown as DurableCoordinationStore;
+      const current = { value: record('active', 7) };
+      return {
+        store,
+        current,
+        run: (action: 'close' | 'resume' = 'close') => requestDurableSessionControl({
+          store,
+          request: { larkAppId: 'cli_test', sessionKey: 'om_root::cli_test', sessionId: 'session-1', action },
+          now: () => clock,
+          wait: async () => { clock += 5; tick += 1; onWait(tick); },
+          timeoutMs: 20,
+          pollIntervalMs: 5,
+        }),
+      };
+    }
+
+    it('reports an enqueued close as accepted and still closing, not as a failure', async () => {
+      const h = harness();
+      await expect(h.run()).resolves.toEqual({ ok: true, outcome: 'closing', pending: true, operationId });
+      expect(h.store.enqueueInbox).toHaveBeenCalledOnce();
+    });
+
+    it('still reports a resume that never committed as a timeout', async () => {
+      const h = harness();
+      h.current.value = record('closed', 7);
+      // A closed canonical row is the resume precondition; keep it closed so the request waits.
+      await expect(h.run('resume')).resolves.toEqual({ ok: false, error: 'durable_control_timeout' });
+    });
+
+    it('rechecks once at the deadline so a commit in the last interval is reported as closed', async () => {
+      const h = harness(tick => { if (tick === 4) h.current.value = record('closed', 8, true); });
+      await expect(h.run()).resolves.toEqual({ ok: true, outcome: 'closed' });
+    });
+
+    it('answers closed when another path closed the Session before this operation committed', async () => {
+      const h = harness(tick => { if (tick === 4) h.current.value = record('closed', 8); });
+      await expect(h.run()).resolves.toEqual({ ok: true, outcome: 'closed', alreadyClosed: true });
+    });
+
+    it('does not claim progress for a Session that disappeared while waiting', async () => {
+      const h = harness(tick => { if (tick === 2) (h.current as { value: unknown }).value = undefined; });
+      await expect(h.run()).resolves.toEqual({ ok: false, error: 'durable_session_disappeared' });
+    });
+  });
 });

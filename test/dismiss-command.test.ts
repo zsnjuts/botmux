@@ -151,6 +151,7 @@ describe('dismissSessionGroup', () => {
     ['failed', peerReply(502, { ok: false, alreadyClosed: false, error: 'riff_cancel_failed' }), 'close_failed', 'riff_cancel_failed'],
     ['unknown', peerReply(200, { ok: true, outcome: 'closed', alreadyClosed: false, known: false }), 'close_failed', 'unknown'],
     ['residual', peerReply(200, { ok: true, outcome: 'closed_with_residual', residual: { reason: 'mojo_lineage_quarantined', taskId: 'peer-survivor' } }), 'residual', 'peer-survivor'],
+    ['still closing', peerReply(202, { ok: true, outcome: 'closing', pending: true, operationId: 'op-peer' }), 'close_failed', 'close_pending'],
   ])('keeps the resident and the group when a peer close is %s', async (_shape, reply, status, detail) => {
     h.peers = [peer('s2')];
     const state = await confirmation();

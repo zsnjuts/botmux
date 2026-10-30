@@ -18,7 +18,7 @@ import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLa
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
-import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
+import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual, parseClosePending } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -2645,9 +2645,11 @@ export async function handleCommand(
                 const body = await res.json().catch(() => undefined);
                 if (body?.archiveError) await sessionReply(rootId, `⚠️ Botmux 会话已关闭，Codex 归档失败：${body.archiveError}`);
                 const residual = res.ok ? parseCloseResidual(body) : undefined;
-                if (res.ok && !residual) closedSiblings++;
+                // 202 closing：已受理但会话仍在，不能当作已关闭去删 worktree。
+                const pending = res.ok && !!parseClosePending(body);
+                if (res.ok && !residual && !pending) closedSiblings++;
                 else {
-                  const reason = residual ? `residual=${describeCloseResidual(residual)}` : `http_${res.status}`;
+                  const reason = residual ? `residual=${describeCloseResidual(residual)}` : pending ? 'close_pending' : `http_${res.status}`;
                   logger.warn(`[${logTag}] sibling close ${sibling.sessionId} not fully closed: ${reason}`);
                   siblingCloseFailures.push(sibling.sessionId);
                 }

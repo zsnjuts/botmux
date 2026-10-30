@@ -4,7 +4,7 @@ import type { Session } from '../types.js';
 import type { DaemonSession } from './types.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
-import { describeCloseResidual, parseCloseResidual } from './close-residual.js';
+import { describeCloseResidual, parseCloseResidual, parseClosePending } from './close-residual.js';
 import { closeSession } from './worker-pool.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
@@ -75,6 +75,10 @@ async function closeOne(ownAppId: string, target: ChatSession): Promise<CloseFai
     return { kind: 'failed', reason: typeof body?.error === 'string' ? body.error : `http_${res.status}` };
   }
   if (body.known === false) return { kind: 'failed', reason: 'unknown_session' };
+  // Accepted but not yet committed: the session is still live, so disbanding
+  // now would not be a verified teardown. Fail this attempt; a retry after the
+  // close commits sees an ordinary closed result.
+  if (parseClosePending(body)) return { kind: 'failed', reason: 'close_pending' };
   const residual = parseCloseResidual(body);
   return residual ? { kind: 'residual', reason: describeCloseResidual(residual) } : undefined;
 }

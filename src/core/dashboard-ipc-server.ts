@@ -488,6 +488,8 @@ export type DurableSessionLifecycleResult =
       residual: { reason?: string; taskId?: string };
       alreadyClosed?: boolean;
     }
+  /** close 已持久入队但等待窗口内未提交；HTTP 202，调用方轮询会话状态。 */
+  | { ok: true; outcome: 'closing'; pending: true; operationId: string }
   | { ok: false; error: string };
 
 let durableSessionLifecycleHandler: ((
@@ -2591,7 +2593,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
         action: 'close',
         ...(typeof body.rootId === 'string' ? { rootId: body.rootId } : {}),
       });
-      return jsonRes(res, result.ok ? 200 : 409, result);
+      // 202 = 已受理、仍在关闭（远端 compute 删除 + 快照可能超过等待窗口）。
+      // 不能报 409：关闭稍后会成功，报失败会让 Dashboard / admin CLI 误导操作者。
+      const status = !result.ok ? 409 : 'pending' in result && result.pending ? 202 : 200;
+      return jsonRes(res, status, result);
     } catch (error) {
       return jsonRes(res, 503, {
         ok: false,
