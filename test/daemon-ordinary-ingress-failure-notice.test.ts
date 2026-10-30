@@ -3,6 +3,8 @@ import {
   __testOnly_handleDocComment,
   __testOnly_recordDurablePrimaryInputCommit,
   __testOnly_handleWorkerTurnInputRejected,
+  __testOnly_restoreRecoveredTurnOwner,
+  __testOnly_setActiveInteractiveTurn,
   __testOnly_submitDurablePrimaryRetryTurn,
 } from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
@@ -1526,6 +1528,74 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       admitted: false,
       retryReason: 'session has an unfinished turn',
     });
+  });
+
+  it('restores the owner of a turn re-adopted by a replacement worker, so a follow-up steers into it', async () => {
+    const anchor = 'om_thread_primary_recovered_turn_steer';
+    const turnId = 'om_primary_recovered_turn_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    // The previous owner started the turn and recorded its owner durably.
+    __testOnly_setActiveInteractiveTurn(ds, 'om_primary_active_owner', activeCaller);
+    expect(ds.session.activeTurnOwners).toEqual([
+      expect.objectContaining({ turnId: 'om_primary_active_owner', caller: activeCaller }),
+    ]);
+    // This daemon took the session over: the in-memory owner is gone.
+    ds.activeInteractiveTurn = undefined;
+    __testOnly_restoreRecoveredTurnOwner(ds, {
+      type: 'turn_input_committed',
+      turnId: 'om_primary_active_owner',
+      recoveredTurn: true,
+    });
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId: 'om_primary_active_owner',
+      caller: activeCaller,
+    });
+
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 4, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = vi.fn();
+    await handleThreadReply(makeEventData(turnId, 'also cover the edge case', anchor), ctx);
+
+    const submitted = workerSend.mock.calls.map(([message]) => message)
+      .find(message => message.type === 'message');
+    expect(submitted).toMatchObject({ turnId, activeTurnSteer: true, trustedCaller: activeCaller });
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('restores a recovered turn owner only from its own record and never over a live owner', () => {
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds } = seedActiveRemoteRunnerSession('om_thread_primary_owner_restore_guard', activeCaller);
+    const recovered = {
+      type: 'turn_input_committed' as const,
+      turnId: 'om_primary_active_owner',
+      recoveredTurn: true as const,
+    };
+    // No durable owner record for the turn: nothing to trust.
+    ds.activeInteractiveTurn = undefined;
+    ds.session.activeTurnOwners = [];
+    __testOnly_restoreRecoveredTurnOwner(ds, recovered);
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+
+    // A live owner is never replaced.
+    const other = { requestLarkAppId: APP, requestUserOpenId: 'ou_other_owner', senderType: 'user' as const };
+    ds.session.activeTurnOwners = [{ turnId: 'om_primary_active_owner', caller: other, recordedAt: NOW }];
+    ds.activeInteractiveTurn = { turnId: 'om_primary_active_owner', caller: activeCaller };
+    __testOnly_restoreRecoveredTurnOwner(ds, recovered);
+    expect(ds.activeInteractiveTurn.caller).toEqual(activeCaller);
+
+    // A steer acknowledgement is not the recovered turn.
+    ds.activeInteractiveTurn = undefined;
+    __testOnly_restoreRecoveredTurnOwner(ds, { ...recovered, activeTurnSteer: true });
+    expect(ds.activeInteractiveTurn).toBeUndefined();
   });
 
   it('keeps a different peer bot serial even when it explicitly requests @steer', async () => {

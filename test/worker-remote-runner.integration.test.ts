@@ -209,6 +209,8 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       turnId: 'om_turn_survived',
       dispatchAttempt: 8,
       durablePrimaryInbox: true,
+      // Lets the replacement daemon restore this turn's owner for steer.
+      recoveredTurn: true,
     }));
 
     writeFileSync(releaseRecoveredFinalPath, 'release\n');
