@@ -169,6 +169,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private stateCb: ((state: RemoteRunnerBackendState) => void) | null = null;
   private usageCb: ((usage: RemoteRunnerUsageReport) => void) | null = null;
   private accessUrlCb: ((url: string) => void) | null = null;
+  private startupProgressCb: ((stage: string) => void) | null = null;
 
   constructor(
     private readonly config: RemoteRunnerConfig,
@@ -496,6 +497,9 @@ export class RemoteRunnerBackend implements SessionBackend {
     this.usageCb = cb;
   }
   onAccessUrl(cb: (url: string) => void): void { this.accessUrlCb = cb; }
+  /** Display-only startup milestones (`startup_progress`), reported while a
+   * start/resume request or a not-yet-acknowledged turn is still preparing. */
+  onStartupProgress(cb: (stage: string) => void): void { this.startupProgressCb = cb; }
 
   captureCurrentScreen(): string { return this.terminalSnapshot || this.outputBuffer; }
   getPaneSize(): { cols: number; rows: number } | null {
@@ -770,6 +774,20 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     if (event.type === 'access_url') {
       this.accessUrlCb?.(event.url);
+      return;
+    }
+    if (event.type === 'startup_progress') {
+      // Display-only: a late or misdirected milestone is dropped rather than
+      // failing the protocol. It is honored only while startup is genuinely in
+      // progress — a start/resume request is pending, or the named turn has not
+      // received its busy acknowledgement yet.
+      const startupPending = event.turnId
+        ? event.turnId === this.activeTurnId && !this.activeTurnAccepted
+        : [...this.pendingRequests.values()].some(pending =>
+          pending.command.type === 'start' || pending.command.type === 'resume');
+      if (startupPending && this.providerCapabilities.has('startup_progress')) {
+        this.startupProgressCb?.(event.stage);
+      }
       return;
     }
     if (event.type === 'terminal_screen') {

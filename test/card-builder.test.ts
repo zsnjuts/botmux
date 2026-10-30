@@ -1229,6 +1229,40 @@ describe('buildStreamingCard', () => {
       });
     });
 
+    // Remote Runner 还在准备本轮（建沙箱、启动 CLI）：working 底下也显示「启动中 · 阶段」。
+    describe('remote startup stage label', () => {
+      const build = (status: 'starting' | 'working' | 'idle', label: unknown, locale?: 'en') => parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', status, 'claude-code', 'hidden',
+        undefined, undefined, false, false, locale, undefined, undefined, false,
+        undefined, undefined, undefined, label as any,
+      ));
+
+      it('shows the stage instead of 工作中 and keeps the starting colour', () => {
+        for (const status of ['starting', 'working'] as const) {
+          const card = build(status, { startupStage: 'sandbox_create' });
+          expect(card.header.title.content).toContain('启动中 · 正在创建沙箱');
+          expect(card.header.title.content).not.toContain('工作中');
+          expect(card.header.template).toBe('yellow');
+        }
+        expect(build('working', { startupStage: 'cli_start' }).header.title.content).toContain('启动中 · 正在启动远端 CLI');
+        expect(build('working', { startupStage: 'sandbox_resume' }, 'en').header.title.content)
+          .toContain('Starting · resuming the sandbox');
+      });
+
+      it('falls back to the generic starting label for an unknown stage', () => {
+        const card = build('working', { startupStage: 'provider_future_stage' });
+        expect(card.header.title.content).toContain('启动中…');
+        expect(card.header.title.content).not.toContain('provider_future_stage');
+      });
+
+      it('is inert once the turn settles', () => {
+        const idle = build('idle', { startupStage: 'cli_start' });
+        expect(idle.header.title.content).toContain('等待输入');
+        expect(idle.header.title.content).not.toContain('启动中');
+        expect(idle.header.template).toBe('green');
+      });
+    });
+
     // 冻结卡回读：新字段 idleLabel 优先；旧盘只有 silentIdle:true 仍按 silent 渲染。
     it('frozenIdleLabel: idleLabel wins, legacy silentIdle maps to silent, neither → undefined', () => {
       expect(frozenIdleLabel({ idleLabel: 'completed' })).toBe('completed');

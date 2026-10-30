@@ -58,6 +58,13 @@ export const messages: Record<string, string> = {
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
+  'card.status.starting_stage': 'Starting · {stage}',
+  'card.startup_stage.sandbox_check': 'checking the sandbox',
+  'card.startup_stage.sandbox_resume': 'resuming the sandbox',
+  'card.startup_stage.sandbox_create': 'creating the sandbox',
+  'card.startup_stage.sandbox_init': 'initializing the sandbox',
+  'card.startup_stage.tools_prepare': 'preparing tool identities',
+  'card.startup_stage.cli_start': 'starting the remote CLI',
   'card.status.working': 'Working',
   'card.status.idle': 'Awaiting input',
   'card.status.idle_silent': '✓ Turn ended (AI determined no reply was needed) · Awaiting input',

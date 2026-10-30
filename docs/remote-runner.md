@@ -88,6 +88,15 @@ steer 成功只提交 `steerId` 的输入收据，不创建第二个 final owner
 
 用户显式 `/queue <正文>` 永远作为当前 turn 之后的独立新轮，不设置 `activeTurnSteer`；用户显式 `/stop` 仍走终端控制通道。provider 声明 `terminal_input` 后 Remote Runner 才支持 `/stop`，否则回复不支持；provider 可以把该能力收窄为只接受当前 generation active turn 的 Ctrl-C。provider 确认该轮因用户中断而结束时应发送 `status: cancelled` 的关联 `failure`；Host 只用它结算 turn 生命周期，不把其中的诊断文案再次投递成 `final_output`，停止命令或控制卡的原回执继续负责用户可见反馈。
 
+### 可选启动进度
+
+BotMux 在 hello 的 `optionalCapabilities` 里列出 `startup_progress`。provider hello 也声明它之后，可以在启动还没完成时发送只用于展示的 `startup_progress` 事件：`{"type":"startup_progress","stage":"sandbox_create"}`，turn 准备期间再带上该 turn 的 `turnId`。
+
+- `stage` 是协议枚举，文案由 BotMux 负责：`sandbox_check`、`sandbox_resume`、`sandbox_create`、`sandbox_init`、`tools_prepare`、`cli_start`。较新 provider 的未知阶段（小写字母、数字、下划线，最长 48 个字符）照常解析，卡片显示通用的「启动中…」；任意文本不会进入卡片。
+- 只在两个时间窗里生效：start / resume 请求还在等 `ready`，或带 `turnId` 的 turn 还没收到 `status: busy`。窗口外、turnId 不匹配或 provider 未声明该能力的事件直接丢弃，不判协议错误。
+- 它不是就绪或准入信号。worker 把输入交给 provider 后就报「工作中」，而 provider 可能还在建沙箱、启动 CLI；有启动阶段时卡头显示「启动中 · 正在创建沙箱」等，provider 回 busy 后恢复「工作中」。
+- provider 不声明该能力、或旧 BotMux 不请求时，双方都不发也不处理，行为与之前一致。
+
 ### 可选远端终端
 
 provider 可以额外声明三项通用终端能力：

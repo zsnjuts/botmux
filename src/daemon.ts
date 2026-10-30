@@ -6069,6 +6069,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // baked into the frozen card above; live cards return to normal labels.
   ds.messageListenerCompletedTurnId = undefined;
   ds.silentIdleTurnId = undefined;
+  ds.remoteStartupStage = undefined;
   ds.completedIdleTurnId = undefined;
   ds.failedIdleTurnId = undefined;
   // Lineage anchor for the deliberate-silence label: a turn_terminal that lands
@@ -28297,6 +28298,7 @@ async function handleThreadReplyAdmitted(
     // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
     ds.messageListenerCompletedTurnId = undefined;
     ds.silentIdleTurnId = undefined;
+    ds.remoteStartupStage = undefined;
     ds.completedIdleTurnId = undefined;
     ds.failedIdleTurnId = undefined;
     ds.currentTurnId = parsed.messageId;
@@ -29807,6 +29809,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       // see the Lark-message re-fork branch above.
       ds.messageListenerCompletedTurnId = undefined;
       ds.silentIdleTurnId = undefined;
+      ds.remoteStartupStage = undefined;
       ds.completedIdleTurnId = undefined;
       ds.failedIdleTurnId = undefined;
       ds.currentTurnId = turnId;

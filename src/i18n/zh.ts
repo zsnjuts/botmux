@@ -61,6 +61,13 @@ export const messages: Record<string, string> = {
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': '启动中…',
+  'card.status.starting_stage': '启动中 · {stage}',
+  'card.startup_stage.sandbox_check': '正在检查沙箱',
+  'card.startup_stage.sandbox_resume': '正在唤醒沙箱',
+  'card.startup_stage.sandbox_create': '正在创建沙箱',
+  'card.startup_stage.sandbox_init': '正在初始化沙箱',
+  'card.startup_stage.tools_prepare': '正在准备工具身份',
+  'card.startup_stage.cli_start': '正在启动远端 CLI',
   'card.status.working': '工作中',
   'card.status.idle': '等待输入',
   'card.status.idle_silent': '✓ 本轮已结束（AI 判断无需回复） · 等待输入',

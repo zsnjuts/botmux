@@ -56,6 +56,25 @@ describe('remote runner protocol', () => {
     })).toBeUndefined();
   });
 
+  it('parses display-only startup milestones with an optional turn id', () => {
+    const line = (event: Record<string, unknown>) => JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION, type: 'startup_progress', ...event,
+    });
+    expect(parseRemoteRunnerEventLine(line({ stage: 'sandbox_create' })))
+      .toEqual(expect.objectContaining({ type: 'startup_progress', stage: 'sandbox_create' }));
+    expect(parseRemoteRunnerEventLine(line({ stage: 'cli_start', turnId: 'turn-1' })))
+      .toEqual(expect.objectContaining({ type: 'startup_progress', stage: 'cli_start', turnId: 'turn-1' }));
+    // A newer provider's stage stays parseable; the host renders it generically.
+    expect(parseRemoteRunnerEventLine(line({ stage: 'provider_future_stage' })))
+      .toEqual(expect.objectContaining({ stage: 'provider_future_stage' }));
+    // Free text never reaches the card.
+    expect(parseRemoteRunnerEventLine(line({ stage: '正在创建沙箱' }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(line({ stage: 'Sandbox Create' }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(line({ stage: 'x'.repeat(49) }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(line({}))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(line({ stage: 'cli_start', turnId: '' }))).toBeUndefined();
+  });
+
   it('keeps event types closed while accepting additive provider capabilities', () => {
     const event = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,

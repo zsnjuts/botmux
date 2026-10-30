@@ -23115,8 +23115,32 @@ async function spawnCli(
     if (backend !== observedBackend) return;
     send({ type: 'remote_usage', usage });
   });
+  // Remote Runner startup milestones (sandbox create, CLI start, …) relabel the
+  // daemon's card while the turn is still preparing; the busy acknowledgement
+  // clears the label so the card says 「工作中」 only once the prompt is in.
+  let remoteStartupStageShown = false;
+  backend.onStartupProgress?.((stage) => {
+    if (backend !== observedBackend) return;
+    remoteStartupStageShown = true;
+    log(`Remote runner startup stage: ${stage}`);
+    send({
+      type: 'remote_startup_progress',
+      stage,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+  });
   backend.onActiveTurnAccepted?.(() => {
     if (backend !== observedBackend) return;
+    if (remoteStartupStageShown) {
+      remoteStartupStageShown = false;
+      send({
+        type: 'remote_startup_progress',
+        stage: null,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
+    }
     if (pendingMessages[0]?.activeTurnSteer === true) void flushPending();
   });
   backend.onReady?.(() => {

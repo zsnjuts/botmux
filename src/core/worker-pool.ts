@@ -1494,6 +1494,16 @@ function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
   scheduleActiveRuntimePatch(ds);
 }
 
+/** Re-render the live card after a Remote Runner startup stage change. The
+ * revision bump makes a starting-card POST still in flight reconcile once it
+ * lands; an already-posted card is patched now (fenced to `turnId`). */
+function scheduleRemoteStartupStagePatch(ds: DaemonSession, turnId: string | undefined): void {
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) return;
+  if (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce) return;
+  bumpStreamCardStatusRevision(ds);
+  reconcilePostedStartingCard(ds, turnId, -1);
+}
+
 /** Card-label flag for a turn that completed as DELIBERATE silence (worker
  *  terminal outputDisposition 'nothing_to_send'): every live-card rebuild —
  *  status edges, button toggles, runtime/tier patches — must keep rendering
@@ -1515,10 +1525,17 @@ export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
   return undefined;
 }
 
-/** 活卡卡头标签（重建活卡的 buildStreamingCard 调用点统一从这里取）：主回合已结束
- *  但仍有后台子任务在跑时为「后台子任务运行中（N）」，盖过 idle 标签；否则同
- *  {@link idleCardLabel}。冻结卡不用它——后台计数只描述当下。 */
+/** 活卡卡头标签（重建活卡的 buildStreamingCard 调用点统一从这里取）：Remote Runner
+ *  还在准备本轮时为启动阶段（`remoteStartupStage`）；主回合已结束但仍有后台子任务
+ *  在跑时为「后台子任务运行中（N）」，盖过 idle 标签；否则同 {@link idleCardLabel}。
+ *  冻结卡不用它——启动阶段和后台计数都只描述当下。 */
 export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
+  const startup = ds.remoteStartupStage;
+  if (startup
+      && (ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'starting' || ds.lastScreenStatus === 'working')
+      && (!startup.turnId || !ds.currentTurnId || startup.turnId === ds.currentTurnId)) {
+    return { startupStage: startup.stage };
+  }
   if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
     return { backgroundTasks: ds.backgroundTaskCount };
   }
@@ -15613,6 +15630,7 @@ function setupWorkerHandlers(
     const postingRuntimeKey = activeSessionKey(ds);
     const postingGeneration = ds.streamCardTurnGeneration ?? 0;
     const previousNonce = ds.streamCardNonce;
+    const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
     const cardReplyTarget = captureStreamingCardReplyTarget(ds, turnId);
     const nonce = randomBytes(4).toString('hex');
     const cardJson = buildStreamingCard(
@@ -15716,6 +15734,10 @@ function setupWorkerHandlers(
         // The generation already ended while the card was posting.
         if (startupState.failureSurfaced) markPreReadyCardFailed();
         if (preReadyStartingCards.get(ds) === card) preReadyStartingCards.delete(ds);
+      } else {
+        // Still starting: a startup stage reported during the POST is not on
+        // the card that just landed.
+        reconcilePostedStartingCard(ds, turnId, statusRevisionAtPost);
       }
       return true;
     } catch (err) {
@@ -16926,6 +16948,7 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        if (ds.lastScreenStatus !== 'working') ds.remoteStartupStage = undefined;
         ds.backgroundTaskCount = (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
@@ -18084,6 +18107,21 @@ function setupWorkerHandlers(
         // the cause; the process exit itself is handled by the exit handler.
         logger.error(`[${t}] Worker fatal: ${msg.message}`);
         stderrRing.pushMarker(msg.message);
+        break;
+      }
+
+      case 'remote_startup_progress': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        if (msg.stage === null) {
+          if (!ds.remoteStartupStage) break;
+          ds.remoteStartupStage = undefined;
+        } else {
+          if (ds.remoteStartupStage?.stage === msg.stage && ds.remoteStartupStage.turnId === msg.turnId) break;
+          ds.remoteStartupStage = { stage: msg.stage, ...(msg.turnId ? { turnId: msg.turnId } : {}) };
+        }
+        logger.info(`[${t}] Remote runner startup stage: ${msg.stage ?? 'turn accepted'}`);
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        scheduleRemoteStartupStagePatch(ds, msg.turnId ?? startupState.initTurnId);
         break;
       }
 
