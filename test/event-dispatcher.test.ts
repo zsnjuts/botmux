@@ -13014,6 +13014,23 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     }));
   });
 
+  // <p> 段落形态下命令同样排在 @ 之前：位置判定要先解包，否则 `<p>/solve …`
+  // 不以 `/` 开头，命令自带的 @ 参数会被当成「先点名别人」而让路。
+  it('still fires for a rich-text <p> body whose @mention comes after the command', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = fire('<p>/solve @_user_1 看看这个</p>', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      commandTrigger: expect.objectContaining({ cmd: '/solve' }),
+    }));
+  });
+
   // 参数原样带上 @名字 交给 daemon 渲染模板 —— 否则命令收到的是被吃掉 @ 的半句话。
   it('keeps the trailing mention in the args handed to the daemon', async () => {
     setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '处理：{args}' }] });

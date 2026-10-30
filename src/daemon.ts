@@ -214,6 +214,7 @@ import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './servi
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
 import { resolvePricingConfig } from './services/model-pricing.js';
 import { createImgNumberer, extractPostAtParticipants, isPlaceholderOnlyText, mentionAppId, mentionOpenId, messageMentionsBot, parseApiMessage, parseEventMessage, resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { isExactTextCloseCommand } from './im/lark/exact-close-command.js';
 import {
   getGroupContextSettings,
   groupContextSettingsStorePath,
@@ -28909,23 +28910,7 @@ function isExactDurableCloseCommand(
     if (content === '/close') return true;
     return isExactInteractiveCloseContent(content, selfMentionNames);
   }
-  if (message?.message_type !== 'text') return false;
-  let body: unknown;
-  try { body = JSON.parse(message.content ?? '{}'); } catch { return false; }
-  if (!body || typeof body !== 'object' || typeof (body as { text?: unknown }).text !== 'string') {
-    return false;
-  }
-  const bot = getBot(larkAppId);
-  let text = (body as { text: string }).text;
-  const mentions = Array.isArray(message.mentions) ? message.mentions : [];
-  for (const mention of mentions) {
-    const self = (!!bot.botOpenId && mentionOpenId(mention) === bot.botOpenId)
-      || mentionAppId(mention) === larkAppId;
-    const key = typeof mention?.key === 'string' ? mention.key : '';
-    if (!self || !key) continue;
-    text = text.split(key).join('');
-  }
-  return text.trim().toLowerCase() === '/close';
+  return isExactTextCloseCommand(message, { larkAppId, botOpenId: getBot(larkAppId).botOpenId });
 }
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {

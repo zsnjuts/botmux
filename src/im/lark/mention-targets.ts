@@ -13,7 +13,7 @@
  * 从 grant-command.ts 提炼泛化（2026-07 /invite 落地时）；grant 的对外导出
  * （parseGrantTargets / isGrantTargetOnly / stripAllMentions）保持原样委托到这里。
  */
-import { mentionIdentity, resolvePostAtIdentity } from './message-parser.js';
+import { mentionIdentity, resolvePostAtIdentity, unwrapRichTextParagraphs } from './message-parser.js';
 
 /** 命令正则必须带 `\b` 边界、不带 g 标志（exec/index 语义依赖）。 */
 export type CommandPattern = RegExp;
@@ -151,7 +151,7 @@ function parsePostAtMentions(message: any, botOpenId: string | undefined, cmdPat
  *
  * 两种消息形态的位置信息藏在不同地方，必须分开判（与 isCommandTargetOnly 同款）：
  *  - text：mention 以 `@_user_N` 占位符内联在正文里，字符位置即先后，正文
- *    trimStart 后以 `/` 开头就说明命令在最前。
+ *    （解包 `<p>` 段落后）trimStart 以 `/` 开头就说明命令在最前。
  *  - post：@ 是独立的 `at` 节点，**根本不在 text 里** —— 拼接出来的正文天然以命令
  *    开头，只看字符串会把「前导 @」误判成「命令在最前」，让路语义在富文本下失效。
  *    所以按文档节点顺序比较首个 `at` 与首个以 `/` 开头的 text 节点。
@@ -163,7 +163,9 @@ export function commandPrecedesMentions(message: any): boolean {
   let content: any;
   try { content = JSON.parse(message?.content ?? '{}'); } catch { return false; }
 
-  if (typeof content?.text === 'string') return /^\s*\//.test(content.text);
+  // 富文本编辑器的 <p> 段落形态先解包（与解析层同源），否则 `<p>/cmd …</p>`
+  // 永远不以 `/` 开头，命令在前也会被当成「先点名再下命令」。
+  if (typeof content?.text === 'string') return /^\s*\//.test(unwrapRichTextParagraphs(content.text));
 
   const inner = content?.zh_cn ?? content?.en_us ?? content;
   if (Array.isArray(inner?.content)) {
