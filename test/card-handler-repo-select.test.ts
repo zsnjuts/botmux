@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/card-handler-repo-select.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, onTestFinished, vi } from 'vitest';
 
 // ─── Mocks (before importing the module under test) ───────────────────────
 
@@ -96,6 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   writableTerminalLinkFor: vi.fn(() => 'http://term'),
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: vi.fn(),
+  sessionSupportsWebTerminal: vi.fn(() => true),
   deliverEphemeralOrReply: vi.fn(),
   closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock,
@@ -186,9 +187,11 @@ import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { setDefaultControlAuditSinkForTest, type ControlAuditRecord } from '../src/dashboard/control-audit.js';
+import { verifyWriteLinkIssuance } from '../src/core/terminal-write-link-issuance.js';
 import {
   __testOnly_resetBotTurnMutationGates,
   withBotTurnMutation,
@@ -2275,6 +2278,106 @@ describe('repo select card — worktree open', () => {
     expect(res?.toast?.type).toBe('warning');
     expect(res?.toast?.content).toContain('没有操作权限');
     expect(vi.mocked(deliverWriteLinkCard)).not.toHaveBeenCalled(); // 门控就拦下，未投递
+  });
+
+  it('get_write_link：会话发起人不是 operator 也能拿到自己会话的操作链接', async () => {
+    const ds = makeDs({ workerToken: 'tok' } as Partial<DaemonSession>);
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValue(false);
+    onTestFinished(() => { vi.mocked(canOperate).mockReturnValue(true); });
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+
+    const res = await handleCardAction({
+      operator: { open_id: OWNER },
+      action: { value: { action: 'get_write_link', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('success');
+    expect(vi.mocked(deliverWriteLinkCard)).toHaveBeenCalledWith(ds, OWNER, expect.any(String));
+  });
+
+  it('get_write_link：链接带签名的领取人，审计记下谁领了链接', async () => {
+    const ds = makeDs({ workerToken: 'tok' } as Partial<DaemonSession>);
+    const { deps } = makeDeps(ds);
+    const secretDir = join(homedir(), '.botmux');
+    mkdirSync(secretDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(secretDir, '.dashboard-secret'), 'test-secret\n', { mode: 0o600 });
+    onTestFinished(() => rmSync(join(secretDir, '.dashboard-secret'), { force: true }));
+    const records: ControlAuditRecord[] = [];
+    setDefaultControlAuditSinkForTest({ append: record => records.push(record) });
+    onTestFinished(() => setDefaultControlAuditSinkForTest(undefined));
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+
+    const res = await handleCardAction({
+      operator: { open_id: OWNER },
+      action: { value: { action: 'get_write_link', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('success');
+    const cardJson = vi.mocked(deliverWriteLinkCard).mock.calls.at(-1)![2] as string;
+    const link = new URL(/https?:\/\/[^"\s]*token=tok[^"\s]*/.exec(cardJson)![0]);
+    expect(link.searchParams.get('token')).toBe('tok');
+    expect(verifyWriteLinkIssuance('test-secret', ds.session.sessionId, link.searchParams.get('issuedTo')))
+      .toBe(OWNER);
+    expect(records).toEqual([expect.objectContaining({
+      user: OWNER,
+      session: ds.session.sessionId,
+      action: 'terminal.write_link_issued',
+    })]);
+    expect(JSON.stringify(records)).not.toContain('tok');
+  });
+
+  it('get_write_link：被拉黑的会话发起人仍然拿不到操作链接', async () => {
+    const ds = makeDs({ workerToken: 'tok' } as Partial<DaemonSession>);
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValue(false);
+    onTestFinished(() => { vi.mocked(canOperate).mockReturnValue(true); });
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [OWNER],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+
+    const res = await handleCardAction({
+      operator: { open_id: OWNER },
+      action: { value: { action: 'get_write_link', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('warning');
+    expect(vi.mocked(deliverWriteLinkCard)).not.toHaveBeenCalled();
+  });
+
+  it('会话发起人例外只放行 get_write_link，close 等管理动作仍静默拦下', async () => {
+    const ds = makeDs();
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValue(false);
+    onTestFinished(() => { vi.mocked(canOperate).mockReturnValue(true); });
+
+    const res = await handleCardAction({
+      operator: { open_id: OWNER },
+      action: { value: { action: 'close', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res).toBeUndefined();
+    expect(closeWorkerPoolSession).not.toHaveBeenCalled();
   });
 
   it('rolls back already-created worktrees when a later repo in the batch fails', async () => {
