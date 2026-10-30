@@ -208,9 +208,9 @@ const CHAT = 'oc_ingress_notice_chat';
 const OWNER = 'ou_owner';
 const NOW = new Date().toISOString();
 
-function makeEventData(messageId: string, text: string, rootId?: string): any {
+function makeEventData(messageId: string, text: string, rootId?: string, senderOpenId = OWNER): any {
   return {
-    sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+    sender: { sender_id: { open_id: senderOpenId }, sender_type: 'user' },
     message: {
       message_id: messageId,
       root_id: rootId,
@@ -1458,6 +1458,68 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       makeBotEventData(turnId, 'ordinary bot follow-up', anchor),
       ctx,
     );
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
+  it('steers another human\'s follow-up into the turn as the turn\'s owner', async () => {
+    const helper = 'ou_steering_helper';
+    const bot = getBot(APP);
+    bot.config.allowedUsers = [OWNER, helper];
+    bot.resolvedAllowedUsers = [OWNER, helper];
+    const anchor = 'om_thread_primary_active_other_human_steer';
+    const turnId = 'om_primary_active_other_human_steer_follow_up';
+    const activeCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, activeCaller);
+    ds.activeInteractiveTurn.controller = undefined;
+    const queuePostAdmissionOutput = vi.fn();
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 4, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+
+    await handleThreadReply(makeEventData(turnId, 'also cover the edge case', anchor, helper), ctx);
+
+    const submitted = workerSend.mock.calls.map(([message]) => message)
+      .find(message => message.type === 'message');
+    // The steer runs under the turn owner's identity, not a second one.
+    expect(submitted).toMatchObject({ turnId, activeTurnSteer: true, trustedCaller: activeCaller });
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId: 'om_primary_active_owner',
+      caller: activeCaller,
+    });
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+    // The notice still names whoever steered.
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: `<at user_id="${helper}"></at> 收到，引导成功`,
+    }));
+  });
+
+  it('keeps a human follow-up serial behind a bot-owned turn', async () => {
+    const bot = getBot(APP);
+    bot.config.allowedUsers = [OWNER, 'ou_proposer_bot'];
+    bot.resolvedAllowedUsers = [OWNER, 'ou_proposer_bot'];
+    const anchor = 'om_thread_primary_active_bot_owned';
+    const turnId = 'om_primary_active_bot_owned_follow_up';
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(anchor, {
+      requestLarkAppId: APP,
+      requestUserOpenId: 'ou_active_peer_bot',
+      requestUserUnionId: 'on_active_peer_bot',
+      senderType: 'bot' as const,
+    });
+    ds.activeInteractiveTurn.controller = undefined;
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 4, signal: new AbortController().signal };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'take this over', anchor), ctx);
 
     expect(workerSend).not.toHaveBeenCalled();
     expect(ctx.ingressAdmission).toEqual({

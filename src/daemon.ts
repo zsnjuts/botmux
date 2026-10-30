@@ -23571,14 +23571,17 @@ function durablePrimaryTurnDisposition(
 }
 
 /** A Remote Runner steer needs the live provider to have negotiated
- * `turn_steer` (reported by this worker's active_turn_controls) and may only inherit
- * the exact active principal. Without it the follow-up keeps waiting for the
- * active turn, as before. */
-function durablePrimaryActiveTurnSteerAuthorized(
+ * `turn_steer` (reported by this worker's active_turn_controls). The active
+ * principal steers as itself. Another authenticated human of the same bot may
+ * steer an interactive human turn too, like typing into the owner's terminal:
+ * the steer runs as the turn's owner (the returned caller), never as a second
+ * identity inside one turn. Without authority the follow-up keeps waiting for
+ * the active turn, as before. */
+function durablePrimaryActiveTurnSteerCaller(
   ds: DaemonSession,
   caller: TrustedCaller | undefined,
   opts: { explicitBotSteer?: boolean } = {},
-): boolean {
+): TrustedCaller | undefined {
   const active = ds.activeInteractiveTurn;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   // Match the existing single-machine steer contract: an authenticated human
@@ -23587,15 +23590,31 @@ function durablePrimaryActiveTurnSteerAuthorized(
   // caller/audit tuple; the directive never borrows its configured human owner.
   const callerRequestedSteer = caller?.senderType === 'user'
     || (caller?.senderType === 'bot' && opts.explicitBotSteer === true);
-  return backendType === 'remote-runner'
-    && !!ds.worker
-    && ds.activeTurnControls?.worker === ds.worker
-    && ds.activeTurnControls.steer
-    && callerRequestedSteer
-    && !!active
-    && activeTurnInputCommitted(ds, active.turnId)
-    && (sameTrustedPrincipal(active.caller, caller)
-      || sameTrustedPrincipal(active.controller, caller));
+  if (backendType !== 'remote-runner'
+    || !caller
+    || !ds.worker
+    || ds.activeTurnControls?.worker !== ds.worker
+    || !ds.activeTurnControls.steer
+    || !callerRequestedSteer
+    || !active
+    || !activeTurnInputCommitted(ds, active.turnId)) {
+    return undefined;
+  }
+  if (sameTrustedPrincipal(active.caller, caller)
+    || sameTrustedPrincipal(active.controller, caller)) {
+    return caller;
+  }
+  // The XPI switch owns cross-principal follow-ups when it is on (the owner
+  // approves them); a bot or a schedule turn is never borrowed.
+  const owner = active.caller;
+  return !config.crossPrincipalInterruption
+    && caller.senderType === 'user'
+    && (caller.source ?? 'interactive') === 'interactive'
+    && owner?.senderType === 'user'
+    && (owner.source ?? 'interactive') === 'interactive'
+    && owner.requestLarkAppId === caller.requestLarkAppId
+    ? owner
+    : undefined;
 }
 
 function retryDurablePrimaryIngress(ctx: RoutingContext, reason: string): boolean {
@@ -27018,6 +27037,9 @@ async function handleThreadReplyAdmitted(
 
   let ds = activeSessions.get(runtimeSessionKey);
   let durablePrimaryActiveTurnSteer = false;
+  // Who the steer runs as: the sender, or the active turn's owner when someone
+  // else steers it. The accepted notice still @-mentions the sender.
+  let steerTrustedCaller: TrustedCaller | undefined;
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
@@ -27031,11 +27053,12 @@ async function handleThreadReplyAdmitted(
   // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
   // retry must be a pure claim-state transition.
   if (ds && ctx.durablePrimaryDispatch) {
-    durablePrimaryActiveTurnSteer = durablePrimaryActiveTurnSteerAuthorized(
+    steerTrustedCaller = durablePrimaryActiveTurnSteerCaller(
       ds,
       threadTrustedCaller,
       { explicitBotSteer: botSteerDirective.requested },
-    )
+    );
+    durablePrimaryActiveTurnSteer = !!steerTrustedCaller
       && !ds.adoptedFrom
       && !ds.initConfig?.adoptMode
       && !ds.session.principalLane
@@ -28091,7 +28114,9 @@ async function handleThreadReplyAdmitted(
           ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(durablePrimaryActiveTurnSteer ? { activeTurnSteer: true as const } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
-          ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+          ...(durablePrimaryActiveTurnSteer && steerTrustedCaller
+            ? { trustedCaller: steerTrustedCaller }
+            : threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
         });
       // Record the input as the session's last real CLI turn ONLY after the
       // worker accepted it. Recording before delivery (the old order) persisted
