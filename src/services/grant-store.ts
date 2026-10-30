@@ -212,6 +212,125 @@ export async function removeGlobalGrant(
   return { ok: true, removed: r.result.removed };
 }
 
+// ─── 批量全局对话授权（管理员 infrabuddy grants）──────────────────────────────
+// 一批人在**一次** RMW / CAS 里写完：几百人不会产生几百次 CAS 写，也不会把只保留
+// 64 条的 CAS 审计环冲掉。语义与单条 addGlobalGrant 一致（talk-only，不碰 allowedUsers），
+// 但对已在名单里的人是幂等的：额度上限、有效期都没变就不动它，不会把已用额度清零。
+
+export type GlobalGrantChange = 'created' | 'updated' | 'unchanged';
+
+/** 一条全局授权的现状：是否在名单、额度上限（无记录 = 不限）、到期时间（无记录 = 永久）。 */
+export function globalGrantState(o: any, openId: string): { granted: boolean; quotaLimit?: number; expiresAt?: number } {
+  const qk = globalQuotaKey(openId);
+  const quota = getQuotaMap(o)?.[qk];
+  const expiry = getExpiryMap(o)?.[qk];
+  return {
+    granted: Array.isArray(o.globalGrants) && o.globalGrants.includes(openId),
+    ...(typeof quota?.limit === 'number' ? { quotaLimit: quota.limit } : {}),
+    ...(typeof expiry?.expiresAt === 'number' ? { expiresAt: expiry.expiresAt } : {}),
+  };
+}
+
+function normalizeQuota(quota: number | undefined): number | undefined {
+  return quota !== undefined && quota > 0 ? quota : undefined;
+}
+function normalizeExpiresAt(expiresAt: number | undefined): number | undefined {
+  return typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined;
+}
+
+/** 目标授权相对现状的变化。已在名单时只比较额度上限与有效期，不看已用额度。 */
+export function classifyGlobalGrant(
+  o: any, openId: string, quota: number | undefined, expiresAt: number | undefined,
+): GlobalGrantChange {
+  const cur = globalGrantState(o, openId);
+  if (!cur.granted) return 'created';
+  return cur.quotaLimit === normalizeQuota(quota) && cur.expiresAt === normalizeExpiresAt(expiresAt)
+    ? 'unchanged'
+    : 'updated';
+}
+
+/** 把一批全局授权套到 entry 上（磁盘快照或内存 config 同形），返回每人的变化。 */
+function applyGlobalGrants(
+  o: any, openIds: readonly string[], quota: number | undefined, expiresAt: number | undefined,
+): Record<string, GlobalGrantChange> {
+  const changes: Record<string, GlobalGrantChange> = {};
+  const wantQuota = normalizeQuota(quota);
+  const wantExpiry = normalizeExpiresAt(expiresAt);
+  const list: string[] = Array.isArray(o.globalGrants) ? [...o.globalGrants] : [];
+  let listChanged = false;
+  for (const openId of openIds) {
+    const change = classifyGlobalGrant(o, openId, wantQuota, wantExpiry);
+    changes[openId] = change;
+    if (change === 'unchanged') continue;
+    const cur = globalGrantState(o, openId);
+    if (change === 'created') { list.push(openId); listChanged = true; }
+    const qk = globalQuotaKey(openId);
+    // 只改真正变了的那一项：延长有效期不清零已用额度，改额度也不动有效期。
+    if (change === 'created' || cur.quotaLimit !== wantQuota) applyGrantQuota(o, qk, wantQuota);
+    if (change === 'created' || cur.expiresAt !== wantExpiry) applyGrantExpiry(o, qk, wantExpiry);
+  }
+  if (listChanged) o.globalGrants = list;
+  return changes;
+}
+
+/**
+ * 批量全局对话授权：一次 RMW 写入整批 open_id（调用方须保证都是**本 bot 应用**下的 open_id）。
+ * quota 缺省 = 不限，expiresAt 缺省 = 永久。
+ */
+export async function addGlobalGrants(
+  larkAppId: string, openIds: readonly string[], opts: { quota?: number; expiresAt?: number } = {},
+): Promise<{ ok: true; changes: Record<string, GlobalGrantChange> } | Fail> {
+  let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const ids = [...new Set(openIds)];
+  if (ids.length === 0) return { ok: true, changes: {} };
+  const r = await rmwBotEntry<Record<string, GlobalGrantChange>>(larkAppId, (entry) => {
+    const changes = applyGlobalGrants(entry, ids, opts.quota, opts.expiresAt);
+    return { write: Object.values(changes).some(c => c !== 'unchanged'), result: changes };
+  });
+  if (!r.ok) return r;
+  // 按磁盘侧已写入的那批同步内存（只同步非 unchanged 的人）。
+  const written = ids.filter(id => r.result[id] !== 'unchanged');
+  applyGlobalGrants(bot.config, written, opts.quota, opts.expiresAt);
+  const count = (c: GlobalGrantChange) => ids.filter(id => r.result[id] === c).length;
+  logger.info(`[grant:${larkAppId}] +global batch created=${count('created')} updated=${count('updated')} unchanged=${count('unchanged')}`
+    + `${opts.quota ? ` quota=${opts.quota}` : ''}${opts.expiresAt ? ` expiresAt=${opts.expiresAt}` : ''}`);
+  return { ok: true, changes: r.result };
+}
+
+/** 批量撤销全局对话授权（连同额度、有效期记录）；不碰 allowedUsers 与按群授权。 */
+export async function removeGlobalGrants(
+  larkAppId: string, openIds: readonly string[],
+): Promise<{ ok: true; removed: string[]; absent: string[] } | Fail> {
+  let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const ids = [...new Set(openIds)];
+  if (ids.length === 0) return { ok: true, removed: [], absent: [] };
+  const strip = (o: any): { removed: string[]; changed: boolean } => {
+    const list: string[] = Array.isArray(o.globalGrants) ? o.globalGrants : [];
+    const removed = ids.filter(id => list.includes(id));
+    let changed = false;
+    if (removed.length > 0) {
+      const next = list.filter(id => !removed.includes(id));
+      if (next.length > 0) o.globalGrants = next; else delete o.globalGrants;
+      changed = true;
+    }
+    for (const id of ids) {
+      const qk = globalQuotaKey(id);
+      if (setQuotaRecord(o, qk, null)) changed = true;
+      if (setExpiryRecord(o, qk, null)) changed = true;
+    }
+    return { removed, changed };
+  };
+  const r = await rmwBotEntry<string[]>(larkAppId, (entry) => {
+    const { removed, changed } = strip(entry);
+    return { write: changed, result: removed };
+  });
+  if (!r.ok) return r;
+  strip(bot.config);
+  const absent = ids.filter(id => !r.result.includes(id));
+  logger.info(`[grant:${larkAppId}] -global batch removed=${r.result.length} absent=${absent.length}`);
+  return { ok: true, removed: r.result, absent };
+}
+
 /**
  * 仅当磁盘中的过期时间仍等于观察值且确已到期时回收，避免异步清理误删刚续期的授权。
  */
