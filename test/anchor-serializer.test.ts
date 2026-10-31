@@ -11,7 +11,7 @@
  * Run: pnpm vitest run test/anchor-serializer.test.ts
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { serializeByAnchor, __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
+import { serializeByAnchor, serializeByOrderingKey, __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 
 const delayPush = (order: string[], label: string, ms: number) => () =>
   new Promise<void>(resolve => {
@@ -122,5 +122,69 @@ describe('serializeByAnchor — wait cap (head-of-line-blocking guard)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// Mew #100：primary 下同群消息的进程内顺序要和 Inbox 领取一致——不同话题互不等待，
+// 无排序键的行（编辑、撤回、斜杠命令）是整群屏障。
+describe('serializeByOrderingKey', () => {
+  beforeEach(() => __resetAnchorQueues());
+
+  function gate() {
+    let open!: () => void;
+    const opened = new Promise<void>(resolve => { open = resolve; });
+    return { opened, open };
+  }
+
+  it('runs different keys side by side and one key in call order', async () => {
+    const order: string[] = [];
+    const a1 = gate();
+    const first = serializeByOrderingKey('P', 'topic-a', async () => {
+      order.push('start:a1');
+      await a1.opened;
+      order.push('end:a1');
+    });
+    const other = serializeByOrderingKey('P', 'topic-b', async () => { order.push('b'); });
+    const second = serializeByOrderingKey('P', 'topic-a', async () => { order.push('a2'); });
+    await other;
+    expect(order).toEqual(['start:a1', 'b']);
+    a1.open();
+    await Promise.all([first, second]);
+    expect(order).toEqual(['start:a1', 'b', 'end:a1', 'a2']);
+  });
+
+  it('lets a keyless row wait for every earlier row and hold back every later one', async () => {
+    const order: string[] = [];
+    const keyed = gate();
+    const barrier = gate();
+    const before = serializeByOrderingKey('P', 'topic-a', async () => {
+      order.push('start:a');
+      await keyed.opened;
+      order.push('end:a');
+    });
+    const edit = serializeByOrderingKey('P', undefined, async () => {
+      order.push('start:edit');
+      await barrier.opened;
+      order.push('end:edit');
+    });
+    const after = serializeByOrderingKey('P', 'topic-b', async () => { order.push('b'); });
+    const elsewhere = serializeByOrderingKey('Q', undefined, async () => { order.push('other-chat'); });
+    await elsewhere;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(order).toEqual(['start:a', 'other-chat']);
+    keyed.open();
+    await before;
+    await vi.waitFor(() => expect(order).toContain('start:edit'));
+    expect(order).not.toContain('b');
+    barrier.open();
+    await Promise.all([edit, after]);
+    expect(order).toEqual(['start:a', 'other-chat', 'end:a', 'start:edit', 'end:edit', 'b']);
+  });
+
+  it('does not let a failing row block the rows behind it', async () => {
+    const failed = serializeByOrderingKey('P', undefined, async () => { throw new Error('boom'); });
+    const next = serializeByOrderingKey('P', 'topic-a', async () => 'ok');
+    await expect(failed).rejects.toThrow('boom');
+    await expect(next).resolves.toBe('ok');
   });
 });
