@@ -836,6 +836,9 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
       expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
       expect(sendWorkerInputMock.mock.calls[0][0]).toBe(ds);
       expect(sendWorkerInputMock.mock.calls[0][2]).toMatch(/^schedule:task0001:/);
+      // Mew #39: the second fire must wait for A's turn instead of being
+      // submitted back-to-back into a serial backend.
+      expect(sendWorkerInputMock.mock.calls[0][3]).toMatchObject({ queueAfterActiveTurn: true });
     } finally {
       releaseSeed();
       // suite beforeEach only mockClear()s these mocks, so implementations set
@@ -1331,6 +1334,7 @@ describe('executeScheduledTask — live-session injection', () => {
 
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
     expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({
+      queueAfterActiveTurn: true,
       trustedCaller: {
         requestUserOpenId: 'ou_creator',
         requestUserUnionId: 'on_creator',
@@ -1353,8 +1357,8 @@ describe('executeScheduledTask — live-session injection', () => {
       ownerOpenId: 'ou_creator',
     }), active, refreshCliVersion);
 
-    // Byte-for-byte the pre-change behaviour for legacy/bot-created tasks.
-    expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({});
+    // No identity for legacy/bot-created tasks; still queued behind any active turn.
+    expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({ queueAfterActiveTurn: true });
   });
 
   it('loud continuation appends per-fire context to the injected and remembered prompt', async () => {
