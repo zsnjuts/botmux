@@ -199,6 +199,15 @@ export type CurrentActorDaemonResult =
 export const CURRENT_ACTOR_LOOKUP_BUDGET_MS = 3_000;
 /** A lookup this slow is still answered, but logged so the next timeout has context. */
 const CURRENT_ACTOR_SLOW_LOOKUP_MS = 1_000;
+/**
+ * The worker publishes a turn's origin to the daemon over IPC while it hands
+ * the turn to the provider, so a provider that asks right away can overtake
+ * that message (Mew #70: unverified 19 ms after turn start under load). The
+ * same attestation is retried for this long before failing closed; with the
+ * lookup budget it stays inside the Runner's 5 s request timeout.
+ */
+const CURRENT_TURN_ATTESTATION_WAIT_MS = 1_000;
+const CURRENT_TURN_ATTESTATION_POLL_MS = 50;
 const LOOKUP_TIMED_OUT = Symbol('current actor lookup timed out');
 
 export interface CurrentTurnPeerAttestation {
@@ -350,6 +359,7 @@ export async function resolveDaemonCurrentActor(input: {
   procRoot?: string;
   expectedScheduledTurnId?: string;
   lookupBudgetMs?: number;
+  attestationWaitMs?: number;
 }): Promise<CurrentActorDaemonResult> {
   const procRoot = input.procRoot ?? '/proc';
   const attestInput = {
@@ -359,7 +369,12 @@ export async function resolveDaemonCurrentActor(input: {
       ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
       : {}),
   };
-  const frozen = attestCurrentTurnLoopbackPeer(attestInput);
+  let frozen = attestCurrentTurnLoopbackPeer(attestInput);
+  const attestationDeadline = Date.now() + (input.attestationWaitMs ?? CURRENT_TURN_ATTESTATION_WAIT_MS);
+  while (!frozen && Date.now() < attestationDeadline) {
+    await new Promise(resolve => setTimeout(resolve, CURRENT_TURN_ATTESTATION_POLL_MS));
+    frozen = attestCurrentTurnLoopbackPeer(attestInput);
+  }
   if (!frozen) return { ok: false, error: 'current_actor_unverified' };
 
   const budgetMs = input.lookupBudgetMs ?? CURRENT_ACTOR_LOOKUP_BUDGET_MS;
