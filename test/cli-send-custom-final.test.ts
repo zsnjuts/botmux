@@ -10,6 +10,7 @@ import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
 import { buildTurnTerminalFooterPatch } from '../src/im/lark/card-builder.js';
+import { t } from '../src/i18n/index.js';
 import { customFinalCardError } from '../src/im/lark/final-card-sections.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { normalizeCompletionProposalInput } from '../src/core/completion-proposal.js';
@@ -97,7 +98,8 @@ describe('custom schema-2 final uses the canonical reply lifecycle', () => {
       expect(requests[0].body.content.match(/"element_id":"botmux_reply_footer"/g)).toHaveLength(1);
       expect(requests[0].body.content).toContain('Example assistant');
       expect((requests[0].body.content.match(/<at id=ou_requester>/g) ?? []).length).toBe(1);
-      expect(buildTurnTerminalFooterPatch(requests[0].body.content, 'completed', 'zh')?.content).toContain('本轮已结束');
+      expect(buildTurnTerminalFooterPatch(requests[0].body.content, 'completed', 'zh')?.content)
+        .toContain(t('worker.turn_terminal_receipt.completed', undefined, 'zh'));
       const id = reserved ? 'om_original_card' : 'om_separate_message';
       feedbackStore = await SkillFeedbackStore.open(dataDir);
       const delivery = feedbackStore.findDeliveryByPlatformMessage('lark', key.larkAppId, id)!;

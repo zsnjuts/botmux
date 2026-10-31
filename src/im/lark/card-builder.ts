@@ -38,11 +38,19 @@ export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
 
 export type TurnTerminalReceiptKind = 'completed' | 'silent';
 
-/** Independent, low-visual-weight terminal marker used when auto mode cannot
- * patch the last visible carrier (for example a file, voice, or custom card).
- * It is deliberately headerless and action-free: the answer/progress messages
- * keep their own presentation while this final strip only answers whether the
- * agent is still working or has returned control to the user. */
+/** The turn-end label as rendered: a completed turn is green bold so it reads
+ * as a status, not as part of the grey footer chrome; a silent turn (nothing to
+ * reply) stays grey, only bold. */
+function turnTerminalReceiptMarkup(kind: TurnTerminalReceiptKind, locale?: Locale): string {
+  const color = kind === 'completed' ? 'green' : 'grey';
+  return `<font color='${color}'>**${t(`worker.turn_terminal_receipt.${kind}`, undefined, locale)}**</font>`;
+}
+
+/** Independent terminal marker used when auto mode cannot patch the last
+ * visible carrier (for example a file, voice, or custom card). It is
+ * deliberately headerless and action-free: the answer/progress messages keep
+ * their own presentation while this final strip only answers whether the agent
+ * is still working or has returned control to the user. */
 export function buildTurnTerminalReceiptCard(
   kind: TurnTerminalReceiptKind,
   locale?: Locale,
@@ -55,8 +63,7 @@ export function buildTurnTerminalReceiptCard(
       padding: '8px 12px 8px 12px',
       elements: [{
         tag: 'markdown',
-        text_size: 'notation_small_v2',
-        content: `<font color='grey'>${t(`worker.turn_terminal_receipt.${kind}`, undefined, locale)}</font>`,
+        content: turnTerminalReceiptMarkup(kind, locale),
       }],
     },
   });
@@ -80,29 +87,61 @@ function findCardElementById(value: unknown, elementId: string): any | undefined
   return undefined;
 }
 
-function withoutKnownTurnTerminalReceipt(content: string): string {
-  const known = [
-    t('worker.turn_terminal_receipt.completed', undefined, 'zh'),
-    t('worker.turn_terminal_receipt.silent', undefined, 'zh'),
-    t('worker.turn_terminal_receipt.completed', undefined, 'en'),
-    t('worker.turn_terminal_receipt.silent', undefined, 'en'),
-  ];
+/** Labels an earlier build appended in grey inside (or right after) the footer.
+ * Cards already patched that way are re-patched on retry, so they must still be
+ * recognized after the wording changed. */
+const LEGACY_TURN_TERMINAL_RECEIPT_LABELS = [
+  '✓ 本轮已结束 · 等待输入',
+  '✓ 本轮已结束（AI 判断无需回复） · 等待输入',
+  '✓ Turn ended · Awaiting input',
+  '✓ Turn ended (AI determined no reply was needed) · Awaiting input',
+];
+
+function knownTurnTerminalReceiptLabels(): string[] {
+  const current = (['completed', 'silent'] as const).flatMap(kind => (['zh', 'en'] as const)
+    .map(locale => t(`worker.turn_terminal_receipt.${kind}`, undefined, locale)));
+  return [...new Set([...current, ...LEGACY_TURN_TERMINAL_RECEIPT_LABELS])];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Strip a receipt appended after the footer in the current shape
+ * `<footer> <font color='…'>**label**</font>` (also tolerating a readback that
+ * dropped the quotes or the bold markers). */
+function withoutCurrentTurnTerminalReceipt(content: string, labels: readonly string[]): string {
   let result = content;
-  for (const label of known) {
-    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    result = result.replace(new RegExp(`\\s*·\\s*(?:<font color=['\"]grey['\"]>)?${escaped}(?:<\\/font>)?\\s*$`), '');
+  for (const label of labels) {
+    result = result.replace(
+      new RegExp(`\\s*(?:·\\s*)?<font color=['"]?[a-z]+['"]?>(?:\\*\\*)?${escapeRegExp(label)}(?:\\*\\*)?<\\/font>\\s*$`),
+      '',
+    );
+  }
+  return result;
+}
+
+/** Strip a legacy grey ` · label` suffix (inside the footer font, or in its own
+ * grey font after it). */
+function withoutLegacyTurnTerminalReceipt(content: string, labels: readonly string[]): string {
+  let result = content;
+  for (const label of labels) {
+    result = result.replace(
+      new RegExp(`\\s*·\\s*(?:<font color=['"]grey['"]>)?${escapeRegExp(label)}(?:<\\/font>)?\\s*$`),
+      '',
+    );
   }
   return result.trimEnd();
 }
 
-function appendTurnTerminalReceiptToFooter(content: string, label: string): string {
-  const outerGrey = /^(<font color=['"]grey['"]>)([\s\S]*)(<\/font>)$/.exec(content);
-  if (outerGrey) {
-    const base = withoutKnownTurnTerminalReceipt(outerGrey[2]);
-    return `${outerGrey[1]}${base} · ${label}${outerGrey[3]}`;
-  }
-  const base = withoutKnownTurnTerminalReceipt(content);
-  return `${base} · <font color='grey'>${label}</font>`;
+function appendTurnTerminalReceiptToFooter(content: string, receipt: string): string {
+  const labels = knownTurnTerminalReceiptLabels();
+  const stripped = withoutCurrentTurnTerminalReceipt(content, labels).trimEnd();
+  const outerGrey = /^(<font color=['"]grey['"]>)([\s\S]*)(<\/font>)$/.exec(stripped);
+  const base = outerGrey
+    ? `${outerGrey[1]}${withoutLegacyTurnTerminalReceipt(outerGrey[2], labels)}${outerGrey[3]}`
+    : withoutLegacyTurnTerminalReceipt(stripped, labels);
+  return `${base} ${receipt}`;
 }
 
 /** Build a footer-only CardKit update. Message reads may normalize Markdown;
@@ -120,7 +159,7 @@ export function buildTurnTerminalFooterPatch(
     return undefined;
   }
   return { content: appendTurnTerminalReceiptToFooter(
-    footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
+    footer.content, turnTerminalReceiptMarkup(kind, locale),
   ) };
 }
 

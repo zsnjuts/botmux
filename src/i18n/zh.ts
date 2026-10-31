@@ -1349,8 +1349,11 @@ export const messages: Record<string, string> = {
   'worker.unsent_inputs_unconfirmed': '⚠️ 会话重启前收到的 {count} 条消息在补投途中又遇到重启，无法确认是否已送进 CLI，请核对后按需重发。',
   'worker.failed_reason_unavailable': '未提供可安全展示的错误摘要',
   'worker.silent_turn_receipt': '🪧 本轮已处理完毕：我判定这条消息无需回复（自动回执）。如需我必须回话，请再 @ 我并明确要求答复。',
-  'worker.turn_terminal_receipt.completed': '✓ 本轮已结束 · 等待输入',
+  'worker.turn_terminal_receipt.completed': '✅ 本轮已完成 · 等待输入',
   'worker.turn_terminal_receipt.silent': '✓ 本轮已结束（AI 判断无需回复） · 等待输入',
+  // 远端轮次（Remote Runner）过程消息卡片的标题，用来和本轮最终回复区分。
+  'card.remote_outbound.progress_header': '⏳ 进行中 · 过程消息',
+  'card.remote_outbound.auxiliary_header': '📎 补充说明',
   'worker.empty_final_failed': '⚠️ {cliName} 本轮执行失败：{reason}\n完整错误已保留在 Web 终端和 daemon 日志中；排除问题后请重发消息。',
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
   'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
