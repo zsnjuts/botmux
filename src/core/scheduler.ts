@@ -17,6 +17,7 @@ import type {
   ScheduleAuthorityStore,
   ScheduleSelfCleanupReceipt,
 } from '../services/schedule-authority-store.js';
+import type { DurableScheduleAuthority } from '../services/durable-schedule-authority.js';
 import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
 import {
   revokeScheduledRunSettlements,
@@ -45,6 +46,10 @@ let ownerAppId: string | null = null;
 let ownerIsPrimary = false;
 let authorityStore: ScheduleAuthorityStore | null = null;
 let authorityUnavailable: string | null = null;
+/** Durable primary mode only: tasks live in the shared coordination store and
+ * every replica claims each due run there before executing it. */
+let durableAuthority: DurableScheduleAuthority | null = null;
+let durableTickInFlight = false;
 
 /** Installed only in daemon processes. CLI processes keep using the JSON
  * projection for display, but all daemon execution/mutation uses SQLite. */
@@ -58,6 +63,15 @@ export function setScheduleAuthorityStore(store: ScheduleAuthorityStore | null):
 export function setScheduleAuthorityUnavailable(error: unknown): void {
   authorityStore = null;
   authorityUnavailable = error instanceof Error ? error.message : String(error);
+}
+
+export function setDurableScheduleAuthority(authority: DurableScheduleAuthority | null): void {
+  durableAuthority = authority;
+  durableTickInFlight = false;
+}
+
+export function isDurableScheduleAuthorityActive(): boolean {
+  return durableAuthority !== null;
 }
 
 function assertScheduleAuthorityAvailable(): void {
@@ -288,6 +302,7 @@ function markRuntimeRun(
   error?: string,
   deliveryError?: string,
   runId?: string,
+  onlyWhileRunning = false,
 ): void {
   if (!authorityStore) {
     scheduleStore.markRun(id, success, error, deliveryError, runId);
@@ -296,6 +311,7 @@ function markRuntimeRun(
   if (!runtimeTask(id)) return;
   mutateRuntimeTask(id, task => {
     if (runId !== undefined && task.lastRunId !== runId) return;
+    if (onlyWhileRunning && task.lastStatus !== 'running') return;
     const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
     const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
       && repeat.times > 0 && repeat.completed >= repeat.times;
@@ -774,7 +790,32 @@ function computeGraceSeconds(parsed: ParsedSchedule): number {
 
 // ─── Tick loop ──────────────────────────────────────────────────────────────
 
+interface DurableTickContext {
+  authority: DurableScheduleAuthority;
+  appId: string;
+}
+
 async function tick(): Promise<void> {
+  const authority = durableAuthority;
+  if (!authority) return runTick();
+  const appId = authorityAppId();
+  if (!appId || durableTickInFlight) return;
+  durableTickInFlight = true;
+  try {
+    // Pull other replicas' changes first, then settle runs whose owning daemon died.
+    await authority.heartbeat(appId);
+    await authority.sync(appId);
+    for (const orphan of await authority.findOrphanedRuns(appId)) {
+      // Several replicas may reap the same run; only the first settles it.
+      markRuntimeRun(orphan.taskId, false, 'schedule run interrupted by daemon restart', undefined, orphan.runId, true);
+    }
+    await runTick({ authority, appId });
+  } finally {
+    durableTickInFlight = false;
+  }
+}
+
+async function runTick(durable?: DurableTickContext): Promise<void> {
   const tasks = runtimeTasks();
   const now = Date.now();
 
@@ -836,18 +877,26 @@ async function tick(): Promise<void> {
       nextRunAt: newNext ?? undefined,
       lastRunId: executionContext.runId,
     }) : undefined;
+    const claimDue = (current: ScheduledTask): ScheduledTask | undefined => {
+      if (current.lastStatus === 'running' || !current.enabled) return;
+      return { ...current, lastRunAt: executionContext.startedAt,
+        nextRunAt: newNext ?? undefined, lastRunId: executionContext.runId,
+        lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
+        // Re-arm for the next cycle: a pending manual flag belongs only to
+        // the run that is being claimed now (mirrors legacy claimRun, which
+        // deletes the field from storage and returns it on the snapshot).
+        manualRunRequested: undefined };
+    };
     const claimedTask = legacyClaim
       ? (legacyClaim.ok ? legacyClaim.task : undefined)
-      : mutateRuntimeTask(task.id, current => {
-          if (current.lastStatus === 'running' || !current.enabled) return;
-          return { ...current, lastRunAt: executionContext.startedAt,
-            nextRunAt: newNext ?? undefined, lastRunId: executionContext.runId,
-            lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
-            // Re-arm for the next cycle: a pending manual flag belongs only to
-            // the run that is being claimed now (mirrors legacy claimRun, which
-            // deletes the field from storage and returns it on the snapshot).
-            manualRunRequested: undefined };
-        });
+      : durable
+        // Exactly one replica wins this occurrence: the CAS claim also checks
+        // that nobody claimed or rescheduled it since this tick observed it.
+        ? await durable.authority.claim(durable.appId, task.id, current =>
+            current.lastRunId === task.lastRunId && current.nextRunAt === nextRunAt
+              ? claimDue(current)
+              : undefined)
+        : mutateRuntimeTask(task.id, claimDue);
     if (!claimedTask || claimedTask.lastRunId !== executionContext.runId) continue;
     // Mirror claimRun: the claimed snapshot must still carry the manual flag
     // (it was cleared from storage) so this run is admitted as a manual/dashboard
@@ -965,7 +1014,9 @@ function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): vo
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 export function startScheduler(): void {
-  const startupTasks = runtimeTasks();
+  // Durable mode: a running task may belong to a live replica. tick() marks it
+  // interrupted only once its owner's runner lease is free.
+  const startupTasks = durableAuthority ? [] : runtimeTasks();
   for (const task of startupTasks) {
     if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
     markRuntimeRun(
@@ -1011,6 +1062,8 @@ export function startScheduler(): void {
 
 export function stopScheduler(): void {
   if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  // Drains pending write-throughs, then releases this daemon's runner lease.
+  durableAuthority?.stop().catch(error => logger.warn(`[scheduler] durable authority stop failed: ${error}`));
   logger.info('[scheduler] Stopped');
 }
 
@@ -1404,6 +1457,26 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   // re-fire the same task while this manual run is still in flight.
   const executionContext = createExecutionContext('dashboard');
   const next = computeNextRun(task.parsed, executionContext.startedAt);
+  const claimNow = (current: ScheduledTask): ScheduledTask | undefined => current.lastStatus === 'running'
+    ? undefined : { ...current, lastRunAt: executionContext.startedAt,
+      nextRunAt: next ?? undefined, lastRunId: executionContext.runId,
+      lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
+      manualRunRequested: undefined };
+  const durableAppId = durableAuthority ? authorityAppId(task.larkAppId) : undefined;
+  if (durableAuthority && durableAppId) {
+    if (task.lastStatus === 'running') return { ok: false, error: 'already_running' };
+    // Another replica may already be running it; the shared CAS claim decides.
+    void durableAuthority.claim(durableAppId, id, claimNow, { requireObservedRevision: false })
+      .then(claimedTask => {
+        if (claimedTask?.lastRunId !== executionContext.runId) {
+          logger.info(`[scheduler] Manual run of ${id} not started: the durable claim was not won`);
+          return;
+        }
+        dispatchManualRun(claimedTask, executionContext);
+      })
+      .catch(err => logger.error(`[scheduler] Manual run of ${id} failed to start: ${err}`));
+    return { ok: true };
+  }
   const legacyClaim = !authorityStore ? scheduleStore.claimRun(id, {
     lastRunAt: executionContext.startedAt,
     nextRunAt: next ?? undefined,
@@ -1411,14 +1484,16 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   }) : undefined;
   const claimedTask = legacyClaim
     ? (legacyClaim.ok ? legacyClaim.task : undefined)
-    : mutateRuntimeTask(id, current => current.lastStatus === 'running'
-      ? undefined : { ...current, lastRunAt: executionContext.startedAt,
-        nextRunAt: next ?? undefined, lastRunId: executionContext.runId,
-        lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
-        manualRunRequested: undefined });
+    : mutateRuntimeTask(id, claimNow);
   if (!claimedTask || claimedTask.lastRunId !== executionContext.runId) {
     return { ok: false, error: 'already_running' };
   }
+  dispatchManualRun(claimedTask, executionContext);
+  return { ok: true };
+}
+
+function dispatchManualRun(claimedTask: ScheduledTask, executionContext: ScheduleExecutionContext): void {
+  const id = claimedTask.id;
   claimedTask.lastCalendarCheck = manualCalendarCheck(claimedTask);
   if (claimedTask.lastCalendarCheck) recordRuntimeCalendarCheck(id, claimedTask.lastCalendarCheck);
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
@@ -1443,7 +1518,6 @@ export function runNow(id: string): { ok: boolean; error?: string } {
       emitScheduleFiredHook(claimedTask, 'error', err);
     },
   );
-  return { ok: true };
 }
 
 /**
