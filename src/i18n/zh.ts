@@ -1327,6 +1327,9 @@ export const messages: Record<string, string> = {
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
   'worker.final_output_content_audit_blocked': '⚠️ 本轮回复被飞书内容安全审计拦截（错误码 {code}，通常因正文含邮箱、手机号、证件号等敏感信息），消息未送达，也不会按原内容自动重试。完整回答仍保留在 Web 终端中，可打开终端查看；如需发到群里，请脱敏（删除或打码敏感信息）后重发。',
   'worker.bridge_restored_turn_notice': '⚠️ 本轮曾因 botmux 重启中断，以下是从终端记录恢复的该轮输出（可能不完整）：',
+  // 远端轮次最终回答里，已用 --mention-back 过程消息发过的链接改成这句提示（Mew #80）。
+  'worker.remote_final.link_sent_above': '（链接已在上方消息发送）',
+  'worker.remote_final.link_sent_above_labeled': '{label}（链接已在上方消息发送）',
   'worker.restart_interrupted.note': '【botmux 提示】这个会话刚刚重启过：CLI 进程中途退出，已用原上下文恢复。{details}请先核对这些工作的实际状态（例如 CI、测试、子任务的结果），再继续没做完的事；仍需要的监控或后台任务要重新启动。',
   'worker.restart_interrupted.note_turn': '重启前你正在处理的那一轮还没做完。',
   'worker.restart_interrupted.note_tasks': '以下后台任务随旧进程一起终止，不会再有完成通知：{tasks}。',

@@ -163,6 +163,11 @@ import {
 } from './utils/pending-input-queue.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
+import {
+  RemoteFinalLinkLedger,
+  dedupeRemoteFinalLinks,
+  outboundLinksReachedRequester,
+} from './services/remote-final-link-dedupe.js';
 import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
 import {
   bridgeRemoteWebTerminal,
@@ -6934,6 +6939,11 @@ function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number |
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
 }
 
+// Links a remote turn already delivered to the requester via an @-mentioning
+// (`--mention-back`) progress/auxiliary send, so its final answer does not post
+// the same authorization / confirmation link a second time (Mew #80).
+const remoteFinalLinkLedger = new RemoteFinalLinkLedger();
+
 function deliverRemoteTurnFinal(
   text: string,
   exactTurnId?: string,
@@ -6990,7 +7000,15 @@ function deliverRemoteTurnFinal(
   }
   // Strip a trailing sentinel line: "prose + sentinel" with no send is the
   // "did the work, forgot to send" shape — post the prose, never the token.
-  const postContent = bridgePostText(text, adoptMode);
+  const postContent = dedupeRemoteFinalLinks(
+    bridgePostText(text, adoptMode),
+    remoteFinalLinkLedger.deliveredUrls(turnId, dispatchAttempt),
+    {
+      bare: t('worker.remote_final.link_sent_above'),
+      labeled: label => t('worker.remote_final.link_sent_above_labeled', { label }),
+    },
+  );
+  remoteFinalLinkLedger.clear(turnId, dispatchAttempt);
   if (!postContent.trim()) {
     onPersisted?.(true);
     return;
@@ -7059,15 +7077,18 @@ async function deliverRemoteRunnerOutboundMessage(
   if (pinnedConfig) env.BOTS_CONFIG = pinnedConfig;
   else delete env.BOTS_CONFIG;
 
-  return sendRemoteRunnerOutboundMessage(message, {
+  const dispatchAttempt = currentBotmuxDispatchAttempt;
+  const result = await sendRemoteRunnerOutboundMessage(message, {
     sessionId,
     turnId: message.turnId,
-    ...(currentBotmuxDispatchAttempt !== undefined
-      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
-      : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(linkRefMode ? { linkRefMode } : {}),
     env,
   });
+  if (outboundLinksReachedRequester(message, result)) {
+    remoteFinalLinkLedger.record(message.turnId, dispatchAttempt, message.content);
+  }
+  return result;
 }
 
 async function deliverRemoteRunnerSessionTool(
