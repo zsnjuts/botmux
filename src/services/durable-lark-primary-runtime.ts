@@ -14,6 +14,7 @@ import {
   startDurableLarkPrimaryIngress,
   type DurableLarkIngressLeadership,
   type DurableLarkPrimaryIngress,
+  type DurableLarkPrimaryIngressOptions,
   type DurableLarkPrimaryIngressStatus,
   type DurableLarkPrimaryIngressStopResult,
 } from './durable-lark-primary-ingress.js';
@@ -46,6 +47,8 @@ export interface DurableLarkPrimaryRuntimeOptions {
   deliverOutbox: DurableOutboxPumpOptions['deliver'];
   onLeadershipAcquired?: (leadership: DurableLarkIngressLeadership) => void | Promise<void>;
   onLeadershipLost?: (reason: unknown) => void | Promise<void>;
+  /** See DurableLarkPrimaryIngressOptions.resolveOrderingKey (Mew #100). */
+  resolveOrderingKey?: DurableLarkPrimaryIngressOptions['resolveOrderingKey'];
   onSessionLeaseLost?: (sessionKey: string, error: Error) => void;
   onInboxRetried?: (retry: DurableInboxPrimaryRetry) => void | Promise<void>;
   onInboxExhausted?: (exhausted: DurableInboxPrimaryExhausted) => void | Promise<void>;
@@ -201,6 +204,7 @@ export function startDurableLarkPrimaryRuntime(
       ? {}
       : { electionIntervalMs: options.ingressElectionIntervalMs }),
     shutdownMs,
+    ...(options.resolveOrderingKey ? { resolveOrderingKey: options.resolveOrderingKey } : {}),
     onLeadershipAcquired: options.onLeadershipAcquired,
     onLeadershipLost: options.onLeadershipLost,
     onError: reportError,
