@@ -109,6 +109,7 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import type { Locale } from '../i18n/types.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import {
@@ -13860,6 +13861,13 @@ export function freezeSessionSandboxDecision(
  * staged behind an ACK, routed through a live owner, or spawn-deferred during
  * device isolation — returns `true`.
  */
+/** User-facing notice when memory admission rejects a turn before any worker starts. */
+export function memoryPressureBlockedNotice(reclaimed: number, locale?: Locale): string {
+  return reclaimed > 0
+    ? tr('worker.memory_pressure_blocked_reclaimed', { count: reclaimed }, locale)
+    : tr('worker.memory_pressure_blocked', undefined, locale);
+}
+
 export function forkWorker(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
@@ -14138,15 +14146,13 @@ export function forkWorker(
   if (!admission.allowed) {
     const notifyBlocked = (decision: WorkerAdmissionDecision, reclaimed: number): void => {
       const reason = decision.reasons.join('; ');
-      logger.warn(`[${tag(ds)}] Worker admission blocked by memory pressure: ${reason}`);
-      const reclamationNote = reclaimed > 0
-        ? ` Automatically suspended ${reclaimed} idle session${reclaimed === 1 ? '' : 's'} `
-          + `to free memory, but available memory is still below the reserve.`
-        : '';
-      const retry = `Memory pressure is critical: ${reason}. `
-        + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
+      // Reserve/PSI figures are for operators; the chat notice stays plain.
+      logger.warn(
+        `[${tag(ds)}] Worker admission blocked by memory pressure: ${reason} `
         + `(reserve ${formatMemoryBytes(decision.policy.minAvailableMemoryBytes)}, `
-        + `PSI limit ${decision.policy.maxMemoryFullAvg10.toFixed(2)}%).${reclamationNote}`;
+        + `PSI limit ${decision.policy.maxMemoryFullAvg10.toFixed(2)}%, reclaimed ${reclaimed} idle)`,
+      );
+      const retry = memoryPressureBlockedNotice(reclaimed, localeForBot(ds.larkAppId));
       const blockedTurnId = fallbackTurnId(ds, initTurnId);
       if (opts.onAdmissionBlocked) {
         opts.onAdmissionBlocked({

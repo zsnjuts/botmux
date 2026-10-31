@@ -1354,6 +1354,8 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
   'worker.empty_final_failed_upstream': '⚠️ {cliName} 遇到模型网关/上游服务故障：{reason}\n这是服务端暂态错误，与你的消息内容无关；请稍后重发消息重试。',
   'worker.empty_final_failed_credential': '⚠️ {cliName} 获取模型凭据失败，本轮已中止：{reason}\n请求没有发到模型，多为机器负载高时取 token 超时，属暂态错误；直接重发消息即可继续。反复出现请检查凭据命令或登录状态。',
+  'worker.memory_pressure_blocked': '⚠️ 机器人当前内存不足，这条消息还没有开始处理。请稍等一两分钟后重新发送。',
+  'worker.memory_pressure_blocked_reclaimed': '⚠️ 机器人当前内存不足，这条消息还没有开始处理（已自动挂起 {count} 个空闲会话释放内存，仍然不够）。请稍等一两分钟后重新发送。',
   'worker.codex_capacity_recovery_stopped': '⚠️ {cliName} 模型容量不足，当前停止自动恢复。请稍后点击「继续」恢复原任务，或切换模型后继续。',
   'worker.ordinary_recovery_disabled': '⚠️ {cliName} 的容量自动恢复已关闭，本轮停止续跑。请检查已有进度，需要时点击「继续」手动恢复。',
   'worker.ordinary_recovery_persist_failed': '⚠️ {cliName} 自动续跑状态保存失败，已停止自动处理。请检查 Web 终端中的已有进度后再继续。',

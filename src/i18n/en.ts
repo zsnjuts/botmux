@@ -1355,6 +1355,8 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_connection': '⚠️ {cliName} could not connect to the model service: {reason}\nCheck the network and model-service status, then resend the message.',
   'worker.empty_final_failed_upstream': '⚠️ {cliName} hit a model gateway / upstream service failure: {reason}\nThis is a transient server-side error unrelated to your message. Wait a moment, then resend the message.',
   'worker.empty_final_failed_credential': '⚠️ {cliName} could not obtain model credentials, so this turn stopped: {reason}\nThe request never reached the model; this is usually a token command timing out under high machine load, a transient error. Resend the message to continue. If it keeps happening, check the credential command or login.',
+  'worker.memory_pressure_blocked': '⚠️ The bot is low on memory, so this message has not started. Please wait a minute or two and send it again.',
+  'worker.memory_pressure_blocked_reclaimed': '⚠️ The bot is low on memory, so this message has not started (it suspended {count} idle session(s) to free memory, which was not enough). Please wait a minute or two and send it again.',
   'worker.codex_capacity_recovery_stopped': '⚠️ {cliName} model capacity is unavailable. Automatic recovery stopped. Use Continue later to resume the task, or change models and continue.',
   'worker.ordinary_recovery_disabled': '⚠️ {cliName} capacity recovery was turned off, so this pending continuation was cancelled. Check existing progress and use Continue to resume manually if needed.',
   'worker.ordinary_recovery_persist_failed': '⚠️ {cliName} automatic recovery state could not be saved. Automatic processing stopped. Check existing progress in the Web Terminal before continuing.',
