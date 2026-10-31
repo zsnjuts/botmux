@@ -4756,6 +4756,12 @@ export function createLarkEventDispatcherRuntime(
     if (retryReason) {
       const wakeKey = ctx.ingressAdmission?.retryWakeKey;
       const retryAfterMs = ctx.ingressAdmission?.retryAfterMs;
+      // 重试本身不是错误，但没有这一行就无从判断一条消息为什么排了很久（Mew #93 / #49）。
+      logger.info(
+        `[durable-primary:${larkAppId}] inbox retry msg=${primary.message.messageId.substring(0, 16)} `
+        + `attempt=${primary.message.attempts} reason=${retryReason.substring(0, 120)}`
+        + `${wakeKey ? ' wake=session' : ''}${retryAfterMs !== undefined ? ` after=${retryAfterMs}ms` : ''}`,
+      );
       return {
         kind: 'retry',
         reason: retryReason,
