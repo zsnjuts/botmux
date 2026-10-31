@@ -3206,6 +3206,125 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     runtime.close();
   });
+  describe('多副本编辑事件判重（Mew #95）', () => {
+    const processEdit = (
+      runtime: ReturnType<typeof createLarkEventDispatcherRuntime>,
+      messageId: string,
+      attempts = 1,
+    ) => runtime.processDurableMessage({
+      eventType: 'lark.im.message.updated_v1',
+      eventId: `im.message.updated_v1:${MY_APP_ID}:evt-${messageId}-${attempts}`,
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+      larkAppId: MY_APP_ID,
+      messageId,
+      attempts,
+      data: { event_id: `evt-${messageId}`, message: { message_id: messageId, chat_id: 'chat-primary' } },
+    }, {
+      claim: {
+        event: {
+          eventId: `im.message.updated_v1:${MY_APP_ID}:evt-${messageId}-${attempts}`,
+          partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+          payload: {}, visibleAt: 1, createdAt: 1,
+        },
+        workerId: 'primary-worker', claimEpoch: 1, claimUntil: 60_000, attempts,
+      },
+      signal: new AbortController().signal,
+    });
+
+    const readbackMentioning = (messageId: string) => ({ items: [{
+      message_id: messageId,
+      chat_id: 'chat-primary',
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text: '@BotA 排查一下这个告警 https://example.com/alert' }) },
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: MY_OPEN_ID, id_type: 'open_id' }],
+      sender: { id: USER_OPEN_ID, id_type: 'open_id', sender_type: 'user' },
+    }] });
+
+    beforeEach(() => {
+      setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'new-topic' });
+      mockGetChatMode.mockResolvedValue('group');
+    });
+
+    it('原消息已由另一副本准入：编辑事件直接忽略，不再当成补 @ 重跑', async () => {
+      const messageId = 'om_edit_admitted_by_peer';
+      mockGetMessageDetail.mockResolvedValue(readbackMentioning(messageId));
+      const handlers = makeHandlers();
+      const readPrimaryAdmittedMessageIds = vi.fn(async (key: string) => (
+        key === `${messageId}::${MY_APP_ID}` ? [messageId] : undefined
+      ));
+      const takeOverPrimarySession = vi.fn(async () => ({ kind: 'retry' as const, reason: 'peer owns it' }));
+      const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers, 'feishu', undefined, {
+        readPrimaryAdmittedMessageIds,
+        takeOverPrimarySession,
+      });
+
+      await expect(processEdit(runtime, messageId)).resolves.toMatchObject({ kind: 'ignored' });
+      expect(readPrimaryAdmittedMessageIds).toHaveBeenCalledWith(`${messageId}::${MY_APP_ID}`);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(takeOverPrimarySession).not.toHaveBeenCalled();
+      expect(hasTriggeredMessage(MY_APP_ID, messageId)).toBe(true);
+      runtime.close();
+    });
+
+    it('权威记录里没有这条消息：仍按「延迟的首次 @」派发', async () => {
+      const messageId = 'om_edit_first_mention_primary';
+      mockGetMessageDetail.mockResolvedValue(readbackMentioning(messageId));
+      const handlers = makeHandlers();
+      handlers.handleNewTopic.mockImplementation(async (_data: any, ctx: any) => {
+        ctx.ingressAdmission = { admitted: true };
+      });
+      handlers.resolveDurableSession = vi.fn(() => ({
+        sessionId: 'session-edit-first-mention',
+        chatId: 'chat-primary',
+        rootMessageId: messageId,
+        scope: 'thread' as const,
+        title: 'Edit first mention',
+        status: 'active' as const,
+        createdAt: '2026-10-31T00:00:00.000Z',
+        larkAppId: MY_APP_ID,
+      }));
+      const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers, 'feishu', undefined, {
+        readPrimaryAdmittedMessageIds: async () => ['om_some_other_message'],
+      });
+
+      await expect(processEdit(runtime, messageId)).resolves.toMatchObject({ kind: 'admitted' });
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      runtime.close();
+    });
+
+    it('编辑事件重试预算用完后放弃，不再占住整个群的分区', async () => {
+      const messageId = 'om_edit_peer_owned';
+      mockGetMessageDetail.mockResolvedValue(readbackMentioning(messageId));
+      const canonical = {
+        sessionId: 'session-edit-peer-owned',
+        chatId: 'chat-primary',
+        rootMessageId: messageId,
+        scope: 'thread' as const,
+        title: 'Peer owned',
+        status: 'active' as const,
+        createdAt: '2026-10-31T00:00:00.000Z',
+        larkAppId: MY_APP_ID,
+      };
+      const handlers = makeHandlers();
+      handlers.resolveDurableSession = vi.fn(() => undefined);
+      handlers.isSessionOwner = vi.fn(() => false);
+      const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers, 'feishu', undefined, {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession: async () => ({ kind: 'retry' as const, reason: 'active Session lease is still owned by replica-a' }),
+      });
+
+      await expect(processEdit(runtime, messageId, 1)).resolves.toEqual({
+        kind: 'retry',
+        reason: 'active Session lease is still owned by replica-a',
+      });
+      await expect(processEdit(runtime, messageId, 3)).resolves.toEqual({
+        kind: 'ignored',
+        reason: 'edited message retry budget exhausted',
+      });
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      runtime.close();
+    });
+  });
 });
 
 describe('startLarkEventDispatcher — VC bot meeting push events', () => {

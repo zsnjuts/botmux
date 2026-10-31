@@ -32246,6 +32246,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
             },
+            readPrimaryAdmittedMessageIds: async stableKey => {
+              const current = await durableCoordinationRuntime.store.readSession(stableKey);
+              return current
+                ? parseDurablePrimarySessionRecord(current).admissions.map(entry => entry.messageId)
+                : undefined;
+            },
             takeOverPrimarySession: async (stableKey, canonical) => {
               const result = await takeOverPrimarySession(stableKey, canonical);
               return result && !('kind' in result) ? result.session : result;
