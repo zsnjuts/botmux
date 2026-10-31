@@ -142,6 +142,7 @@ import {
   listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
+import { DurableActiveTakeoverUnsupportedError } from './services/durable-session-control-errors.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import {
   startDurableRemoteOrphanReconciler,
@@ -32197,10 +32198,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               options,
             );
             if (!takeover.ok) {
-              throw new Error(
-                `durable active takeover failed: ${takeover.error}`
-                + (takeover.detail ? ` (${takeover.detail})` : ''),
-              );
+              const message = `durable active takeover failed: ${takeover.error}`
+                + (takeover.detail ? ` (${takeover.detail})` : '');
+              throw takeover.error === 'unsupported_session'
+                ? new DurableActiveTakeoverUnsupportedError(message)
+                : new Error(message);
             }
             return { session: takeover.ds.session, owner: takeover.ds };
           } catch (error) {

@@ -17,6 +17,7 @@ import type {
 } from './durable-session-control-dispatch.js';
 import { createDurableSessionControlDispatch } from './durable-session-control-dispatch.js';
 import {
+  DurableActiveTakeoverUnsupportedError,
   DurableSessionControlDeferredError,
   DurableSessionControlOwnerHandoffError,
 } from './durable-session-control-errors.js';
@@ -512,16 +513,32 @@ export function createDurableLarkSessionControlRuntime(
           const takeoverOptions = control.action === 'close' && remote
             ? { remoteResumeMode: 'close-control' as const }
             : undefined;
-          const takeover = takeoverOptions
-            ? await options.takeOverActiveSession?.(canonicalKey, canonicalSession, takeoverOptions)
-            : await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
-          if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
-            throw new DurableSessionControlOwnerHandoffError(takeover.reason);
+          let takeover: Awaited<ReturnType<NonNullable<typeof options.takeOverActiveSession>>>;
+          try {
+            takeover = takeoverOptions
+              ? await options.takeOverActiveSession?.(canonicalKey, canonicalSession, takeoverOptions)
+              : await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+          } catch (error) {
+            if (!(error instanceof DurableActiveTakeoverUnsupportedError)) throw error;
+            // The lease was free, yet no replica can ever reattach this Session
+            // (e.g. its Remote Runner never published a remote session because
+            // the sandbox was full). Retrying the takeover would loop forever;
+            // settle the close exactly like a never-started remote (Mew #23).
+            persisted = options.materializeClosedSession({
+              ...structuredClone(canonicalSession),
+              status: 'closed',
+              closedAt: new Date(now()).toISOString(),
+            });
           }
-          live = options.findActiveSession(control.sessionId);
-          persisted = options.getPersistedSession(control.sessionId);
-          if (!live || live.session.sessionId !== canonicalSession.sessionId) {
-            throw new Error('active control target could not be taken over by this replica');
+          if (persisted?.status !== 'closed') {
+            if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
+              throw new DurableSessionControlOwnerHandoffError(takeover.reason);
+            }
+            live = options.findActiveSession(control.sessionId);
+            persisted = options.getPersistedSession(control.sessionId);
+            if (!live || live.session.sessionId !== canonicalSession.sessionId) {
+              throw new Error('active control target could not be taken over by this replica');
+            }
           }
         }
       }
