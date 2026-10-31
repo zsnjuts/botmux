@@ -63,7 +63,58 @@ export function serializeByAnchor<T>(
   return next;
 }
 
+interface PartitionLanes {
+  /** Settles once the latest keyless (barrier) work and everything before it settled. */
+  barrier: Promise<void>;
+  /** Tail of each ordering key's chain started since that barrier. */
+  keys: Map<string, Promise<void>>;
+  pending: number;
+}
+
+const partitions = new Map<string, PartitionLanes>();
+
+/**
+ * Same ordering rule as the durable Inbox claim (Mew #100), applied in process:
+ * work with an ordering key waits only for earlier work of the same key and for
+ * earlier keyless work; keyless work is a barrier that waits for everything
+ * queued before it in the partition, and everything queued after waits for it.
+ * No cap: the claim lease, not a timer, bounds how long one row may hold its lane.
+ */
+export function serializeByOrderingKey<T>(
+  partition: string,
+  orderingKey: string | undefined,
+  work: () => Promise<T>,
+): Promise<T> {
+  let lanes = partitions.get(partition);
+  if (!lanes) {
+    lanes = { barrier: Promise.resolve(), keys: new Map(), pending: 0 };
+    partitions.set(partition, lanes);
+  }
+  const gate = orderingKey === undefined
+    ? Promise.all([lanes.barrier, ...lanes.keys.values()])
+    : Promise.all([lanes.barrier, lanes.keys.get(orderingKey) ?? Promise.resolve()]);
+  const next = gate.then(work);
+  const settled = next.then(() => {}, () => {});
+  if (orderingKey === undefined) {
+    lanes.barrier = settled;
+    lanes.keys.clear();
+  } else {
+    lanes.keys.set(orderingKey, settled);
+  }
+  lanes.pending++;
+  const current = lanes;
+  void settled.then(() => {
+    current.pending--;
+    if (orderingKey !== undefined && current.keys.get(orderingKey) === settled) {
+      current.keys.delete(orderingKey);
+    }
+    if (current.pending === 0 && partitions.get(partition) === current) partitions.delete(partition);
+  });
+  return next;
+}
+
 /** Test-only: clear all queues between cases. */
 export function __resetAnchorQueues(): void {
   queues.clear();
+  partitions.clear();
 }

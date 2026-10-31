@@ -15,7 +15,7 @@ import { listChats, type ChatBrief } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
-import { serializeByAnchor } from '../../utils/anchor-serializer.js';
+import { serializeByAnchor, serializeByOrderingKey } from '../../utils/anchor-serializer.js';
 import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
 import { commandSpec } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
@@ -6882,15 +6882,13 @@ export function createLarkEventDispatcherRuntime(
         return { kind: 'ignored', reason: 'edited message retry budget exhausted' };
       };
       let result: DurableLarkCanonicalHandlerResult | void;
-      // Inbox 领取已保证：无排序键的行是整个分区的屏障，同键的行按序领取（Mew #100）。
-      // 进程内只需在同一排序键内串行；按整群串行会让同副本上不同话题的续轮
-      // 依次等前一条的提交回执，排序键在领取上省下的等待又被这里吃掉。
-      const serialKey = message.orderingKey
-        ? `${message.partitionKey}\u0000${message.orderingKey}`
-        : message.partitionKey;
+      // 进程内与 Inbox 领取同一套顺序（Mew #100）：带排序键的行只等同键和更早的无键行，
+      // 无键行（编辑、撤回、斜杠命令、普通群）是整个分区的屏障。按整群串行会让同副本
+      // 上不同话题的续轮依次等前一条的提交回执，排序键在领取上省下的等待又被这里吃掉。
       try {
-        result = await serializeByAnchor(
-          serialKey,
+        result = await serializeByOrderingKey(
+          message.partitionKey,
+          message.orderingKey,
           async () => {
             if (message.eventType === 'lark.im.message.recalled_v1') {
               const ev = (message.data as any)?.event ?? message.data as any;
@@ -6959,7 +6957,6 @@ export function createLarkEventDispatcherRuntime(
               ? processMessageUpdatedEvent(message.data, primary)
               : processMessageEvent(message.data, undefined, primary);
           },
-          0,
         );
       } catch (error) {
         if (!editRetryBudgetSpent) throw error;
