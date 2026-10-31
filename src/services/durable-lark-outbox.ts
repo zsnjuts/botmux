@@ -245,6 +245,32 @@ function retryAt(
   return visibleAt < expiresAt - IDEMPOTENCY_EXPIRY_GUARD_MS ? visibleAt : undefined;
 }
 
+/**
+ * Mew #35: what to do with a row that stayed ambiguous at the head of its
+ * Session. Re-attempting is safe only while Lark still dedupes its provider
+ * UUID (send / reply, and the fallback send of a terminal update); a plain card
+ * PATCH is idempotent and may always be re-applied. Past the window the
+ * outcome can never be learned, so the row is abandoned to release the FIFO.
+ */
+export function reconcileAmbiguousLarkOutbox(
+  record: DurableOutboxRecord,
+  now: number,
+): { kind: 'retry' } | { kind: 'abandon'; reason: string } {
+  let parsed: DurableLarkOutboxEnvelope;
+  try {
+    parsed = parseDurableLarkOutboxRecord(record);
+  } catch (error) {
+    return {
+      kind: 'abandon',
+      reason: `invalid durable Lark payload: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (parsed.target.kind === 'update' && !parsed.terminalUpdateFallback) return { kind: 'retry' };
+  return now < record.createdAt + LARK_OUTBOX_IDEMPOTENCY_TTL_MS - IDEMPOTENCY_EXPIRY_GUARD_MS
+    ? { kind: 'retry' }
+    : { kind: 'abandon', reason: 'provider UUID dedupe window is exhausted; delivery outcome stays unknown' };
+}
+
 /** Deliver one already-attempting durable row through existing Lark clients. */
 export async function deliverDurableLarkOutbox(
   record: DurableOutboxRecord,
