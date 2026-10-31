@@ -188,7 +188,7 @@ describe('remote runner protocol', () => {
       state: { version: 1, provider: 'reference', generation: 3, remoteSessionId: 'remote-live' },
       orphanReconciliation,
     }));
-    for (const reason of ['remote_alive', 'remote_resumable']) {
+    for (const reason of ['remote_alive', 'remote_resumable', 'remote_turn_inflight']) {
       expect(ready({ verdict: 'not_orphan', reason })).toMatchObject({
         type: 'ready',
         orphanReconciliation: { verdict: 'not_orphan', reason },

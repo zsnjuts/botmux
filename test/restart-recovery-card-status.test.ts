@@ -123,6 +123,7 @@ import {
   reconcileRestoredStreamingCardStatus,
   sweepStaleWorkingCards,
   setActiveSessionsRegistry,
+  setRestoredRemoteTurnReattachHandler,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { MessageUpdateExpiredError } from '../src/im/lark/client.js';
@@ -203,6 +204,7 @@ beforeEach(() => {
     closeSession: vi.fn(),
   } as any);
   setActiveSessionsRegistry(new Map());
+  setRestoredRemoteTurnReattachHandler(undefined);
 });
 
 describe('silent restart recovery: no new card, but the surviving card follows status', () => {
@@ -280,6 +282,37 @@ describe('reconcileRestoredStreamingCardStatus', () => {
     activate(reattached, inconclusive, adopted);
     probeMock.mockReturnValue('unknown');
     getMessageDetailMock.mockResolvedValue(cardDetail('🖥️ Claude · t — 工作中'));
+
+    await reconcileRestoredStreamingCardStatus('app_test');
+
+    expect(getMessageDetailMock).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('hands a worker-less Remote Runner whose card claims work to the re-attach handler', async () => {
+    // Mew #55: the provider may still own that turn; PATCHing the card to idle
+    // would hide a result that nobody re-attaches to deliver.
+    const reattach = vi.fn(async (_ds: DaemonSession) => {});
+    setRestoredRemoteTurnReattachHandler(reattach);
+    const working = makeDs({ streamCardId: 'om_a' }, { sessionId: 'sid-a', rootMessageId: 'om_ra', backendType: 'remote-runner' });
+    const idle = makeDs({ streamCardId: 'om_b' }, { sessionId: 'sid-b', rootMessageId: 'om_rb', backendType: 'remote-runner' });
+    activate(working, idle);
+    getMessageDetailMock.mockImplementation(async (_app: string, id: string) =>
+      cardDetail(id === 'om_a' ? '🖥️ Remote Runner · t — 工作中' : '🖥️ Remote Runner · t — 等待输入'));
+
+    await reconcileRestoredStreamingCardStatus('app_test');
+
+    expect(reattach).toHaveBeenCalledTimes(1);
+    expect(reattach).toHaveBeenCalledWith(working);
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+    expect(working.streamCardId).toBe('om_a');
+  });
+
+  it('leaves a worker-less Remote Runner card alone without a re-attach handler', async () => {
+    const ds = makeDs({ streamCardId: 'om_card' }, { backendType: 'remote-runner' });
+    activate(ds);
+    getMessageDetailMock.mockResolvedValue(cardDetail('🖥️ Remote Runner · t — 工作中'));
 
     await reconcileRestoredStreamingCardStatus('app_test');
 

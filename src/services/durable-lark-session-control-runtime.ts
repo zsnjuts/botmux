@@ -891,6 +891,42 @@ export function createDurableLarkSessionControlRuntime(
               await wait(Math.min(resumeReadinessPollMs, deadline - now()), signal);
             }
             const verdict = options.orphanReconciliationVerdict?.(proofOwner);
+            if (verdict?.verdict === 'not_orphan' && verdict.reason === 'remote_turn_inflight') {
+              // The provider still owns an in-flight turn. Releasing here would
+              // leave that turn with nobody driving it and its card stuck on
+              // "working". Re-attach like a handoff so the provider recovers the
+              // turn, or settles it with an explicit terminal result.
+              await options.abandonOrphanTakeover?.(control.sessionId, proofOwner);
+              const reattached = await options.takeOverActiveSession?.(
+                canonicalKey,
+                canonicalSession,
+                { remoteResumeMode: 'reattach' },
+              );
+              if (!reattached) {
+                return { kind: 'not_applied', error: 'orphan turn recovery takeover is unavailable' };
+              }
+              if ('kind' in reattached) {
+                return { kind: 'not_applied', error: reattached.reason };
+              }
+              live = options.findActiveSession(control.sessionId);
+              persisted = options.getPersistedSession(control.sessionId);
+              if (!live || live.session.sessionId !== canonicalSession.sessionId
+                  || persisted?.status !== 'active') {
+                return { kind: 'not_applied', error: 'orphan turn recovery did not materialize locally' };
+              }
+              // Canonical is unchanged; the live re-attached owner now drives the
+              // turn through the normal recovery path, which ends in its own
+              // final answer or an explicit turn failure.
+              return {
+                kind: 'completed',
+                result: result('active', undefined, {
+                  applied: false,
+                  ignored: true,
+                  reason: 'not_orphan:remote_turn_inflight',
+                  recovery: 'reattached',
+                }),
+              };
+            }
             if (verdict?.verdict === 'not_orphan') {
               // The provider proved this lineage is alive or dormant-but-
               // resumable. Retire only the proof owner; canonical stays active
