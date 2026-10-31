@@ -53,7 +53,7 @@ function cluster(options: { now?: () => number } = {}) {
     };
     return { local, authority: boot(`boot-${name}`), dataDir, replaced, restart: () => boot(`boot-${name}-2`) };
   };
-  return { root, replica };
+  return { root, coordination, replica };
 }
 
 function task(id: string, overrides: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -383,6 +383,51 @@ describe('scheduler tick with a durable schedule authority', () => {
     await settle(a.authority);
     await b.authority.sync(APP);
     expect(b.local.getRecord(APP, 't1')?.task).toMatchObject({ lastStatus: 'ok', lastRunId: context.runId });
+  });
+
+  it('counts a run once when its settlement is replayed after a write that committed but reported failure', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    vi.setSystemTime(NOW);
+    const { coordination, replica } = cluster();
+    const a = replica('a');
+    await a.authority.hydrate(APP, () => []);
+    a.local.createDirect(task('t1', {
+      nextRunAt: new Date(NOW - 10_000).toISOString(),
+      repeat: { times: 5, completed: 0 },
+    }));
+    await a.authority.flush();
+    wireScheduler(a);
+
+    let release!: () => void;
+    scheduler.setExecuteCallback(vi.fn(() => new Promise<void>(resolve => { release = resolve; })));
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await settle(a.authority);
+
+    // The settlement commits in the coordination store, but the caller sees an
+    // error, so the write-through keeps it queued and replays it later.
+    const realWrite = coordination.writeAuxiliaryState.bind(coordination);
+    let lost = 0;
+    vi.spyOn(coordination, 'writeAuxiliaryState').mockImplementation(async input => {
+      const result = await realWrite(input);
+      if (lost === 0 && input.lease.sessionKey.includes('schedule-task') && result.kind === 'written') {
+        lost += 1;
+        throw new Error('connection reset after commit');
+      }
+      return result;
+    });
+    release();
+    await settle(a.authority);
+    expect(lost).toBe(1);
+    await a.authority.sync(APP);
+    await settle(a.authority);
+
+    const observer = replica('observer');
+    await observer.authority.hydrate(APP, () => []);
+    expect(observer.local.getRecord(APP, 't1')?.task).toMatchObject({
+      lastStatus: 'ok',
+      repeat: { times: 5, completed: 1 },
+    });
   });
 
   it('leaves a run owned by a live replica alone and marks it interrupted after the owner stops', async () => {
