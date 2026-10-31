@@ -818,6 +818,14 @@ import {
 } from './managed-origin-capability.js';
 import { truncateUtf16WellFormed } from '../utils/unicode.js';
 
+/** True when this turn's startup failure has not been posted yet (Mew #105). */
+function claimStartupFailureNotice(ds: DaemonSession, turnId: string | undefined, reason: string): boolean {
+  const key = `${turnId ?? ''}\u0000${reason}`;
+  if (ds.startupFailureNotice === key) return false;
+  ds.startupFailureNotice = key;
+  return true;
+}
+
 type WorkerStartupState = {
   ready: boolean;
   failureNotified: boolean;
@@ -14782,6 +14790,13 @@ export function forkWorker(
       );
       return;
     }
+    if (!claimStartupFailureNotice(ds, initAttributionTurnId, reason)) {
+      logger.warn(
+        `[${t}] Worker fork failure already posted for this turn; not repeating `
+        + `turn=${initAttributionTurnId?.slice(0, 12) ?? '-'}: ${reason}`,
+      );
+      return;
+    }
     const cliName = sessionCliDisplayName(ds, botCfg);
     const message = tr(workerStartFailedMessageKey(reason), { cliName, reason }, botLocale(botCfg));
     void cb.sessionReply(
@@ -15633,6 +15648,13 @@ function setupWorkerHandlers(
       );
       return;
     }
+    if (!claimStartupFailureNotice(ds, turnId, reason)) {
+      logger.warn(
+        `[${t}] Startup failure already posted for this turn; not repeating `
+        + `turn=${turnId?.slice(0, 12) ?? '-'}: ${reason}`,
+      );
+      return;
+    }
     startupState.failureSurfaced = true;
     const cliName = sessionCliDisplayName(ds, botCfg);
     const message = tr(workerStartFailedMessageKey(reason), { cliName, reason }, loc);
@@ -16301,6 +16323,7 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
+        ds.startupFailureNotice = undefined;
         // Past the pre-ready window: the ordinary ready-time card flow below
         // owns any card this generation has not published yet.
         preReadyStartingCardPosters.delete(worker);
