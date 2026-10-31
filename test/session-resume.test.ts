@@ -328,6 +328,77 @@ describe('takeOverDurableActiveRemoteSession', () => {
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('resumes a Session whose canonical record never received remote state from the provider copy', async () => {
+    // Mew #73：daemon 在 worker 首次上报远端状态前就停了，canonical 里 remoteBackendState
+    // 为空，但 provider 本地已绑定远端、首轮可能还在跑。用第 0 代占位状态发 resume，由 provider
+    // 按本地状态继续；关闭控制与孤儿核查保持原有处理。
+    const { getBot } = await import('../src/bot-registry.js');
+    const base = vi.mocked(getBot).getMockImplementation()!;
+    vi.mocked(getBot).mockImplementation(((appId: string) => {
+      const bot = base(appId) as any;
+      return { ...bot, config: { ...bot.config, remoteRunner: {
+        ...bot.config.remoteRunner, expectedProvider: 'tae-traex',
+      } } };
+    }) as any);
+    try {
+      await expect(takeOverDurableActiveRemoteSession(
+        activeRemoteCanonical({ remoteBackendState: undefined }),
+        new Map(),
+        { remoteResumeMode: 'close-control' },
+      )).resolves.toMatchObject({ ok: false, error: 'unsupported_session' });
+
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, resume: any, opts: any) => {
+        expect(resume).toEqual({ resume: true });
+        expect(opts).toEqual(expect.objectContaining({ remoteResumeMode: 'reattach' }));
+        expect(ds.session.remoteBackendState).toEqual({ version: 1, provider: 'tae-traex', generation: 0 });
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        return true;
+      });
+      const result = await takeOverDurableActiveRemoteSession(
+        activeRemoteCanonical({ remoteBackendState: undefined }),
+        new Map(),
+      );
+      expect(result.ok).toBe(true);
+      expect(forkWorker).toHaveBeenCalledOnce();
+
+      // 记下了第 0 代状态、还没记下远端会话：同样交给 provider 按本地状态继续。
+      const generationZero = {
+        version: 1 as const,
+        provider: 'tae-traex',
+        generation: 0,
+        providerState: { sessionKey: 'bmx1-key' },
+      };
+      await expect(takeOverDurableActiveRemoteSession(
+        activeRemoteCanonical({
+          sessionId: 'session-remote-gen0',
+          rootMessageId: 'om_remote_root_gen0',
+          remoteBackendState: generationZero,
+        }),
+        new Map(),
+        { remoteResumeMode: 'orphan-reconcile' },
+      )).resolves.toMatchObject({ ok: false, error: 'unsupported_session' });
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, resume: any, opts: any) => {
+        expect(resume).toEqual({ resume: true });
+        expect(ds.session.remoteBackendState).toEqual(generationZero);
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        return true;
+      });
+      const gen0 = await takeOverDurableActiveRemoteSession(
+        activeRemoteCanonical({
+          sessionId: 'session-remote-gen0',
+          rootMessageId: 'om_remote_root_gen0',
+          remoteBackendState: generationZero,
+        }),
+        new Map(),
+      );
+      expect(gen0).toMatchObject({ ok: true });
+    } finally {
+      vi.mocked(getBot).mockImplementation(base);
+    }
+  });
+
   it('fails closed and unregisters when no takeover worker is admitted', async () => {
     const canonical = activeRemoteCanonical();
     const map = new Map<string, DaemonSession>();
