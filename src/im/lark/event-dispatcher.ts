@@ -2714,6 +2714,9 @@ export interface RoutingContext {
     /** Durable-primary only: redeliver sooner than the Inbox default because
      * another live replica (the Session owner) is expected to claim it. */
     retryAfterMs?: number;
+    /** Durable-primary only: the input did not get through; count the retry
+     * against the Inbox failure budget (see DurableInboxPrimaryDispatchResult). */
+    retryCountsAsFailure?: true;
   };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
@@ -4770,6 +4773,7 @@ export function createLarkEventDispatcherRuntime(
         reason: retryReason,
         ...(wakeKey ? { wakeKey } : {}),
         ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+        ...(ctx.ingressAdmission?.retryCountsAsFailure ? { countsAsFailure: true as const } : {}),
       };
     }
     if (!ctx.ingressAdmission?.admitted) {

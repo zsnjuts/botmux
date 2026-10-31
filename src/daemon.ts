@@ -23734,7 +23734,22 @@ function retryDurablePrimaryIngress(
   ctx.ingressAdmission.retryReason = reason;
   ctx.ingressAdmission.retryWakeKey = waitFor ? durablePrimaryRetryWakeKey(waitFor) : undefined;
   ctx.ingressAdmission.retryAfterMs = undefined;
+  ctx.ingressAdmission.retryCountsAsFailure = undefined;
   return true;
+}
+
+/** A retry after the provider submit receipt never arrived: the input did not
+ * get through, so it spends the Inbox failure budget. A Session that can never
+ * start (e.g. its remote lineage no longer resumes) then settles its row after
+ * the usual number of attempts instead of holding a group-wide barrier for
+ * hours behind it. */
+function retryDurablePrimaryIngressAfterReceiptTimeout(
+  ctx: RoutingContext,
+  reason: string,
+  waitFor: DaemonSession,
+): void {
+  if (!retryDurablePrimaryIngress(ctx, reason, waitFor)) return;
+  ctx.ingressAdmission!.retryCountsAsFailure = true;
 }
 
 function durablePrimaryRetryWakeKey(ds: DaemonSession): string {
@@ -24106,7 +24121,7 @@ async function submitDurablePrimaryRetryTurn(
     // submit-failed side effect from the stale owner.
     if (dispatch.signal.aborted) return { kind: 'retry', inputAccepted: true };
     // Park on this replica (it holds the worker): the late receipt wakes it.
-    retryDurablePrimaryIngress(ctx, 'retry provider submit receipt is still pending', ds);
+    retryDurablePrimaryIngressAfterReceiptTimeout(ctx, 'retry provider submit receipt is still pending', ds);
     logger.warn(
       `[${tag(ds)}] Durable-primary /retry ${turnId.slice(0, 12)} will retry `
       + `after provider submit receipt wait failed: `
@@ -28280,7 +28295,7 @@ async function handleThreadReplyAdmitted(
             // Park on this replica (it holds the worker) instead of handing the
             // row to the queue, where the other replica may keep claiming it
             // while the final output waits for this admission (Mew #72).
-            retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending', ds);
+            retryDurablePrimaryIngressAfterReceiptTimeout(ctx, 'provider submit receipt is still pending', ds);
             logger.warn(
               `[${tag(ds)}] Durable-primary turn ${parsed.messageId.slice(0, 12)} `
               + `will retry after provider submit receipt wait failed: `
@@ -28788,7 +28803,7 @@ async function handleThreadReplyAdmitted(
       } catch (error) {
         if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
         // Park on this replica (it holds the worker): the late receipt wakes it.
-        retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending after worker refork', ds);
+        retryDurablePrimaryIngressAfterReceiptTimeout(ctx, 'provider submit receipt is still pending after worker refork', ds);
         logger.warn(
           `[${tag(ds)}] Durable-primary reforked turn ${parsed.messageId.slice(0, 12)} `
           + `will retry after provider submit receipt wait failed: `
