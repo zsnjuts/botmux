@@ -19,8 +19,11 @@ export type DurableInboxPrimaryDispatchResult =
   /** `wakeKey`: the event waits for a condition this process can observe
    * (e.g. one Session finishing its turn). It is redelivered as soon as
    * {@link DurableInboxPrimaryConsumer.wakeRetry} names that key, and no later
-   * than the ordinary retry delay. */
-  | { kind: 'retry'; reason: string; wakeKey?: string };
+   * than the ordinary retry delay.
+   * `retryAfterMs`: an earlier, bounded redelivery hint for retries that some
+   * other live replica is expected to resolve by claiming the event itself
+   * (for example the Session owner). Never later than the ordinary delay. */
+  | { kind: 'retry'; reason: string; wakeKey?: string; retryAfterMs?: number };
 
 export interface DurableInboxPrimaryDispatchContext {
   claim: InboxClaim;
@@ -112,6 +115,8 @@ interface ParkedRetry {
 /** Slack between a parked retry's deadline and its shortened claim lease, so a
  * slightly late hand-back still owns the claim. */
 const PARKED_RETRY_LEASE_SLACK_MS = 2_000;
+/** Floor for a dispatch-provided early retry hint, so a hint cannot spin the queue. */
+const MIN_RETRY_HINT_MS = 100;
 
 function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
@@ -254,9 +259,16 @@ export function startDurableInboxPrimaryConsumer(
             return;
           }
         }
+        if (result.retryAfterMs !== undefined
+            && (!Number.isFinite(result.retryAfterMs) || result.retryAfterMs <= 0)) {
+          throw new Error('durable inbox primary retryAfterMs must be a positive finite number');
+        }
+        const retryAfterMs = result.retryAfterMs === undefined
+          ? retryDelayMs
+          : Math.min(retryDelayMs, Math.max(MIN_RETRY_HINT_MS, Math.trunc(result.retryAfterMs)));
         const retried = await options.store.retryInboxClaim({
           claim,
-          visibleAt: now() + retryDelayMs,
+          visibleAt: now() + retryAfterMs,
         });
         if (retried.kind === 'stale') {
           loseOwnership(new Error(`durable inbox primary retry lost claim ${claim.event.eventId}`));

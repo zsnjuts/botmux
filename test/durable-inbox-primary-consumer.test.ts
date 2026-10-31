@@ -200,6 +200,30 @@ describe('durable inbox primary consumer', () => {
     await consumer.stop();
   });
 
+  it('honours an earlier retry hint, bounded by the floor and the ordinary delay', async () => {
+    for (const [hint, expected] of [[300, 9_300], [20, 9_100], [60_000, 14_000]] as const) {
+      const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+      const store = inboxStore({ claims: [claim(`om_hint_${hint}`)], retried });
+      const consumer = startDurableInboxPrimaryConsumer({
+        store,
+        workerId: 'primary-boot',
+        concurrency: 1,
+        intervalMs: 60_000,
+        retryDelayMs: 5_000,
+        now: () => 9_000,
+        dispatch: async () => ({
+          kind: 'retry',
+          reason: 'active Session lease is still owned by replica-a',
+          retryAfterMs: hint,
+        }),
+      });
+      await consumer.ready;
+      expect(retried).toHaveLength(1);
+      expect(retried[0].visibleAt).toBe(expected);
+      await consumer.stop();
+    }
+  });
+
   it('requeues an explicit busy result without reporting a dispatch error', async () => {
     const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
     // Explicit retry is a wait-state, not a failing attempt. Even an already

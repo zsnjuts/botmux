@@ -23699,6 +23699,7 @@ function retryDurablePrimaryIngress(
   ctx.ingressAdmission ??= { admitted: false };
   ctx.ingressAdmission.retryReason = reason;
   ctx.ingressAdmission.retryWakeKey = waitFor ? durablePrimaryRetryWakeKey(waitFor) : undefined;
+  ctx.ingressAdmission.retryAfterMs = undefined;
   return true;
 }
 
@@ -32166,7 +32167,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ): Promise<{
           session: Session;
           owner: DaemonSession;
-        } | { kind: 'retry'; reason: string } | undefined> => {
+        } | { kind: 'retry'; reason: string; ownedByPeer?: boolean } | undefined> => {
           if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
           try {
             const claimed = await claimDurableLarkActiveSession({
@@ -32181,6 +32182,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 reason: claimed.kind === 'occupied'
                   ? `active Session lease is still owned by ${claimed.ownerId}`
                   : `active Session takeover is not ready: ${claimed.kind}`,
+                ...(claimed.kind === 'occupied' ? { ownedByPeer: true } : {}),
               };
             }
             const local = activeSessions.get(stableKey);

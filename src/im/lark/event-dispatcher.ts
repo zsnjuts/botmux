@@ -1094,6 +1094,16 @@ const GRANT_REPLAY_MARKER = '__botmuxGrantReplay';
 const GRANT_REPLAY_EVENT_TAG = 'botmux-grant-replay';
 /** 等待授权在领取副本上生效的最多领取次数（Inbox 默认每次间隔 5s）。 */
 const GRANT_REPLAY_MAX_ATTEMPTS = 6;
+/** 续轮落到非 owner 副本时的快速退回间隔（第 1、2 次领取），让 owner 尽快领到；
+ *  之后回到 Inbox 默认间隔，owner 长时间不领（宕机等租约过期）时不空转轮询。 */
+const PEER_OWNED_RETRY_DELAYS_MS = [300, 600] as const;
+
+function peerOwnedRetryDelayMs(attempts: number): number | undefined {
+  return Number.isSafeInteger(attempts) && attempts >= 1
+    ? PEER_OWNED_RETRY_DELAYS_MS[attempts - 1]
+    : undefined;
+}
+
 /** primary 编辑事件（非授权重放）最多领取几次：Inbox 默认每次间隔约 5 秒。 */
 const PRIMARY_EDIT_RETRY_LIMIT = 3;
 
@@ -2699,6 +2709,9 @@ export interface RoutingContext {
     /** Durable-primary only: the retry waits for this local condition (e.g. a
      * Session finishing its turn) and is redelivered as soon as it holds. */
     retryWakeKey?: string;
+    /** Durable-primary only: redeliver sooner than the Inbox default because
+     * another live replica (the Session owner) is expected to claim it. */
+    retryAfterMs?: number;
   };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
@@ -4611,7 +4624,7 @@ export interface LarkEventDispatcherRuntimeOptions {
   takeOverPrimarySession?: (
     sessionKey: string,
     canonical: Session,
-  ) => Promise<Session | { kind: 'retry'; reason: string } | undefined>;
+  ) => Promise<Session | { kind: 'retry'; reason: string; ownedByPeer?: boolean } | undefined>;
   /** Test seam; production defaults to a 2s post-ready REST quiet period. */
   primaryRecoverySettleMs?: number;
 }
@@ -4742,7 +4755,13 @@ export function createLarkEventDispatcherRuntime(
     const retryReason = ctx.ingressAdmission?.retryReason?.trim();
     if (retryReason) {
       const wakeKey = ctx.ingressAdmission?.retryWakeKey;
-      return { kind: 'retry', reason: retryReason, ...(wakeKey ? { wakeKey } : {}) };
+      const retryAfterMs = ctx.ingressAdmission?.retryAfterMs;
+      return {
+        kind: 'retry',
+        reason: retryReason,
+        ...(wakeKey ? { wakeKey } : {}),
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      };
     }
     if (!ctx.ingressAdmission?.admitted) {
       return { kind: 'ignored', reason: 'canonical handler completed without task admission' };
@@ -4787,6 +4806,11 @@ export function createLarkEventDispatcherRuntime(
         ctx.ingressAdmission ??= { admitted: false };
         ctx.ingressAdmission.retryReason = takeover.reason;
         ctx.ingressAdmission.retryWakeKey = undefined;
+        // 另一个活着的副本持有这个会话：它自己会很快领到这条消息，没必要整整等一个
+        // Inbox 间隔。前两次快速退回，之后回到默认间隔。
+        ctx.ingressAdmission.retryAfterMs = takeover.ownedByPeer
+          ? peerOwnedRetryDelayMs(primary.message.attempts)
+          : undefined;
         return 'retry';
       }
       local = handlers.resolveDurableSession?.(ctx);

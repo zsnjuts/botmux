@@ -1635,6 +1635,51 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('asks the Inbox to redeliver sooner when a live peer owns the Session (Mew #93)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-owned-by-live-peer',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-live-peer-root',
+      scope: 'thread' as const,
+      title: 'Live peer owner',
+      status: 'active' as const,
+      createdAt: '2026-10-31T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    handlers.isSessionOwner = vi.fn(() => false);
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers, 'feishu', undefined, {
+      readPrimarySession: async () => canonical,
+      takeOverPrimarySession: async () => ({
+        kind: 'retry' as const,
+        reason: 'active Session lease is still owned by replica-a',
+        ownedByPeer: true,
+      }),
+    });
+    const followup = (messageId: string) => makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId,
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_live_peer',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, followup('msg-live-peer-1'), 'msg-live-peer-1'))
+      .resolves.toEqual({
+        kind: 'retry',
+        reason: 'active Session lease is still owned by replica-a',
+        retryAfterMs: 300,
+      });
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it('revalidates the owner lease before routing an already-local active Session', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('topic');
