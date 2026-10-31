@@ -29,6 +29,8 @@ import type {
   LeaseMutationResult,
   MarkControlOperationAmbiguousInput,
   MarkOutboxAmbiguousInput,
+  AbandonOutboxReservationInput,
+  ReserveAmbiguousOutboxInput,
   OutboxAttempt,
   OutboxMutationResult,
   OutboxReservation,
@@ -996,6 +998,76 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
       'ambiguous',
       { error: input.error },
     ));
+  }
+
+  async reserveAmbiguousOutbox(input: ReserveAmbiguousOutboxInput): Promise<OutboxReservation | undefined> {
+    const workerId = nonempty(input.workerId, 'workerId');
+    if (!Number.isSafeInteger(input.minAmbiguousAgeMs) || input.minAmbiguousAgeMs < 0) {
+      throw new Error('minAmbiguousAgeMs must be a non-negative integer');
+    }
+    const now = this.now();
+    const until = leaseUntil(now, input.leaseDurationMs);
+    return this.transaction(() => {
+      // Only the head of a Session's FIFO: an earlier unsettled row still owns
+      // the ordering fence and must be resolved first.
+      const candidate = this.db.prepare(
+        `SELECT o.message_id FROM durable_outbox o
+          JOIN durable_outbox_order current_order ON current_order.message_id = o.message_id
+          WHERE o.state = 'ambiguous' AND o.updated_at <= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM durable_outbox earlier
+               JOIN durable_outbox_order earlier_order ON earlier_order.message_id = earlier.message_id
+               WHERE earlier.session_key = o.session_key
+                 AND earlier.state != 'delivered'
+                 AND earlier_order.sequence < current_order.sequence
+            )
+          ORDER BY current_order.sequence
+          LIMIT 1`,
+      ).get(now - input.minAmbiguousAgeMs) as { message_id: string } | undefined;
+      if (!candidate) return undefined;
+      this.db.prepare(
+        `UPDATE durable_outbox
+            SET state = 'reserved', claim_owner = ?, claim_epoch = claim_epoch + 1,
+                claim_until = ?, updated_at = ?
+          WHERE message_id = ? AND state = 'ambiguous'`,
+      ).run(workerId, until, now, candidate.message_id);
+      const row = this.selectOutbox(candidate.message_id);
+      if (!row) throw new Error(`reserved outbox row ${candidate.message_id} disappeared`);
+      return {
+        record: outboxRecord(row),
+        workerId,
+        claimEpoch: Number(row.claim_epoch),
+        claimUntil: until,
+      };
+    });
+  }
+
+  async abandonOutboxReservation(input: AbandonOutboxReservationInput): Promise<OutboxMutationResult> {
+    const now = this.now();
+    const error = nonempty(input.error, 'error');
+    const receipt = encoded(input.receipt);
+    const reservation = input.reservation;
+    return this.transaction(() => {
+      const result = this.db.prepare(
+        `UPDATE durable_outbox
+            SET state = 'delivered', receipt_json = ?, last_error = ?,
+                claim_owner = NULL, claim_until = NULL, updated_at = ?
+          WHERE message_id = ? AND state = 'reserved' AND claim_owner = ?
+            AND claim_epoch = ? AND claim_until > ?`,
+      ).run(
+        receipt.json,
+        error,
+        now,
+        reservation.record.messageId,
+        reservation.workerId,
+        reservation.claimEpoch,
+        now,
+      );
+      if (Number(result.changes) !== 1) return { kind: 'stale' as const };
+      const row = this.selectOutbox(reservation.record.messageId);
+      if (!row) throw new Error(`abandoned outbox row ${reservation.record.messageId} disappeared`);
+      return { kind: 'applied' as const, record: outboxRecord(row) };
+    });
   }
 
   async readOutbox(messageId: string): Promise<DurableOutboxRecord | undefined> {

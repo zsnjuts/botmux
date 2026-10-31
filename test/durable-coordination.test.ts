@@ -995,6 +995,65 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('reopens only an aged ambiguous Session head and lets an abandoned head release its successors', async () => {
+    // Mew #35: an ambiguous row otherwise fences every later row of its Session forever.
+    let now = 1;
+    const store = makeStore(() => now);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-1', ownerId: 'worker-a', leaseDurationMs: 1_000,
+    }));
+    for (const [messageId, text] of [['message-head', 'first'], ['message-next', 'second']]) {
+      await store.enqueueOutbox({
+        lease,
+        message: { messageId, sessionKey: 'session-1', payload: { text }, visibleAt: 1, createdAt: 1 },
+      });
+    }
+    now = 2;
+    const reservation = await store.reserveNextOutbox({ workerId: 'sender-a', leaseDurationMs: 100 });
+    const begun = await store.beginOutboxAttempt({ reservation: reservation! });
+    if (begun.kind !== 'applied') throw new Error('expected begun attempt');
+    await store.markOutboxAmbiguous({ attempt: begun.attempt, error: 'socket reset after write' });
+
+    now = 50;
+    expect(await store.reserveAmbiguousOutbox({
+      workerId: 'reconciler', leaseDurationMs: 100, minAmbiguousAgeMs: 100,
+    })).toBeUndefined();
+    expect(await store.reserveNextOutbox({ workerId: 'sender-b', leaseDurationMs: 100 })).toBeUndefined();
+
+    now = 200;
+    const reopened = await store.reserveAmbiguousOutbox({
+      workerId: 'reconciler', leaseDurationMs: 100, minAmbiguousAgeMs: 100,
+    });
+    expect(reopened).toMatchObject({
+      workerId: 'reconciler',
+      record: { messageId: 'message-head', state: 'reserved', attempts: 1 },
+    });
+    expect(reopened!.claimEpoch).toBeGreaterThan(begun.attempt.claimEpoch);
+    // The superseded attempt can no longer settle the row.
+    expect(await store.completeOutboxAttempt({
+      attempt: begun.attempt, receipt: { platformMessageId: 'om_superseded' },
+    })).toEqual({ kind: 'stale' });
+
+    expect(await store.abandonOutboxReservation({
+      reservation: { ...reopened!, claimEpoch: reopened!.claimEpoch + 1 },
+      receipt: { kind: 'abandoned', reason: 'wrong claim' },
+      error: 'wrong claim',
+    })).toEqual({ kind: 'stale' });
+    expect(await store.abandonOutboxReservation({
+      reservation: reopened!,
+      receipt: { kind: 'abandoned', reason: 'dedupe window exhausted' },
+      error: 'dedupe window exhausted',
+    })).toMatchObject({
+      kind: 'applied',
+      record: { state: 'delivered', receipt: { kind: 'abandoned' }, lastError: 'dedupe window exhausted' },
+    });
+
+    expect(await store.reserveNextOutbox({ workerId: 'sender-b', leaseDurationMs: 100 })).toMatchObject({
+      record: { messageId: 'message-next' },
+    });
+    await store.close();
+  });
+
   it('deduplicates stable control operation ids and only retries proven pre-effect failures', async () => {
     let now = 1;
     const store = makeStore(() => now);

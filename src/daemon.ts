@@ -32537,6 +32537,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           primaryRuntime = startDurableLarkPrimaryRuntime({
             store: durableCoordinationRuntime.store,
             larkAppId: cfg.larkAppId,
+            onOutboxAbandoned: record => logger.warn(
+              `[durable-primary:${cfg.larkAppId}] abandoned ambiguous outbox ${record.messageId} `
+              + `(session ${record.sessionKey}, attempts ${record.attempts}): `
+              + `${record.lastError ?? 'delivery outcome unknown'}`,
+            ),
             handleCanonical: eventRuntime.processDurableMessage,
             resolveOrderingKey: ({ eventType, data }) => {
               const chatId = larkEventChatId(data);
