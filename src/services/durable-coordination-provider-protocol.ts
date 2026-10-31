@@ -25,6 +25,8 @@ export const DURABLE_COORDINATION_PROVIDER_METHODS = [
   'completeOutboxAttempt',
   'retryOutboxAttempt',
   'markOutboxAmbiguous',
+  'reserveAmbiguousOutbox',
+  'abandonOutboxReservation',
   'readOutbox',
   'enqueueControlOperation',
   'beginControlOperationAttempt',
@@ -300,6 +302,7 @@ export function validateDurableCoordinationProviderResult(
       valid = !!oneOfKinds(value, ['inserted', 'duplicate', 'conflict', 'stale_lease']);
       break;
     case 'reserveNextOutbox':
+    case 'reserveAmbiguousOutbox':
       valid = value === null || outboxReservation(value);
       break;
     case 'beginOutboxAttempt': {
@@ -310,7 +313,8 @@ export function validateDurableCoordinationProviderResult(
     }
     case 'completeOutboxAttempt':
     case 'retryOutboxAttempt':
-    case 'markOutboxAmbiguous': {
+    case 'markOutboxAmbiguous':
+    case 'abandonOutboxReservation': {
       const item = oneOfKinds(value, ['applied', 'stale']);
       valid = !!item && (item.kind === 'stale' || outboxRecord(item.record));
       break;

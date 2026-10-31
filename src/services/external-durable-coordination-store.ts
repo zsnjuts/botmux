@@ -25,6 +25,8 @@ import type {
   LeaseMutationResult,
   MarkControlOperationAmbiguousInput,
   MarkOutboxAmbiguousInput,
+  AbandonOutboxReservationInput,
+  ReserveAmbiguousOutboxInput,
   OutboxMutationResult,
   OutboxReservation,
   ReconcileControlOperationInput,
@@ -412,6 +414,15 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
   async reserveNextOutbox(input: ReserveOutboxInput): Promise<OutboxReservation | undefined> {
     const result = await this.call('reserveNextOutbox', input);
     return result === null ? undefined : result as unknown as OutboxReservation;
+  }
+
+  async reserveAmbiguousOutbox(input: ReserveAmbiguousOutboxInput): Promise<OutboxReservation | undefined> {
+    const result = await this.call('reserveAmbiguousOutbox', input);
+    return result === null ? undefined : result as unknown as OutboxReservation;
+  }
+
+  async abandonOutboxReservation(input: AbandonOutboxReservationInput): Promise<OutboxMutationResult> {
+    return await this.call('abandonOutboxReservation', input) as unknown as OutboxMutationResult;
   }
 
   async beginOutboxAttempt(input: BeginOutboxAttemptInput): Promise<BeginOutboxAttemptResult> {

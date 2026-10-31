@@ -162,6 +162,101 @@ describe('durable outbox pump', () => {
     await pump.stop();
   });
 
+  it('re-attempts an ambiguous Session head the call site proves idempotent', async () => {
+    // Mew #35: without this the ambiguous row fences its Session forever.
+    const delivered: DurableOutboxRecord[] = [];
+    const store = outboxStore({ reservations: [], delivered });
+    const ambiguousHead = { ...reservation('msg-ambiguous'), record: { ...record('msg-ambiguous'), attempts: 1 } };
+    let handedOut = false;
+    store.reserveAmbiguousOutbox = vi.fn(async ({ workerId }) => {
+      if (handedOut) return undefined;
+      handedOut = true;
+      return { ...ambiguousHead, workerId };
+    });
+    store.abandonOutboxReservation = vi.fn();
+    const deliver = vi.fn(async () => ({
+      kind: 'delivered' as const,
+      receipt: { providerMessageId: 'provider-deduped' } as DurableJson,
+    }));
+    const pump = startDurableOutboxPump({
+      store,
+      workerId: 'outbox-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      deliver,
+      reconcileAmbiguous: () => ({ kind: 'retry' }),
+    });
+    await pump.ready;
+    await pump.stop();
+
+    expect(store.reserveAmbiguousOutbox).toHaveBeenCalledWith(expect.objectContaining({
+      workerId: 'outbox-boot:ambiguous',
+      minAmbiguousAgeMs: expect.any(Number),
+    }));
+    expect(deliver).toHaveBeenCalledOnce();
+    expect(delivered.map(row => row.messageId)).toEqual(['msg-ambiguous']);
+    expect(store.abandonOutboxReservation).not.toHaveBeenCalled();
+  });
+
+  it('abandons an ambiguous Session head that can never be re-attempted', async () => {
+    const store = outboxStore({ reservations: [] });
+    const ambiguousHead = {
+      ...reservation('msg-expired'),
+      record: { ...record('msg-expired'), attempts: 2, lastError: 'delivery attempt timed out' },
+    };
+    let handedOut = false;
+    store.reserveAmbiguousOutbox = vi.fn(async ({ workerId }) => {
+      if (handedOut) return undefined;
+      handedOut = true;
+      return { ...ambiguousHead, workerId };
+    });
+    store.abandonOutboxReservation = vi.fn(async ({ reservation: current }) => ({
+      kind: 'applied' as const,
+      record: { ...current.record, state: 'delivered' as const },
+    }));
+    const deliver = vi.fn();
+    const abandoned: string[] = [];
+    const pump = startDurableOutboxPump({
+      store,
+      workerId: 'outbox-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      deliver,
+      reconcileAmbiguous: () => ({ kind: 'abandon', reason: 'dedupe window exhausted' }),
+      onAbandoned: row => abandoned.push(row.messageId),
+    });
+    await pump.ready;
+    await pump.stop();
+
+    expect(deliver).not.toHaveBeenCalled();
+    expect(store.abandonOutboxReservation).toHaveBeenCalledWith(expect.objectContaining({
+      error: 'dedupe window exhausted',
+      receipt: expect.objectContaining({
+        kind: 'abandoned',
+        reason: 'dedupe window exhausted',
+        attempts: 2,
+        lastError: 'delivery attempt timed out',
+      }),
+    }));
+    expect(abandoned).toEqual(['msg-expired']);
+  });
+
+  it('leaves ambiguous rows untouched without a reconcile callback', async () => {
+    const store = outboxStore({ reservations: [] });
+    store.reserveAmbiguousOutbox = vi.fn(async () => undefined);
+    const pump = startDurableOutboxPump({
+      store,
+      workerId: 'outbox-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      deliver: vi.fn(),
+    });
+    await pump.ready;
+    await pump.stop();
+
+    expect(store.reserveAmbiguousOutbox).not.toHaveBeenCalled();
+  });
+
   it('marks a thrown delivery outcome ambiguous instead of retrying', async () => {
     const ambiguous: DurableOutboxRecord[] = [];
     const store = outboxStore({ reservations: [reservation('msg-throw')], ambiguous });
