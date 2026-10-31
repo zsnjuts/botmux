@@ -302,7 +302,6 @@ function markRuntimeRun(
   error?: string,
   deliveryError?: string,
   runId?: string,
-  onlyWhileRunning = false,
 ): void {
   if (!authorityStore) {
     scheduleStore.markRun(id, success, error, deliveryError, runId);
@@ -310,8 +309,12 @@ function markRuntimeRun(
   }
   if (!runtimeTask(id)) return;
   mutateRuntimeTask(id, task => {
+    // A run settles once. Durable primary mode replays this mutation on the
+    // shared copy: after a write that committed but reported failure, or after
+    // another replica already marked the run interrupted, a second settlement
+    // would count `repeat.completed` twice.
     if (runId !== undefined && task.lastRunId !== runId) return;
-    if (onlyWhileRunning && task.lastStatus !== 'running') return;
+    if (task.lastStatus !== 'running') return;
     const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
     const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
       && repeat.times > 0 && repeat.completed >= repeat.times;
@@ -807,7 +810,7 @@ async function tick(): Promise<void> {
     await authority.sync(appId);
     for (const orphan of await authority.findOrphanedRuns(appId)) {
       // Several replicas may reap the same run; only the first settles it.
-      markRuntimeRun(orphan.taskId, false, 'schedule run interrupted by daemon restart', undefined, orphan.runId, true);
+      markRuntimeRun(orphan.taskId, false, 'schedule run interrupted by daemon restart', undefined, orphan.runId);
     }
     await runTick({ authority, appId });
   } finally {
