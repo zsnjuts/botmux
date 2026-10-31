@@ -82,6 +82,12 @@ export interface DurableLarkPrimaryIngressOptions {
   shutdownMs?: number;
   now?: () => number;
   monotonicNow?: () => number;
+  /** Per-topic ordering key for a message row (Mew #100). Errors and
+   * `undefined` keep the row a barrier for its whole chat partition. */
+  resolveOrderingKey?: (input: {
+    eventType: DurableLarkMessageEventType;
+    data: unknown;
+  }) => string | undefined;
   onLeadershipAcquired?: (leadership: DurableLarkIngressLeadership) => void | Promise<void>;
   onLeadershipLost?: (reason: unknown) => void | Promise<void>;
   onError?: (error: unknown) => void;
@@ -422,12 +428,19 @@ export function startDurableLarkPrimaryIngress(
       throw new Error('durable Lark ingress clock is invalid');
     }
     const createdAt = Math.max(wallNow, lastCreatedAt + 1);
+    let orderingKey: string | undefined;
+    try {
+      orderingKey = options.resolveOrderingKey?.({ eventType, data: input.data });
+    } catch {
+      orderingKey = undefined;
+    }
     const event = durableLarkMessageEvent({
       larkAppId,
       eventType,
       eventId,
       partitionKey,
       data: input.data,
+      ...(orderingKey ? { orderingKey } : {}),
       now: createdAt,
     });
     lastCreatedAt = createdAt;

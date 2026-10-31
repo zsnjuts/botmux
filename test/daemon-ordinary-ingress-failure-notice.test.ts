@@ -1,4 +1,5 @@
 import {
+  __testOnly_durablePrimaryInputReachedWorker,
   __testOnly_durablePrimaryWorkerAdmission,
   __testOnly_handleDocComment,
   __testOnly_recordDurablePrimaryInputCommit,
@@ -1340,6 +1341,23 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       content: `<at user_id="${OWNER}"></at> 收到，引导成功`,
       providerUuid: expect.stringMatching(/^turn_steer_accepted_[a-f0-9]{24}$/),
     }));
+  });
+
+  it('knows an exhausted durable input already reached a local worker', () => {
+    // Mew #68：重试用尽的提示要据此区分「没执行」和「执行了但确认失败」。
+    const anchor = 'om_thread_primary_exhausted_after_delivery';
+    const turnId = 'om_primary_exhausted_after_delivery';
+    const ds = seedThreadSession(anchor, 'exhausted after delivery') as any;
+    ds.session.workerGeneration = 7;
+    expect(__testOnly_durablePrimaryInputReachedWorker(APP, turnId)).toBe(false);
+    __testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId,
+      dispatchAttempt: 3,
+      durablePrimaryInbox: true,
+    }, 7);
+    expect(__testOnly_durablePrimaryInputReachedWorker(APP, turnId)).toBe(true);
+    expect(__testOnly_durablePrimaryInputReachedWorker('cli_other_app', turnId)).toBe(false);
   });
 
   it('admits a follow-up on retry when its receipt landed after the previous attempt gave up', async () => {

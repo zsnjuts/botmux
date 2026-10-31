@@ -75,7 +75,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getCachedChatMode, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -209,6 +209,7 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
+import { larkInboxOrderingKey } from './services/durable-inbox-ordering.js';
 import { setTurnResultRuntime } from './core/turn-result-runtime.js';
 
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
@@ -23619,6 +23620,23 @@ function activeTurnInputCommitted(ds: DaemonSession, turnId: string): boolean {
     && receipt.workerGeneration === ds.session.workerGeneration;
 }
 
+/** Whether a local live Session already got this durable input to its worker. */
+function durablePrimaryInputReachedWorker(larkAppId: string, messageId: string): boolean {
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId === larkAppId && activeTurnInputCommitted(ds, messageId)) return true;
+  }
+  return false;
+}
+
+export const __testOnly_durablePrimaryInputReachedWorker = durablePrimaryInputReachedWorker;
+
+/** chat_id of a raw Lark message event, for the durable ordering key. */
+function larkEventChatId(data: unknown): string | undefined {
+  const event = data && typeof data === 'object' ? data as Record<string, any> : undefined;
+  const chatId = event?.message?.chat_id ?? event?.event?.message?.chat_id;
+  return typeof chatId === 'string' && chatId ? chatId : undefined;
+}
+
 function durablePrimaryTurnDisposition(
   ds: DaemonSession,
   turnId: string,
@@ -32478,6 +32496,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             store: durableCoordinationRuntime.store,
             larkAppId: cfg.larkAppId,
             handleCanonical: eventRuntime.processDurableMessage,
+            resolveOrderingKey: ({ eventType, data }) => {
+              const chatId = larkEventChatId(data);
+              if (!chatId) return undefined;
+              const chatMode = getCachedChatMode(cfg.larkAppId, chatId);
+              // Warm the cache so the next message of this chat can get a key.
+              if (chatMode === undefined) void getChatMode(cfg.larkAppId, chatId).catch(() => undefined);
+              return larkInboxOrderingKey({ eventType, data, chatMode });
+            },
             onInboxRetried: async ({ message, result }) => {
               try {
                 await enqueueDurableInboxRetryNotice({
@@ -32503,6 +32529,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   store: durableCoordinationRuntime.store,
                   message,
                   ownerId: `retry-notice:${getDaemonBootId()}`,
+                  inputReachedWorker: durablePrimaryInputReachedWorker(
+                    message.larkAppId,
+                    message.messageId,
+                  ),
                 });
               } catch (error) {
                 logger.warn(
@@ -33517,9 +33547,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       async () => {
     setSessionLifecycleShutdown(true);
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
+    // The primary runtime only stops at the very end, after handoff and worker
+    // exit. Claiming Lark messages in that window bounced them between this Pod
+    // and its successor during rolling deploys (Mew #93); let the successor
+    // take them. A drain waits for this Pod's own turns, so it keeps claiming.
+    const pauseInboxClaims = REMOTE_SHUTDOWN_MODE === 'handoff';
+    if (pauseInboxClaims && durablePrimaryRuntimes.length > 0) {
+      for (const runtime of durablePrimaryRuntimes) runtime.inbox.pauseClaims();
+      logger.info('[durable-primary] shutdown: inbox claims paused; successors take new messages');
+    }
+    const resumeInboxClaims = (): void => {
+      if (!pauseInboxClaims) return;
+      for (const runtime of durablePrimaryRuntimes) runtime.inbox.resumeClaims();
+    };
 
     const initialShutdownFleet = collectUniqueDaemonShutdownSessions(activeSessions.values());
     if (!initialShutdownFleet.ok) {
+      resumeInboxClaims();
       setSessionLifecycleShutdown(false);
       shuttingDown = false;
       logger.error(`Daemon remains online: ${initialShutdownFleet.error}`);
@@ -33640,6 +33684,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `${result.error ?? 'unknown'}; admission remains fail-closed`,
         );
       }
+      resumeInboxClaims();
       setSessionLifecycleShutdown(false);
       shuttingDown = false;
       logger.error(`Daemon remains online: ${reason}`);

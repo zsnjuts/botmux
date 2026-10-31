@@ -401,12 +401,107 @@ describe('durable inbox primary consumer', () => {
     await store.close();
   });
 
+  it('does not let explicit retries spend the failure budget', async () => {
+    // Mew #68：排在长轮次后面等了很久（每 5 秒一次显式重试），领取次数早已超过
+    // 上限；之后一次瞬时错误不能直接把它当成「重试用尽」丢掉。
+    const completed: InboxClaim[] = [];
+    const dropped: string[] = [];
+    let call = 0;
+    const store = inboxStore({
+      claims: [
+        { ...claim('om_waited'), attempts: 40 },
+        { ...claim('om_waited'), attempts: 41 },
+        { ...claim('om_waited'), attempts: 42 },
+      ],
+      completed,
+      retried: [],
+    });
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      now: () => 9_000,
+      dispatch: async message => {
+        call += 1;
+        if (call === 1) return { kind: 'retry', reason: 'session has an unfinished turn' };
+        if (call === 2) throw new Error('PostgreSQL coordination request failed');
+        return committed(message);
+      },
+      onExhausted: ({ message }) => { dropped.push(message.messageId); },
+    });
+    await consumer.ready;
+
+    expect(dropped).toEqual([]);
+    expect(completed.map(item => item.attempts)).toEqual([42]);
+    await consumer.stop();
+  });
+
+  it('restarts the failure streak after an explicit retry', async () => {
+    const dropped: string[] = [];
+    const outcomes = ['fail', 'fail', 'retry', 'fail', 'fail', 'commit'];
+    const store = inboxStore({
+      claims: outcomes.map((_, index) => ({ ...claim('om_flaky'), attempts: index + 1 })),
+      completed: [],
+      retried: [],
+    });
+    let call = 0;
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      now: () => 9_000,
+      dispatch: async message => {
+        const outcome = outcomes[call++];
+        if (outcome === 'fail') throw new Error('provider unavailable');
+        if (outcome === 'retry') return { kind: 'retry', reason: 'session has an unfinished turn' };
+        return committed(message);
+      },
+      onExhausted: ({ message }) => { dropped.push(message.messageId); },
+    });
+    await consumer.ready;
+
+    expect(dropped).toEqual([]);
+    expect(call).toBe(outcomes.length);
+    await consumer.stop();
+  });
+
+  it('settles a failing row that has been queued for hours', async () => {
+    const dropped: Array<[string, number]> = [];
+    const store = inboxStore({
+      claims: [{ ...claim('om_ceiling'), attempts: 192 }],
+      completed: [],
+      retried: [],
+    });
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      now: () => 1 + 7 * 60 * 60 * 1000,
+      dispatch: async () => { throw new Error('provider unavailable'); },
+      onExhausted: ({ message, attempts }) => { dropped.push([message.messageId, attempts]); },
+    });
+    await consumer.ready;
+
+    expect(dropped).toEqual([['om_ceiling', 192]]);
+    await consumer.stop();
+  });
+
   it('settles an exhausted failure and continues with the next row', async () => {
     const completed: InboxClaim[] = [];
     const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
-    const exhausted = { ...claim('om_exhausted'), attempts: 3 };
     const store = inboxStore({
-      claims: [exhausted, claim('om_after_exhausted')],
+      claims: [
+        { ...claim('om_exhausted'), attempts: 1 },
+        { ...claim('om_exhausted'), attempts: 2 },
+        { ...claim('om_exhausted'), attempts: 3 },
+        claim('om_after_exhausted'),
+      ],
       completed,
       retried,
     });
@@ -419,6 +514,7 @@ describe('durable inbox primary consumer', () => {
       concurrency: 1,
       intervalMs: 60_000,
       maxAttempts: 3,
+      now: () => 9_000,
       dispatch: async message => {
         if (message.messageId === 'om_exhausted') throw new Error('provider unavailable');
         return committed(message);
@@ -434,7 +530,7 @@ describe('durable inbox primary consumer', () => {
       'im.message.receive_v1:cli_test:om_exhausted',
       'im.message.receive_v1:cli_test:om_after_exhausted',
     ]);
-    expect(retried).toHaveLength(0);
+    expect(retried).toHaveLength(2);
     expect(commits[0]).toEqual({
       kind: 'ignored',
       reason: 'durable primary retry limit reached',
@@ -499,6 +595,7 @@ describe('durable inbox primary consumer', () => {
       workerId: 'primary-boot',
       concurrency: 1,
       intervalMs: 60_000,
+      now: () => 9_000,
       dispatch: async () => ({ kind: 'committed' } as never),
     });
     await consumer.ready;
@@ -516,6 +613,7 @@ describe('durable inbox primary consumer', () => {
       workerId: 'primary-boot',
       concurrency: 1,
       intervalMs: 60_000,
+      now: () => 9_000,
       dispatch: async message => {
         const result = committed(message);
         return {
@@ -656,6 +754,41 @@ describe('durable inbox primary consumer', () => {
     })).toBeUndefined());
     await consumer.stop();
     await store.close();
+  });
+
+  it('finishes the in-flight claim but leaves new rows to peers while shutdown pauses claiming', async () => {
+    // Mew #93：滚动发布时旧 Pod 要先交接、等 worker 退出，最后才停消费者；
+    // 这段时间它若继续领取，消息会在旧 Pod 和接替的 Pod 之间来回放回。
+    const completed: InboxClaim[] = [];
+    const store = inboxStore({ claims: [claim('om_in_flight'), claim('om_after_pause')], completed });
+    const inFlight = deferred<void>();
+    const dispatched: string[] = [];
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => 9_000,
+      dispatch: async message => {
+        dispatched.push(message.messageId);
+        if (message.messageId === 'om_in_flight') await inFlight.promise;
+        return committed(message);
+      },
+    });
+    await vi.waitFor(() => expect(dispatched).toEqual(['om_in_flight']));
+
+    consumer.pauseClaims();
+    inFlight.resolve();
+    await consumer.ready;
+    await vi.waitFor(() => expect(completed).toHaveLength(1));
+    consumer.wake();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(dispatched).toEqual(['om_in_flight']);
+
+    // The shutdown was refused: this process stays online and claims again.
+    consumer.resumeClaims();
+    await vi.waitFor(() => expect(dispatched).toEqual(['om_in_flight', 'om_after_pause']));
+    await consumer.stop();
   });
 
   describe('retry waiting on a wake key', () => {

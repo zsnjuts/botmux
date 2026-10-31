@@ -15,7 +15,7 @@ import { listChats, type ChatBrief } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
-import { serializeByAnchor } from '../../utils/anchor-serializer.js';
+import { serializeByAnchor, serializeByOrderingKey } from '../../utils/anchor-serializer.js';
 import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
 import { commandSpec } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
@@ -1094,13 +1094,15 @@ const GRANT_REPLAY_MARKER = '__botmuxGrantReplay';
 const GRANT_REPLAY_EVENT_TAG = 'botmux-grant-replay';
 /** 等待授权在领取副本上生效的最多领取次数（Inbox 默认每次间隔 5s）。 */
 const GRANT_REPLAY_MAX_ATTEMPTS = 6;
-/** 续轮落到非 owner 副本时的快速退回间隔（第 1、2 次领取），让 owner 尽快领到；
+/** 续轮落到非 owner 副本时的快速退回间隔（本副本第 1、2 次退回同一条），让 owner 尽快领到；
  *  之后回到 Inbox 默认间隔，owner 长时间不领（宕机等租约过期）时不空转轮询。 */
 const PEER_OWNED_RETRY_DELAYS_MS = [300, 600] as const;
+/** 记录本副本退回次数的 Inbox 行数上限；超出时丢最早的，最多让那一条再快速退回一次。 */
+const PEER_OWNED_RETRY_TRACK_LIMIT = 4096;
 
-function peerOwnedRetryDelayMs(attempts: number): number | undefined {
-  return Number.isSafeInteger(attempts) && attempts >= 1
-    ? PEER_OWNED_RETRY_DELAYS_MS[attempts - 1]
+function peerOwnedRetryDelayMs(handBacks: number): number | undefined {
+  return Number.isSafeInteger(handBacks) && handBacks >= 1
+    ? PEER_OWNED_RETRY_DELAYS_MS[handBacks - 1]
     : undefined;
 }
 
@@ -4797,6 +4799,21 @@ export function createLarkEventDispatcherRuntime(
     }
   };
 
+  // 快速退回按本副本对这一行退回过几次算，不按这一行的领取次数：领取次数还包含
+  // 别处的领取（繁忙轮次的重试、退出窗口里的旧 Pod），会在 owner 还没机会领到之前
+  // 就把两次快速退回用掉（Mew #93）。
+  const peerOwnedHandBacks = new Map<string, number>();
+  const nextPeerOwnedRetryDelayMs = (eventId: string): number | undefined => {
+    const handBacks = (peerOwnedHandBacks.get(eventId) ?? 0) + 1;
+    peerOwnedHandBacks.delete(eventId);
+    peerOwnedHandBacks.set(eventId, handBacks);
+    if (peerOwnedHandBacks.size > PEER_OWNED_RETRY_TRACK_LIMIT) {
+      const oldest = peerOwnedHandBacks.keys().next().value;
+      if (oldest !== undefined) peerOwnedHandBacks.delete(oldest);
+    }
+    return peerOwnedRetryDelayMs(handBacks);
+  };
+
   const assertPrimaryRouteOwner = async (
     ctx: RoutingContext,
     primary: PrimaryProcessContext | undefined,
@@ -4816,7 +4833,7 @@ export function createLarkEventDispatcherRuntime(
         // 另一个活着的副本持有这个会话：它自己会很快领到这条消息，没必要整整等一个
         // Inbox 间隔。前两次快速退回，之后回到默认间隔。
         ctx.ingressAdmission.retryAfterMs = takeover.ownedByPeer
-          ? peerOwnedRetryDelayMs(primary.message.attempts)
+          ? nextPeerOwnedRetryDelayMs(primary.message.eventId)
           : undefined;
         return 'retry';
       }
@@ -6882,9 +6899,13 @@ export function createLarkEventDispatcherRuntime(
         return { kind: 'ignored', reason: 'edited message retry budget exhausted' };
       };
       let result: DurableLarkCanonicalHandlerResult | void;
+      // 进程内与 Inbox 领取同一套顺序（Mew #100）：带排序键的行只等同键和更早的无键行，
+      // 无键行（编辑、撤回、斜杠命令、普通群）是整个分区的屏障。按整群串行会让同副本
+      // 上不同话题的续轮依次等前一条的提交回执，排序键在领取上省下的等待又被这里吃掉。
       try {
-        result = await serializeByAnchor(
+        result = await serializeByOrderingKey(
           message.partitionKey,
+          message.orderingKey,
           async () => {
             if (message.eventType === 'lark.im.message.recalled_v1') {
               const ev = (message.data as any)?.event ?? message.data as any;
@@ -6953,7 +6974,6 @@ export function createLarkEventDispatcherRuntime(
               ? processMessageUpdatedEvent(message.data, primary)
               : processMessageEvent(message.data, undefined, primary);
           },
-          0,
         );
       } catch (error) {
         if (!editRetryBudgetSpent) throw error;

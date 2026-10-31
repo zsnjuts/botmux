@@ -192,6 +192,48 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('lets different topics of one partition run side by side while keyless rows stay barriers', async () => {
+    // Mew #100：同一个群（分区）里不同话题的消息互不阻塞，同一话题内仍保序；
+    // 没有排序键的行（群级命令、旧副本写入的行）挡住前后所有行。
+    const now = 10;
+    const store = makeStore(() => now);
+    const put = (eventId: string, orderingKey?: string) => store.enqueueInbox({
+      eventId,
+      partitionKey: 'chat-a',
+      payload: orderingKey ? { orderingKey, id: eventId } : { id: eventId },
+      visibleAt: 0,
+      createdAt: 1,
+    });
+    await put('topic-a-1', 'om_root_a');
+    await put('topic-a-2', 'om_root_a');
+    await put('topic-b-1', 'om_root_b');
+    await put('group-command');
+    await put('topic-c-1', 'om_root_c');
+    // Another replica without the chat mode cached writes the same event keyless.
+    expect(await put('topic-a-1')).toEqual({ kind: 'duplicate' });
+
+    const a1 = await store.claimNextInbox({ workerId: 'w1', leaseDurationMs: 100 });
+    expect(a1).toMatchObject({ event: { eventId: 'topic-a-1' } });
+    // topic-a-2 waits behind its own topic; topic-b-1 does not.
+    const b1 = await store.claimNextInbox({ workerId: 'w2', leaseDurationMs: 100 });
+    expect(b1).toMatchObject({ event: { eventId: 'topic-b-1' } });
+    // The keyless command waits for everything before it; topic-c-1 waits for the command.
+    expect(await store.claimNextInbox({ workerId: 'w3', leaseDurationMs: 100 })).toBeUndefined();
+
+    await store.completeInboxClaim(a1!);
+    const a2 = await store.claimNextInbox({ workerId: 'w1', leaseDurationMs: 100 });
+    expect(a2).toMatchObject({ event: { eventId: 'topic-a-2' } });
+    await store.completeInboxClaim(b1!);
+    await store.completeInboxClaim(a2!);
+    const command = await store.claimNextInbox({ workerId: 'w1', leaseDurationMs: 100 });
+    expect(command).toMatchObject({ event: { eventId: 'group-command' } });
+    expect(await store.claimNextInbox({ workerId: 'w2', leaseDurationMs: 100 })).toBeUndefined();
+    await store.completeInboxClaim(command!);
+    expect(await store.claimNextInbox({ workerId: 'w2', leaseDurationMs: 100 }))
+      .toMatchObject({ event: { eventId: 'topic-c-1' } });
+    await store.close();
+  });
+
   it('deduplicates realtime and REST snapshots of one Lark receive event by immutable identity', async () => {
     const store = makeStore(() => 10);
     const eventId = 'im.message.receive_v1:cli_test:om_same';

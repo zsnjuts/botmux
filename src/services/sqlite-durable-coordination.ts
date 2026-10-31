@@ -345,6 +345,15 @@ function controlOperationRecord(row: ControlOperationRow): DurableControlOperati
  * 本地参考实现。它使用异步合同包裹同步 SQLite 事务，从而让调用方与远程数据库实现
  * 共用同一套接口；现有 BotMux 单机路径在显式接线前不会改变。
  */
+/** Two rows of one partition must keep their order unless both carry a
+ * different ordering key. A row without a key (chat-scope traffic, group-level
+ * commands, rows written by an older replica) is a barrier for every row
+ * around it, which is the original whole-partition FIFO (Mew #100). */
+function inboxOrderingConflictSql(left: string, right: string): string {
+  const key = (alias: string) => `NULLIF(json_extract(${alias}.payload_json, '$.orderingKey'), '')`;
+  return `(${key(left)} IS NULL OR ${key(right)} IS NULL OR ${key(left)} = ${key(right)})`;
+}
+
 export class SqliteDurableCoordinationStore implements DurableCoordinationStore {
   private readonly db: DatabaseSyncLike;
   private readonly clock: () => number;
@@ -706,6 +715,7 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
                  AND active.partition_key = i.partition_key
                  AND active.state = 'claimed'
                  AND active.claim_until > ?
+                 AND ${inboxOrderingConflictSql('active', 'i')}
             )
             AND NOT EXISTS (
               SELECT 1 FROM durable_inbox earlier
@@ -714,6 +724,7 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
                  AND earlier.partition_key = i.partition_key
                  AND earlier.state != 'completed'
                  AND earlier_order.sequence < io.sequence
+                 AND ${inboxOrderingConflictSql('earlier', 'i')}
             )
           ORDER BY i.visible_at, io.sequence
           LIMIT 1`,

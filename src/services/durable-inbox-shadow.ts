@@ -17,6 +17,9 @@ export interface DurableLarkMessageEnvelope {
   type: DurableLarkMessageEventType;
   larkAppId: string;
   event: DurableJson;
+  /** Rows of one partition with different keys do not wait for each other;
+   * keyless rows keep the whole-partition FIFO (Mew #100). */
+  orderingKey?: string;
 }
 
 export interface DurableLarkMessageObservation {
@@ -26,6 +29,8 @@ export interface DurableLarkMessageObservation {
   larkAppId: string;
   messageId: string;
   attempts: number;
+  /** See {@link DurableLarkMessageEnvelope.orderingKey}. */
+  orderingKey?: string;
 }
 
 export interface DurableLarkMessageClaim extends DurableLarkMessageObservation {
@@ -102,6 +107,10 @@ export function parseDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMess
     larkAppId,
     messageId,
     attempts: claim.attempts,
+    ...(typeof payload.orderingKey === 'string' && payload.orderingKey
+        && payload.orderingKey.length <= 256
+      ? { orderingKey: payload.orderingKey }
+      : {}),
     data: payload.event as DurableJson,
   };
 }
@@ -121,6 +130,7 @@ export function durableLarkMessageEvent(input: {
   eventId: string;
   partitionKey: string;
   data: unknown;
+  orderingKey?: string;
   now?: number;
 }): DurableInboxEvent {
   const now = input.now ?? Date.now();
@@ -130,6 +140,7 @@ export function durableLarkMessageEvent(input: {
     type: input.eventType ?? 'lark.im.message.receive_v1',
     larkAppId: input.larkAppId,
     event: jsonValue(input.data),
+    ...(input.orderingKey ? { orderingKey: input.orderingKey } : {}),
   };
   return {
     eventId: input.eventId,
