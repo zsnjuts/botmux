@@ -13,6 +13,7 @@
  * a future client that adds a setting we don't know about doesn't lose it.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import type { ProjectScanOptions } from './services/project-scanner.js';
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
@@ -825,10 +826,16 @@ function readRawConfig(): Record<string, unknown> {
 const READ_CACHE_TTL_MS = 2_000;
 let readCache: { path: string; value: GlobalConfig; at: number } | null = null;
 let vcMeetingAgentLiveCache: { path: string; mtimeMs: number; config: VcMeetingAgentGlobalConfig } | null = null;
-let processReadSnapshot: {
+interface GlobalConfigReadSnapshot {
   read: () => GlobalConfig;
   refresh?: () => void;
-} | null = null;
+  /** Raw document behind read(), so live readers never touch storage. */
+  readRaw?: () => Record<string, unknown>;
+  /** Receives the document a same-process write just committed. */
+  publish?: (raw: Record<string, unknown>) => void;
+}
+
+let processReadSnapshot: GlobalConfigReadSnapshot | null = null;
 
 /**
  * 将当前进程的配置热读路径切到与存储后端解耦的快照。
@@ -837,10 +844,7 @@ let processReadSnapshot: {
  * 仍保留原来的短 TTL 文件语义。返回 disposer 供测试和嵌入式宿主清理，生产
  * Dashboard 则在整个进程生命周期内保留 provider。
  */
-export function installGlobalConfigReadSnapshot(provider: {
-  read: () => GlobalConfig;
-  refresh?: () => void;
-}): () => void {
+export function installGlobalConfigReadSnapshot(provider: GlobalConfigReadSnapshot): () => void {
   const previous = processReadSnapshot;
   processReadSnapshot = provider;
   return () => {
@@ -955,6 +959,7 @@ export function invalidateGlobalConfigCache(): void {
  * every event.
  */
 export function globalVcMeetingAgentConfigLive(): VcMeetingAgentGlobalConfig {
+  if (processReadSnapshot?.readRaw) return vcMeetingAgentConfigFromRaw(processReadSnapshot.readRaw());
   const path = globalConfigPath();
   if (!existsSync(path)) {
     const config = { enabled: true };
@@ -970,15 +975,35 @@ export function globalVcMeetingAgentConfigLive(): VcMeetingAgentGlobalConfig {
   if (vcMeetingAgentLiveCache && vcMeetingAgentLiveCache.path === path && vcMeetingAgentLiveCache.mtimeMs === mtimeMs) {
     return vcMeetingAgentLiveCache.config;
   }
-  const raw = readRawConfig();
+  const config = vcMeetingAgentConfigFromRaw(readRawConfig());
+  vcMeetingAgentLiveCache = { path, mtimeMs, config };
+  return config;
+}
+
+function vcMeetingAgentConfigFromRaw(raw: Record<string, unknown>): VcMeetingAgentGlobalConfig {
   const parsed = readVcMeetingAgent(raw.vcMeetingAgent);
-  const config: VcMeetingAgentGlobalConfig = {
+  return {
     enabled: parsed?.enabled !== false,
     ...(parsed?.listenerBotAppId ? { listenerBotAppId: parsed.listenerBotAppId } : {}),
     ...(parsed?.consumerCatalog ? { consumerCatalog: parsed.consumerCatalog } : {}),
   };
-  vcMeetingAgentLiveCache = { path, mtimeMs, config };
-  return config;
+}
+
+/** Read and parse the global config off the event loop. A missing file is the
+ *  empty document; unreadable or invalid JSON rejects so a caller holding a
+ *  last-known-good snapshot can keep it. */
+export async function readGlobalConfigDocument(path: string = globalConfigPath()): Promise<{
+  raw: Record<string, unknown>;
+  config: GlobalConfig;
+}> {
+  let text: string;
+  try {
+    text = await readFile(path, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    text = '{}\n';
+  }
+  return parseGlobalConfigFromText(text);
 }
 
 /** 共享角色预设目录（live 读，随 mtime 失效）。undefined = 还没配置过。 */
@@ -1131,6 +1156,7 @@ export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, Glob
   // (e.g. dashboard PUT /api/settings responds with the resolved config).
   readCache = null;
   vcMeetingAgentLiveCache = null;
+  processReadSnapshot?.publish?.(current);
 }
 
 /** Merge only the dashboard sub-config, preserving unknown keys inside that

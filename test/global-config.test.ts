@@ -7,8 +7,11 @@ import {
   GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
+  installGlobalConfigReadSnapshot,
   isGlobalVcMeetingAgentEnabled,
   invalidateGlobalConfigCache,
+  normalizeGlobalConfig,
+  readGlobalConfigDocument,
   isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
   mergeDashboardConfig,
@@ -34,6 +37,38 @@ describe('global dashboard config', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('serves an installed snapshot without opening the file and publishes same-process writes', async () => {
+    // Mew #33: the daemon must not open config.json (hard-mounted NFS) on its
+    // event loop; the file below says the opposite of the snapshot.
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', vcMeetingAgent: { enabled: true } }));
+    let document = await readGlobalConfigDocument();
+    expect(document.config.lang).toBe('zh');
+    document = { raw: { lang: 'en', vcMeetingAgent: { enabled: false } }, config: normalizeGlobalConfig({ lang: 'en', vcMeetingAgent: { enabled: false } }) };
+    const uninstall = installGlobalConfigReadSnapshot({
+      read: () => document.config,
+      readRaw: () => document.raw,
+      publish: raw => { document = { raw, config: normalizeGlobalConfig(raw) }; },
+    });
+    try {
+      expect(readGlobalConfig().lang).toBe('en');
+      expect(isGlobalVcMeetingAgentEnabled()).toBe(false);
+
+      mergeGlobalConfig({ lang: 'zh' });
+
+      expect(readGlobalConfig().lang).toBe('zh');
+      expect(JSON.parse(readFileSync(globalConfigPath(), 'utf8')).lang).toBe('zh');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('rejects an invalid document so a caller can keep its last good snapshot', async () => {
+    writeFileSync(globalConfigPath(), '{not json');
+    await expect(readGlobalConfigDocument()).rejects.toThrow();
+    rmSync(globalConfigPath());
+    await expect(readGlobalConfigDocument()).resolves.toEqual({ raw: {}, config: normalizeGlobalConfig({}) });
   });
 
   it('reads only boolean dashboard settings', () => {

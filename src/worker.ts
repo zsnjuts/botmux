@@ -249,6 +249,8 @@ import {
   serializePluginCardActionCapabilitiesSnapshot,
 } from './core/plugins/card-actions/capabilities.js';
 import {
+  adoptBotConfigSnapshotSource,
+  installBotConfigReadSnapshot,
   loadBotConfigs,
   resolveBrandLabel,
   resolveUsageDisplay,
@@ -256,6 +258,8 @@ import {
   type BotConfig,
 } from './bot-registry.js';
 import {
+  installGlobalConfigReadSnapshot,
+  type GlobalConfig,
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
   isMultiTopicOrchestrationEnabled,
@@ -2742,6 +2746,22 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+
+/** Mew #28: a synchronous open of the shared (hard-mounted NFS) config store
+ * once parked this main loop in D state for 74 minutes, silencing the turn.
+ * A Remote Runner worker never opens it: config reads are served from the
+ * daemon's seed, which the daemon replaces over IPC when its config reloads. */
+let workerConfigSnapshot: { bots: BotConfig[]; global: GlobalConfig } | undefined;
+
+function installWorkerConfigSnapshots(init: Extract<DaemonToWorker, { type: 'init' }>): void {
+  if (workerConfigSnapshot || !init.botConfigSnapshot) return;
+  workerConfigSnapshot = { bots: init.botConfigSnapshot, global: init.globalConfigSnapshot ?? {} };
+  if (init.loadedBotsConfigProvenance === 'loaded' && init.loadedBotsConfigPath) {
+    adoptBotConfigSnapshotSource(init.loadedBotsConfigPath);
+  }
+  installBotConfigReadSnapshot(() => workerConfigSnapshot!.bots);
+  installGlobalConfigReadSnapshot({ read: () => workerConfigSnapshot!.global });
+}
 
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
  *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
@@ -26669,6 +26689,18 @@ process.on('message', async (raw: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'config_snapshot': {
+      if (workerConfigSnapshot) {
+        workerConfigSnapshot = { bots: msg.botConfigSnapshot, global: msg.globalConfigSnapshot };
+      }
+      break;
+    }
+    case 'liveness_ping': {
+      // Answered only while this main loop runs: a thread stuck in a
+      // synchronous syscall (NFS openat in D state) stays silent (Mew #28).
+      send({ type: 'liveness_pong' });
+      break;
+    }
     case 'link_ref_register_result': {
       const pending = pendingLinkRefRegistrations.get(msg.requestId);
       if (!pending) break;
@@ -26742,6 +26774,7 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      installWorkerConfigSnapshots(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
         // Per-bot liveness window override (#1162). The value is normalized at
         // the registry layer, so retimeout's positive-finite guard is purely

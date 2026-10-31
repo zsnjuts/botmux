@@ -32,8 +32,11 @@ import {
 } from './config.js';
 import {
   globalConfigPath,
+  installGlobalConfigReadSnapshot,
   invalidateGlobalConfigCache,
+  normalizeGlobalConfig,
   readGlobalConfig,
+  readGlobalConfigDocument,
   repoPickerScanOptions,
   isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
@@ -220,6 +223,9 @@ import { isExactTextCloseCommand } from './im/lark/exact-close-command.js';
 import {
   getGroupContextSettings,
   groupContextSettingsStorePath,
+  installGroupContextSettingsReadSnapshot,
+  readGroupContextSettingsDocument,
+  type GroupContextSettingsRegistry,
 } from './services/group-context-settings-store.js';
 import { setGroupContextSettingsResolver } from './services/group-context-ingest.js';
 import { prepareGroupContextForTurn, captureNativeGroupContextInput } from './services/group-context-runtime.js';
@@ -468,6 +474,9 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
   setDurableBridgeFinalOutputHandler,
   setRestoredRemoteTurnReattachHandler,
+  checkWorkerLiveness,
+  broadcastWorkerConfigSnapshot,
+  WORKER_LIVENESS_PING_INTERVAL_MS,
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
 } from './core/worker-pool.js';
@@ -32011,12 +32020,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // write may land on any replica; polling SQL instead of enumerating local
     // daemon descriptors is what makes the refresh cross-Pod.
     if (durableConfigCoordinator) {
-      let appliedGlobalConfig = readGlobalConfig();
       const scopePaths: Record<DurableConfigScope, string> = {
         bots: getLoadedConfigPath() ?? '',
         global: globalConfigPath(),
         'group-context': groupContextSettingsStorePath(),
       };
+      // These documents live on the shared hard-mounted NFS volume, where one
+      // unanswered request blocks an open for the 60 s RPC timeout and the
+      // launcher then restarts a daemon whose heartbeat went stale. Serve the
+      // hot reads from memory; the CAS watchers below load each change off the
+      // event loop and keep the last good copy when a load fails (Mew #33).
+      let globalDocument = await readGlobalConfigDocument(scopePaths.global).catch(error => {
+        logger.warn(
+          `[durable-config:${cfg.larkAppId}] global config is unreadable at startup; using defaults: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return { raw: {}, config: normalizeGlobalConfig({}) };
+      });
+      installGlobalConfigReadSnapshot({
+        read: () => globalDocument.config,
+        readRaw: () => globalDocument.raw,
+        publish: raw => { globalDocument = { raw, config: normalizeGlobalConfig(raw) }; },
+      });
+      let groupContextRegistry: GroupContextSettingsRegistry = await readGroupContextSettingsDocument(
+        scopePaths['group-context'],
+      ).catch(error => {
+        logger.warn(
+          `[durable-config:${cfg.larkAppId}] group-context settings are unreadable at startup; sharing disabled: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return { schemaVersion: 1 as const, configs: {} };
+      });
+      installGroupContextSettingsReadSnapshot({
+        path: scopePaths['group-context'],
+        read: () => groupContextRegistry,
+        publish: registry => { groupContextRegistry = registry; },
+      });
+      let appliedGlobalConfig = readGlobalConfig();
       for (const scope of DURABLE_CONFIG_SCOPES) {
         const path = scopePaths[scope];
         if (!path) throw new Error(`durable ${scope} config path is unavailable`);
@@ -32029,10 +32069,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             switch (scope) {
               case 'bots':
                 await reloadRuntimeBotConfigFromDisk(idx, cfg.larkAppId);
+                broadcastWorkerConfigSnapshot();
                 break;
               case 'global':
                 {
                   const previous = appliedGlobalConfig;
+                  globalDocument = await readGlobalConfigDocument(path);
                   invalidateGlobalConfigCache();
                   // Force parse now so an invalid generation is reported by this
                   // Pod instead of staying latent until an unrelated request.
@@ -32043,12 +32085,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                       && next.dashboard?.crossPrincipalInterruption !== true) {
                     cancelAllCrossPrincipalInterruptionsForFeatureDisable();
                   }
+                  broadcastWorkerConfigSnapshot();
                 }
                 break;
               case 'group-context':
-                // Group-context settings are read from the canonical file on
-                // every access.  Observing the committed revision is the apply.
                 void inspection;
+                groupContextRegistry = await readGroupContextSettingsDocument(path);
                 break;
               default: {
                 const unsupported: never = scope;
@@ -33121,6 +33163,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     void closeIdleGroupSessions().catch(error => logger.warn(`[group-idle-close] sweep failed: ${String(error)}`));
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
+  // A Remote Runner worker stuck in a blocking syscall is killed and its turn
+  // re-attached (Mew #28).
+  const workerLivenessTimer = setInterval(() => checkWorkerLiveness(), WORKER_LIVENESS_PING_INTERVAL_MS);
+  workerLivenessTimer.unref?.();
 
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
@@ -33821,6 +33867,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(workerLivenessTimer);
     clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
@@ -34106,6 +34153,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setCrossPrincipalInterruptionDisableHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(workerLivenessTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);

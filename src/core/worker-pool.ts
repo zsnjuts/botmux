@@ -6403,6 +6403,111 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   ds.workerCardViewToken = null;
 }
 
+/** Mew #28: a worker whose main thread is stuck in a synchronous syscall (an
+ * NFS openat in D state was seen in production) stops reading its Remote
+ * Runner's output. The turn hangs silently while this daemon keeps renewing the
+ * Session lease, so no other replica can take it over. Every live Remote Runner
+ * worker is pinged; one that answers nothing for WORKER_LIVENESS_TIMEOUT_MS is
+ * killed, and a turn it was driving is re-attached once its provider has exited
+ * so the provider's recovered-turn path delivers the result. */
+export const WORKER_LIVENESS_PING_INTERVAL_MS = 30_000;
+const WORKER_LIVENESS_TIMEOUT_MS = 180_000;
+const WORKER_LIVENESS_PROVIDER_EXIT_WAIT_MS = 30_000;
+
+export function checkWorkerLiveness(now: number = Date.now()): void {
+  if (!activeSessionsRegistry) return;
+  for (const ds of new Set(activeSessionsRegistry.values())) {
+    const w = ds.worker;
+    if (!w || w.killed || ds.session.status !== 'active'
+        || !isRemoteBackendSession(ds) || isSessionTransferring(ds)) continue;
+    if (ds.workerLiveness?.worker !== w) ds.workerLiveness = { worker: w };
+    const pendingSince = ds.workerLiveness.pendingSince;
+    if (pendingSince !== undefined && now - pendingSince >= WORKER_LIVENESS_TIMEOUT_MS) {
+      recoverUnresponsiveWorker(ds, w, now - pendingSince);
+      continue;
+    }
+    ds.workerLiveness.pendingSince ??= now;
+    try { w.send({ type: 'liveness_ping' }); } catch { /* channel closed: the exit handler owns it */ }
+  }
+}
+
+/** Remote Runner workers serve config reads from the daemon's seed (Mew #28);
+ * hand them the reloaded config instead of letting them open shared storage. */
+export function broadcastWorkerConfigSnapshot(): void {
+  if (!activeSessionsRegistry) return;
+  const message = {
+    type: 'config_snapshot' as const,
+    botConfigSnapshot: getAllBots().map(bot => bot.config),
+    globalConfigSnapshot: readGlobalConfig(),
+  };
+  for (const ds of new Set(activeSessionsRegistry.values())) {
+    const w = ds.worker;
+    if (!w || w.killed || !isRemoteBackendSession(ds)) continue;
+    try { w.send(message); } catch { /* channel closed: the exit handler owns it */ }
+  }
+}
+
+function noteWorkerAlive(ds: DaemonSession, worker: ChildProcess): void {
+  if (ds.workerLiveness?.worker === worker) ds.workerLiveness.pendingSince = undefined;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function recoverUnresponsiveWorker(ds: DaemonSession, w: ChildProcess, stalledMs: number): void {
+  const providerPid = ds.localProcessAttestation?.cliPid;
+  const turnInFlight = ds.lastScreenStatus === 'working' || !!ds.activeInteractiveTurn;
+  logger.warn(
+    `[${tag(ds)}] Worker pid=${w.pid ?? '?'} answered no liveness ping for ${Math.round(stalledMs / 1000)}s`
+    + ` — killing it${turnInFlight ? ' and re-attaching its turn' : ''}`,
+  );
+  ds.workerLiveness = undefined;
+  retireWorkerProcessOnly(ds, 'worker_liveness_timeout');
+  // A main loop blocked in a syscall cannot run a SIGTERM handler.
+  try { w.kill('SIGKILL'); } catch { /* already gone */ }
+  if (!turnInFlight) return;
+  void reattachUnresponsiveWorkerTurn(ds, providerPid).catch(err => logger.warn(
+    `[${tag(ds)}] re-attach after unresponsive worker failed: ${err instanceof Error ? err.message : String(err)}`,
+  ));
+}
+
+async function reattachAfterProviderExit(ds: DaemonSession, providerPid: number | undefined): Promise<void> {
+  // The provider sees stdin EOF (or EPIPE on a full stdout) once its worker is
+  // gone and releases the Session lock on exit; a replacement started before
+  // that would fail to take the lock.
+  if (providerPid !== undefined) {
+    const deadline = Date.now() + WORKER_LIVENESS_PROVIDER_EXIT_WAIT_MS;
+    while (processAlive(providerPid) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+    }
+    if (processAlive(providerPid)) {
+      logger.warn(`[${tag(ds)}] Provider pid=${providerPid} outlived its unresponsive worker — killing it`);
+      try { process.kill(providerPid, 'SIGKILL'); } catch { /* already gone */ }
+      await new Promise(resolve => setTimeout(resolve, 2_000));
+    }
+  }
+  if (ds.worker || ds.session.status !== 'active'
+      || activeSessionsRegistry?.get(activeSessionKey(ds)) !== ds) return;
+  forkWorker(ds, '', { resume: true }, {
+    remoteResumeMode: 'reattach',
+    deferDuringDeviceIsolation: false,
+  });
+}
+
+let reattachUnresponsiveWorkerTurn = reattachAfterProviderExit;
+
+export function __testOnly_setWorkerLivenessReattach(
+  reattach?: (ds: DaemonSession, providerPid: number | undefined) => Promise<void>,
+): void {
+  reattachUnresponsiveWorkerTurn = reattach ?? reattachAfterProviderExit;
+}
+
 function clearTransferWorkerState(
   ds: DaemonSession,
   worker: ChildProcess | null,
@@ -14920,6 +15025,15 @@ export function forkWorker(
     // not guess this from the filesystem — existence and provenance are
     // independent facts (see core/config-dir.ts BotsConfigProvenance).
     loadedBotsConfigProvenance: getLoadedConfigProvenance(),
+    // A Remote Runner worker serves config reads from this seed and refreshes
+    // it off its main loop, so a hung shared-storage open cannot freeze the
+    // turn it is driving (Mew #28).
+    ...(isRemoteBackendType(resolvedBackendType)
+      ? {
+        botConfigSnapshot: getAllBots().map(bot => bot.config),
+        globalConfigSnapshot: readGlobalConfig(),
+      }
+      : {}),
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
@@ -15795,8 +15909,11 @@ function setupWorkerHandlers(
       logger.debug(`[${t}] Ignored stale worker message: ${msg.type}`);
       return;
     }
+    noteWorkerAlive(ds, worker);
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'liveness_pong':
+        break;
       case 'link_ref_register': {
         const runtime = getLinkRefRuntime();
         const result = runtime
