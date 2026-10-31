@@ -1,4 +1,5 @@
 import type { DurableJson } from './durable-coordination.js';
+import { canonicalJsonStringify } from '../utils/canonical-json.js';
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -195,6 +196,10 @@ export function durableInboxPayloadsAreEquivalent(
   if (existing.eventId !== incoming.eventId
       || (existing.lane ?? 'lark-message') !== (incoming.lane ?? 'lark-message')
       || existing.partitionKey !== incoming.partitionKey) return false;
+  // Replicas may disagree on the ordering key (chat mode not cached on one of
+  // them); it only narrows FIFO and never changes what the event is (Mew #100).
+  if (canonicalJsonStringify(withoutOrderingKey(existing.payload))
+      === canonicalJsonStringify(withoutOrderingKey(incoming.payload))) return true;
   const existingKey = durableInboxSemanticKey(existing);
   const existingCanonical = canonicalLarkReceive(existing);
   const incomingCanonical = canonicalLarkReceive(incoming);
@@ -202,4 +207,10 @@ export function durableInboxPayloadsAreEquivalent(
     && incomingCanonical !== undefined
     && existingCanonical !== undefined
     && receivePayloadsAreEquivalent(existingCanonical, incomingCanonical);
+}
+
+function withoutOrderingKey(payload: DurableJson): DurableJson {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const { orderingKey: _orderingKey, ...rest } = payload as Record<string, DurableJson>;
+  return rest as DurableJson;
 }
