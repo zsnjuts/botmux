@@ -56,6 +56,11 @@ export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
    * with a structured "not an orphan" verdict (the remote is alive or the
    * Session is dormant but resumable) instead of failing the proof. */
   'orphan_reconciliation_verdict',
+  /** With `orphan_reconciliation_verdict`, the provider reports a proven
+   * not-orphan Session that still owns an in-flight turn as
+   * `remote_turn_inflight`, so the host re-attaches and recovers that turn
+   * instead of releasing it with nobody driving it. */
+  'orphan_reconciliation_turn_inflight',
 ] as const;
 
 /** Optional in-turn user steering. The steer augments one already-active
@@ -74,6 +79,7 @@ export const REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES = [
   'turn_steer',
   'terminal_input',
   'orphan_reconciliation_verdict',
+  'orphan_reconciliation_turn_inflight',
   'startup_progress',
 ] as const;
 
@@ -81,7 +87,7 @@ export const REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES = [
  * an orphan. Only sent after `orphan_reconciliation_verdict` was negotiated. */
 export interface RemoteRunnerOrphanVerdict {
   verdict: 'not_orphan';
-  reason: 'remote_alive' | 'remote_resumable';
+  reason: 'remote_alive' | 'remote_resumable' | 'remote_turn_inflight';
 }
 
 export function normalizeRemoteRunnerOrphanVerdict(
@@ -91,7 +97,9 @@ export function normalizeRemoteRunnerOrphanVerdict(
   const value = raw as Record<string, unknown>;
   if (Object.keys(value).some(key => key !== 'verdict' && key !== 'reason')) return undefined;
   if (value.verdict !== 'not_orphan') return undefined;
-  if (value.reason !== 'remote_alive' && value.reason !== 'remote_resumable') return undefined;
+  if (value.reason !== 'remote_alive'
+      && value.reason !== 'remote_resumable'
+      && value.reason !== 'remote_turn_inflight') return undefined;
   return { verdict: 'not_orphan', reason: value.reason };
 }
 
