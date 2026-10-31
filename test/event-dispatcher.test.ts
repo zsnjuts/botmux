@@ -1677,6 +1677,37 @@ describe('Lark event dispatcher — durable primary processor', () => {
         retryAfterMs: 300,
       });
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+    // 这一行之前已在别处被领过多次（繁忙轮次重试、退出中的旧 Pod）：本副本仍先快速
+    // 退回两次，第三次才回到默认间隔。
+    const claimedElsewhere = (attempts: number) => {
+      const messageId = 'msg-live-peer-claimed-elsewhere';
+      const eventId = `im.message.receive_v1:${MY_APP_ID}:${messageId}`;
+      const partitionKey = `lark-message-routing:${MY_APP_ID}:chat-primary`;
+      return runtime.processDurableMessage({
+        eventType: 'lark.im.message.receive_v1',
+        eventId,
+        partitionKey,
+        larkAppId: MY_APP_ID,
+        messageId,
+        attempts,
+        data: followup(messageId),
+      }, {
+        claim: {
+          event: { eventId, partitionKey, payload: {}, visibleAt: 1, createdAt: 1 },
+          workerId: 'primary-worker', claimEpoch: attempts, claimUntil: 60_000, attempts,
+        },
+        signal: new AbortController().signal,
+        queuePostAdmissionOutput: () => undefined,
+        queuePostAdmissionControl: () => undefined,
+      });
+    };
+    const hints: Array<number | undefined> = [];
+    for (const attempts of [4, 5, 6]) {
+      const result = await claimedElsewhere(attempts);
+      hints.push(result.kind === 'retry' ? result.retryAfterMs : -1);
+    }
+    expect(hints).toEqual([300, 600, undefined]);
     runtime.close();
   });
 

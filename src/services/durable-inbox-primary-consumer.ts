@@ -61,6 +61,11 @@ export interface DurableInboxPrimaryConsumer {
   /** Redeliver retried events that are waiting on `wakeKey` now instead of at
    * their retry delay. Unknown keys are a no-op. */
   wakeRetry(wakeKey: string): void;
+  /** Start no new claims while in-flight and parked ones run their course, so
+   * live peers take the rows this process would have claimed (shutdown began). */
+  pauseClaims(): void;
+  /** Undo {@link pauseClaims} when the shutdown was refused and the process stays online. */
+  resumeClaims(): void;
   stop(timeoutMs?: number): Promise<DurableInboxPrimaryStopResult>;
   terminate(): void;
 }
@@ -206,6 +211,7 @@ export function startDurableInboxPrimaryConsumer(
   const parkedLeaseMs = retryDelayMs + PARKED_RETRY_LEASE_SLACK_MS;
   const canParkRetries = parkedLeaseMs <= leaseDurationMs;
   let stopped = false;
+  let claimsPaused = false;
   let claimsYieldUntil = 0;
   // Consecutive dispatch failures per event on this process. `claim.attempts`
   // also counts every explicit retry (busy Session, peer owner, pending
@@ -459,7 +465,7 @@ export function startDurableInboxPrimaryConsumer(
   const drainSlot = async (slot: Slot): Promise<void> => {
     const slotWorkerId = `${workerId}:${slot.index}`;
     for (let index = 0; index < batchSize && !stopped; index++) {
-      if (now() < claimsYieldUntil) return;
+      if (claimsPaused || now() < claimsYieldUntil) return;
       let claim: InboxClaim | undefined;
       try {
         claim = await options.store.claimNextInbox({
@@ -539,6 +545,12 @@ export function startDurableInboxPrimaryConsumer(
     ready,
     wake,
     wakeRetry,
+    pauseClaims: () => { claimsPaused = true; },
+    resumeClaims: () => {
+      if (!claimsPaused) return;
+      claimsPaused = false;
+      wake();
+    },
     terminate,
     stop: (timeoutMs = shutdownMs) => {
       if (stopPromise) return stopPromise;

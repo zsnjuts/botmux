@@ -756,6 +756,41 @@ describe('durable inbox primary consumer', () => {
     await store.close();
   });
 
+  it('finishes the in-flight claim but leaves new rows to peers while shutdown pauses claiming', async () => {
+    // Mew #93：滚动发布时旧 Pod 要先交接、等 worker 退出，最后才停消费者；
+    // 这段时间它若继续领取，消息会在旧 Pod 和接替的 Pod 之间来回放回。
+    const completed: InboxClaim[] = [];
+    const store = inboxStore({ claims: [claim('om_in_flight'), claim('om_after_pause')], completed });
+    const inFlight = deferred<void>();
+    const dispatched: string[] = [];
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => 9_000,
+      dispatch: async message => {
+        dispatched.push(message.messageId);
+        if (message.messageId === 'om_in_flight') await inFlight.promise;
+        return committed(message);
+      },
+    });
+    await vi.waitFor(() => expect(dispatched).toEqual(['om_in_flight']));
+
+    consumer.pauseClaims();
+    inFlight.resolve();
+    await consumer.ready;
+    await vi.waitFor(() => expect(completed).toHaveLength(1));
+    consumer.wake();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(dispatched).toEqual(['om_in_flight']);
+
+    // The shutdown was refused: this process stays online and claims again.
+    consumer.resumeClaims();
+    await vi.waitFor(() => expect(dispatched).toEqual(['om_in_flight', 'om_after_pause']));
+    await consumer.stop();
+  });
+
   describe('retry waiting on a wake key', () => {
     const waiting = (wakeKey = 'session:busy'): DurableInboxPrimaryDispatchResult => ({
       kind: 'retry',
