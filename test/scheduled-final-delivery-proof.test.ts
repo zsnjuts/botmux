@@ -9,6 +9,7 @@ import {
   verifyScheduledFinalDeliveryReadback,
 } from '../src/core/scheduled-final-delivery-proof.js';
 import { markGroupContextCardPurpose } from '../src/im/lark/group-context-card.js';
+import { buildTurnTerminalFooterPatch } from '../src/im/lark/card-builder.js';
 import { REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/reply-card-footer-signature.js';
 
 const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000099';
@@ -206,6 +207,18 @@ describe('scheduled final delivery proof', () => {
     }, proof);
     const card = markGroupContextCardPurpose(stamped, 'message');
 
+    expect(verify(card)).toEqual({ ok: true });
+  });
+
+  it('keeps the exact proof after the turn-end label is patched onto the footer', () => {
+    const card = markGroupContextCardPurpose(stampScheduledFinalDeliveryProof({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'final answer' }] },
+    }, proof), 'message');
+    const footer = card.body.elements.find((element: any) => element.element_id === 'botmux_reply_footer');
+    footer.content = buildTurnTerminalFooterPatch(JSON.stringify(card), 'completed', 'zh')!.content;
+
+    expect(scheduledFinalCardHasExactProof(card, proof)).toBe(true);
     expect(verify(card)).toEqual({ ok: true });
   });
 

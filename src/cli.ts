@@ -9302,6 +9302,7 @@ import {
 } from './im/lark/md-card.js';
 import { repairReplyMarkdown } from './services/reply-markdown.js';
 import {
+  buildRemoteOutboundInterimHeader,
   buildReplyLayoutHeader,
   parseReplyLayoutRequest,
   resolveReplyStyle,
@@ -13289,7 +13290,14 @@ async function cmdSend(rest: string[]): Promise<void> {
         ? { ...customReplyCard,
             config: { ...customReplyCard.config, update_multi: true },
             body: { ...customReplyCard.body, elements } }
-        : createReplyCard([...elements], layoutHeader);
+        : createReplyCard([...elements], layoutHeader ?? (
+          remoteRunnerOutbound && effectiveResponseKind !== 'final'
+            ? buildRemoteOutboundInterimHeader(
+                effectiveResponseKind,
+                t(`card.remote_outbound.${effectiveResponseKind}_header`, undefined, localeForBot(appId)),
+              )
+            : undefined
+        ));
       if (effectiveResponseKind === 'final') {
         composeFinalCardSections(canonicalCard, {
           ...(completionProposalRecord
