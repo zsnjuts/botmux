@@ -57,6 +57,7 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   __testOnly_setWorkerLivenessReattach,
   __testOnly_setupWorkerHandlers,
+  broadcastWorkerConfigSnapshot,
   checkWorkerLiveness,
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -190,6 +191,25 @@ describe('worker liveness watchdog', () => {
 
     checkWorkerLiveness(t0 + 210_000);
     expect(worker.kill).toHaveBeenCalledWith('SIGKILL');
+  });
+
+  it('pushes the reloaded config to Remote Runner workers only', () => {
+    const remote = createFixture();
+    const local = createFixture('tmux');
+    setActiveSessionsRegistry(new Map([
+      ['remote', remote.ds],
+      ['local', local.ds],
+    ]));
+
+    broadcastWorkerConfigSnapshot();
+
+    const pushed = remote.worker.send.mock.calls.map(([message]) => message as { type: string });
+    expect(pushed).toEqual([expect.objectContaining({
+      type: 'config_snapshot',
+      botConfigSnapshot: expect.any(Array),
+      globalConfigSnapshot: expect.any(Object),
+    })]);
+    expect(local.worker.send).not.toHaveBeenCalled();
   });
 
   it('leaves local CLI workers alone', () => {

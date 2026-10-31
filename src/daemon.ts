@@ -469,6 +469,7 @@ import {
   setDurableBridgeFinalOutputHandler,
   setRestoredRemoteTurnReattachHandler,
   checkWorkerLiveness,
+  broadcastWorkerConfigSnapshot,
   WORKER_LIVENESS_PING_INTERVAL_MS,
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
@@ -32031,6 +32032,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             switch (scope) {
               case 'bots':
                 await reloadRuntimeBotConfigFromDisk(idx, cfg.larkAppId);
+                broadcastWorkerConfigSnapshot();
                 break;
               case 'global':
                 {
@@ -32045,6 +32047,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                       && next.dashboard?.crossPrincipalInterruption !== true) {
                     cancelAllCrossPrincipalInterruptionsForFeatureDisable();
                   }
+                  broadcastWorkerConfigSnapshot();
                 }
                 break;
               case 'group-context':

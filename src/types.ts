@@ -1905,6 +1905,8 @@ type DaemonToWorkerBase =
   | { type: 'worker_ipc_probe' }
   /** Daemon liveness probe; answered from the worker's main loop (Mew #28). */
   | { type: 'liveness_ping' }
+  /** Replaces a Remote Runner worker's config seed after the daemon reloads. */
+  | { type: 'config_snapshot'; botConfigSnapshot: import('./bot-registry.js').BotConfig[]; globalConfigSnapshot: import('./global-config.js').GlobalConfig }
   | { type: 'plugin_result_delivery_result'; requestId: string; ok: boolean; messageIds?: string[]; error?: string }
   | { type: 'link_ref_register_result'; requestId: string; ok: boolean; companion?: string; stats?: Partial<import('./services/link-ref-types.js').LinkRefExtractionStats>; error?: string }
   | { type: 'link_ref_resolve_result'; requestId: string; ok: boolean; payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs; error?: string }

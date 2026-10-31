@@ -258,14 +258,13 @@ import {
   type BotConfig,
 } from './bot-registry.js';
 import {
-  globalConfigPath,
   installGlobalConfigReadSnapshot,
+  type GlobalConfig,
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
   isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
 } from './global-config.js';
-import { DashboardConfigSnapshotStore } from './dashboard/config-snapshot.js';
 import {
   stopSessionScope,
   sessionScopePayloadPid,
@@ -2750,26 +2749,18 @@ let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 
 /** Mew #28: a synchronous open of the shared (hard-mounted NFS) config store
  * once parked this main loop in D state for 74 minutes, silencing the turn.
- * A Remote Runner worker serves config reads from the daemon's seed and
- * refreshes it with bounded async reads, keeping the last good copy. */
-let workerConfigSnapshots: DashboardConfigSnapshotStore | undefined;
+ * A Remote Runner worker never opens it: config reads are served from the
+ * daemon's seed, which the daemon replaces over IPC when its config reloads. */
+let workerConfigSnapshot: { bots: BotConfig[]; global: GlobalConfig } | undefined;
 
 function installWorkerConfigSnapshots(init: Extract<DaemonToWorker, { type: 'init' }>): void {
-  if (workerConfigSnapshots || !init.botConfigSnapshot) return;
-  const botsPath = init.loadedBotsConfigProvenance === 'loaded' ? init.loadedBotsConfigPath : undefined;
-  const store = new DashboardConfigSnapshotStore({
-    botsPath: botsPath ?? '',
-    globalPath: globalConfigPath(),
-    initialBots: init.botConfigSnapshot,
-    ...(init.globalConfigSnapshot ? { initialGlobal: init.globalConfigSnapshot } : {}),
-    botsFileEnabled: !!botsPath,
-    ...(botsPath ? { onBotsSnapshotReady: adoptBotConfigSnapshotSource } : {}),
-    log: { warn: (message: string) => log(message) },
-  });
-  installBotConfigReadSnapshot(store.readBots);
-  installGlobalConfigReadSnapshot({ read: store.readGlobal, refresh: () => { void store.refreshGlobal(); } });
-  store.start();
-  workerConfigSnapshots = store;
+  if (workerConfigSnapshot || !init.botConfigSnapshot) return;
+  workerConfigSnapshot = { bots: init.botConfigSnapshot, global: init.globalConfigSnapshot ?? {} };
+  if (init.loadedBotsConfigProvenance === 'loaded' && init.loadedBotsConfigPath) {
+    adoptBotConfigSnapshotSource(init.loadedBotsConfigPath);
+  }
+  installBotConfigReadSnapshot(() => workerConfigSnapshot!.bots);
+  installGlobalConfigReadSnapshot({ read: () => workerConfigSnapshot!.global });
 }
 
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
@@ -26698,6 +26689,12 @@ process.on('message', async (raw: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'config_snapshot': {
+      if (workerConfigSnapshot) {
+        workerConfigSnapshot = { bots: msg.botConfigSnapshot, global: msg.globalConfigSnapshot };
+      }
+      break;
+    }
     case 'liveness_ping': {
       // Answered only while this main loop runs: a thread stuck in a
       // synchronous syscall (NFS openat in D state) stays silent (Mew #28).

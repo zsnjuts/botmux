@@ -6431,6 +6431,22 @@ export function checkWorkerLiveness(now: number = Date.now()): void {
   }
 }
 
+/** Remote Runner workers serve config reads from the daemon's seed (Mew #28);
+ * hand them the reloaded config instead of letting them open shared storage. */
+export function broadcastWorkerConfigSnapshot(): void {
+  if (!activeSessionsRegistry) return;
+  const message = {
+    type: 'config_snapshot' as const,
+    botConfigSnapshot: getAllBots().map(bot => bot.config),
+    globalConfigSnapshot: readGlobalConfig(),
+  };
+  for (const ds of new Set(activeSessionsRegistry.values())) {
+    const w = ds.worker;
+    if (!w || w.killed || !isRemoteBackendSession(ds)) continue;
+    try { w.send(message); } catch { /* channel closed: the exit handler owns it */ }
+  }
+}
+
 function noteWorkerAlive(ds: DaemonSession, worker: ChildProcess): void {
   if (ds.workerLiveness?.worker === worker) ds.workerLiveness.pendingSince = undefined;
 }

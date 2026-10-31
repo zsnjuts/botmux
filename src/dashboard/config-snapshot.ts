@@ -41,8 +41,6 @@ export interface DashboardConfigSnapshotOptions {
   botsPath: string;
   globalPath: string;
   initialBots?: BotConfig[];
-  /** Seed for readGlobal() until the first refresh lands. */
-  initialGlobal?: GlobalConfig;
   botsFileEnabled?: boolean;
   refreshIntervalMs?: number;
   readBudgetMs?: number;
@@ -96,10 +94,6 @@ export class DashboardConfigSnapshotStore {
     this.globalPath = options.globalPath;
     this.botsSnapshot = options.initialBots ?? [];
     this.rawBotsSnapshot = cloneJson(this.botsSnapshot);
-    if (options.initialGlobal) {
-      this.globalSnapshot = options.initialGlobal;
-      this.rawGlobalSnapshot = cloneJson(options.initialGlobal) as Record<string, unknown>;
-    }
     this.botsFileEnabled = options.botsFileEnabled !== false;
     this.refreshIntervalMs = options.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS;
     this.readBudgetMs = options.readBudgetMs ?? DEFAULT_READ_BUDGET_MS;

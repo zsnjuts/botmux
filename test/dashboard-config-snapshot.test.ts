@@ -57,20 +57,6 @@ describe('DashboardConfigSnapshotStore', () => {
     }
   });
 
-  it('serves the seeded global config until a read completes, and keeps it while reads hang', async () => {
-    const store = new DashboardConfigSnapshotStore({
-      botsPath: '/blocked/bots.json',
-      globalPath: '/blocked/config.json',
-      readBudgetMs: 20,
-      initialGlobal: { lang: 'en' },
-      readText: () => new Promise<string>(() => undefined),
-    });
-
-    expect(store.readGlobal()).toEqual({ lang: 'en' });
-    await expect(store.refreshGlobal()).resolves.toBe('timed_out');
-    expect(store.readGlobal()).toEqual({ lang: 'en' });
-  });
-
   it('allows only one blocked read per document instead of exhausting the worker pool', async () => {
     const calls = new Map<string, number>();
     const store = new DashboardConfigSnapshotStore({
