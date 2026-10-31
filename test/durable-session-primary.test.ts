@@ -13,6 +13,7 @@ import type { DurableLarkSessionControlClaim } from '../src/services/durable-lar
 import {
   admitDurableLarkSession,
   claimDurableLarkActiveSession,
+  commitDurableLarkBackgroundClose,
   commitDurableLarkSessionControl,
   durablePrimarySessionProjection,
   listValidDurablePrimarySessions,
@@ -392,6 +393,71 @@ describe('durable primary Session admission', () => {
     expect(store.readSession).not.toHaveBeenCalled();
     expect(store.writeSession).not.toHaveBeenCalled();
     await facade.stop();
+  });
+
+  // Mew #73：群空闲关闭等后台关闭只关了本地，canonical 仍是 active，下一条消息去接管
+  // 一个已经不存在的运行时。
+  describe('background close', () => {
+    const closedLocally = (overrides: Partial<Session> = {}) => session({
+      status: 'closed', closedAt: '2026-10-05T01:00:00.000Z', ...overrides,
+    });
+
+    it('commits the locally closed Session to the canonical record with a trusted close entry', async () => {
+      const { store, records } = fakeStore();
+      const facade = createDurableSessionFacade({ store, ownerId: 'owner-boot' });
+      await admitDurableLarkSession({ facade, message: message('om_root'), session: session() });
+
+      await expect(commitDurableLarkBackgroundClose({
+        facade, session: closedLocally(), reason: 'group idle close',
+      })).resolves.toMatchObject({ kind: 'committed' });
+
+      const parsed = parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!);
+      expect(parsed.session).toMatchObject({ sessionId: 'session-1', status: 'closed' });
+      expect(parsed.admission.messageId).toBe('om_root');
+      expect(parsed.controls.at(-1)).toMatchObject({
+        action: 'close', source: 'trusted-host', sessionId: 'session-1',
+        result: { status: 'closed', reason: 'group idle close' },
+      });
+      await facade.stop();
+    });
+
+    it('leaves a replaced, already closed or missing canonical Session untouched', async () => {
+      const { store, records } = fakeStore();
+      const facade = createDurableSessionFacade({ store, ownerId: 'owner-boot' });
+      await expect(commitDurableLarkBackgroundClose({
+        facade, session: closedLocally(), reason: 'group idle close',
+      })).resolves.toEqual({ kind: 'not_applicable', reason: 'canonical Session is missing' });
+
+      await admitDurableLarkSession({
+        facade, message: message('om_root'), session: session({ sessionId: 'session-successor' }),
+      });
+      const before = records.get('om_root::cli_test')!.revision;
+      await expect(commitDurableLarkBackgroundClose({
+        facade, session: closedLocally(), reason: 'group idle close',
+      })).resolves.toEqual({ kind: 'not_applicable', reason: 'canonical Session was replaced' });
+      expect(records.get('om_root::cli_test')!.revision).toBe(before);
+
+      await commitDurableLarkBackgroundClose({
+        facade, session: closedLocally({ sessionId: 'session-successor' }), reason: 'listener done',
+      });
+      await expect(commitDurableLarkBackgroundClose({
+        facade, session: closedLocally({ sessionId: 'session-successor' }), reason: 'listener done',
+      })).resolves.toEqual({ kind: 'not_applicable', reason: 'canonical Session is already closed' });
+      await facade.stop();
+    });
+
+    it('does not close a Session another replica has taken over meanwhile', async () => {
+      const { store } = fakeStore();
+      const facade = createDurableSessionFacade({ store, ownerId: 'owner-boot' });
+      vi.mocked(store.acquireSessionLease).mockResolvedValueOnce({
+        kind: 'occupied', ownerId: 'resumed-elsewhere', epoch: 7, leaseUntil: 90_000,
+      });
+      await expect(commitDurableLarkBackgroundClose({
+        facade, session: closedLocally(), reason: 'group idle close',
+      })).resolves.toMatchObject({ kind: 'occupied', ownerId: 'resumed-elsewhere' });
+      expect(store.writeSession).not.toHaveBeenCalled();
+      await facade.stop();
+    });
   });
 
   it('fails closed when the canonical Session changed before takeover claim', async () => {

@@ -142,6 +142,7 @@ import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-out
 import { resolveDurablePrimaryOutputClaim } from './services/durable-primary-output-claim.js';
 import {
   claimDurableLarkActiveSession,
+  commitDurableLarkBackgroundClose,
   listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
@@ -439,6 +440,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
   closeSessionForBackgroundCleanup,
+  setBackgroundSessionCloseObserver,
   hasPendingOrdinaryImInput,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
@@ -33032,6 +33034,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         },
       });
     });
+    setBackgroundSessionCloseObserver(async (closedSessionId, context) => {
+      const closed = sessionStore.getOwnedSession(closedSessionId);
+      if (!closed || closed.status !== 'closed') return;
+      const runtime = durablePrimaryRuntimeByApp.get(closed.larkAppId || cfg.larkAppId);
+      if (!runtime) return;
+      const committed = await commitDurableLarkBackgroundClose({
+        facade: runtime.session,
+        session: closed,
+        reason: context,
+      });
+      logger.info(
+        `[${closedSessionId.slice(0, 8)}] ${context}: canonical close `
+        + `${committed.kind === 'not_applicable' ? `skipped (${committed.reason})` : committed.kind}`,
+      );
+    });
   } else {
     useOrdinaryOutputDelivery();
   }
@@ -34091,6 +34108,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
+    setBackgroundSessionCloseObserver(undefined);
     setDurableSessionListHandler(null);
     for (const watcher of durableConfigReloadWatchers) watcher.terminate();
     setDurableConfigCoordinator(undefined);
@@ -34184,6 +34202,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
+    setBackgroundSessionCloseObserver(undefined);
     setDurableSessionListHandler(null);
     for (const watcher of durableConfigReloadWatchers) watcher.terminate();
     setDurableConfigCoordinator(undefined);

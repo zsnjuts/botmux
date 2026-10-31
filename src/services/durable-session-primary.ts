@@ -400,6 +400,90 @@ export async function commitDurableLarkSessionControl(input: {
   return { kind: 'committed', lease: written.lease, record: written.record };
 }
 
+/** The canonical record no longer describes the Session this replica closed. */
+class DurableBackgroundCloseNotApplicable extends Error {}
+
+export type DurableLarkBackgroundCloseResult =
+  | { kind: 'committed'; record: DurableSessionRecord }
+  | { kind: 'not_applicable'; reason: string }
+  | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
+
+/**
+ * Commit a close that happened without a lifecycle control (group idle,
+ * message-listener completion, withdraw auto-close, …). Those paths only closed
+ * the local runtime, so the canonical record stayed active and the next message
+ * in the topic tried to take over a runtime that no longer existed (Mew #73).
+ * The write goes through the Session lease: if another replica already took
+ * the Session over, it is occupied and nothing is committed.
+ */
+export async function commitDurableLarkBackgroundClose(input: {
+  facade: DurableSessionFacade;
+  session: Session;
+  reason: string;
+}): Promise<DurableLarkBackgroundCloseResult> {
+  if (input.session.status !== 'closed') {
+    return { kind: 'not_applicable', reason: 'local Session is not closed' };
+  }
+  const identity = primarySessionIdentity(input.session);
+  const closedAt = input.session.closedAt ?? new Date().toISOString();
+  const control: DurablePrimarySessionControl = {
+    version: 1,
+    type: 'botmux.lark.session-control-commit',
+    operationId: boundedText(
+      ['trusted-host.background-close', identity.larkAppId, input.session.sessionId, closedAt].join(':'),
+      'durable background close operationId',
+      1_024,
+    ),
+    larkAppId: identity.larkAppId,
+    action: 'close',
+    sessionId: input.session.sessionId,
+    operatorOpenId: 'trusted-host',
+    cardMessageId: 'none',
+    source: 'trusted-host',
+    result: {
+      version: 1,
+      type: 'botmux.lark.session-control-result',
+      action: 'close',
+      sessionId: input.session.sessionId,
+      status: 'closed',
+      reason: boundedText(input.reason, 'durable background close reason', 256),
+    },
+  };
+  const sessionValue = cloneSession(input.session);
+  let written: DurableSessionFacadeWriteResult;
+  try {
+    written = await input.facade.writeExactFromCurrent(identity.sessionKey, current => {
+      if (!current) throw new DurableBackgroundCloseNotApplicable('canonical Session is missing');
+      const parsed = parseDurablePrimarySessionRecord(current);
+      if (parsed.session.sessionId !== input.session.sessionId) {
+        throw new DurableBackgroundCloseNotApplicable('canonical Session was replaced');
+      }
+      if (parsed.session.status !== 'active') {
+        throw new DurableBackgroundCloseNotApplicable('canonical Session is already closed');
+      }
+      const next: DurablePrimarySessionProjection = {
+        version: DURABLE_PRIMARY_SESSION_VERSION,
+        type: 'botmux.session.primary',
+        session: sessionValue,
+        admission: parsed.admission,
+        admissions: parsed.admissions,
+        control,
+        controls: [...parsed.controls, control].slice(-DURABLE_PRIMARY_CONTROL_LIMIT),
+      };
+      return next as unknown as DurableJson;
+    });
+  } catch (error) {
+    if (error instanceof DurableBackgroundCloseNotApplicable) {
+      return { kind: 'not_applicable', reason: error.message };
+    }
+    throw error;
+  }
+  if (written.kind === 'written' || written.kind === 'unchanged') {
+    return { kind: 'committed', record: written.record };
+  }
+  return written;
+}
+
 /**
  * Persist one exact canonical Session snapshot and mint the only committed
  * result accepted by the primary inbox consumer.

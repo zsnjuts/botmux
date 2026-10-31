@@ -1370,6 +1370,24 @@ describe('closeSessionForBackgroundCleanup', () => {
     expect(warned).not.toMatch(/远端会话.*未.*取消|remote session .*undefined/);
   });
 
+  it('hands a completed background close to the canonical observer without letting it fail the close', async () => {
+    // Mew #73：primary 下要把这次关闭同步到 canonical；同步失败只记日志，不能把已完成的关闭变成失败。
+    const fixture = createFixture();
+    const { setBackgroundSessionCloseObserver } = await import('../src/core/worker-pool.js');
+    const observed: Array<[string, string]> = [];
+    setBackgroundSessionCloseObserver(async (sessionId, context) => {
+      observed.push([sessionId, context]);
+      throw new Error('coordination unavailable');
+    });
+    try {
+      const result = await closeSessionForBackgroundCleanup(fixture.session.sessionId, 'group idle close');
+      expect(result).toMatchObject({ ok: true });
+      expect(observed).toEqual([[fixture.session.sessionId, 'group idle close']]);
+    } finally {
+      setBackgroundSessionCloseObserver(undefined);
+    }
+  });
+
   it('logs an error when a background close is refused', async () => {
     cancelMojoMock.mockResolvedValue({ kind: 'failed', message: 'HTTP 500', retryable: true });
     const fixture = createFixture();

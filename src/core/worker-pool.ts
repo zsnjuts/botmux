@@ -9534,12 +9534,33 @@ export type CloseSessionResult =
  *
  * Returns the untouched result so a caller that DOES care can still branch.
  */
+/** Primary mode: commit a background close to the canonical Session record. */
+let backgroundSessionCloseObserver: ((sessionId: string, context: string) => Promise<void>) | undefined;
+
+export function setBackgroundSessionCloseObserver(
+  observer: ((sessionId: string, context: string) => Promise<void>) | undefined,
+): void {
+  backgroundSessionCloseObserver = observer;
+}
+
 export async function closeSessionForBackgroundCleanup(
   sessionId: string,
   context: string,
 ): Promise<CloseSessionResult> {
   const result = await closeSession(sessionId);
   const tagId = sessionId.slice(0, 8);
+  if (result.ok && backgroundSessionCloseObserver) {
+    // Without this the canonical record stays active and the next message in
+    // the topic tries to take over a runtime that no longer exists (Mew #73).
+    try {
+      await backgroundSessionCloseObserver(sessionId, context);
+    } catch (error) {
+      logger.warn(
+        `[${tagId}] ${context}: canonical close was not committed: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
   if (!result.ok) {
     logger.error(
       `[${tagId}] ${context}: close REFUSED (${result.error}); the row stays active `
