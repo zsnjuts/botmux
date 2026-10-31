@@ -117,11 +117,11 @@ interface ParkedRetry {
 /** Slack between a parked retry's deadline and its shortened claim lease, so a
  * slightly late hand-back still owns the claim. */
 const PARKED_RETRY_LEASE_SLACK_MS = 2_000;
-/** Rows still claimable after this many claims are completed even when no
- * process saw `maxAttempts` failures in a row, e.g. after repeated restarts.
- * Waiting retries never get near it: 1024 claims at the 5 s retry delay is
- * well over an hour of one turn. */
-const ATTEMPT_CEILING_PER_MAX_ATTEMPT = 64;
+/** A failing row this old is completed even when no process saw `maxAttempts`
+ * failures in a row (e.g. restarts in between). Measured in time, not claims:
+ * every explicit retry is also a claim, and a follow-up may legitimately wait
+ * behind a turn of an hour or more. */
+const FAILING_ROW_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 /** Bound for the per-event failure streaks this process remembers. */
 const FAILURE_STREAK_LIMIT = 4_096;
 /** Floor for a dispatch-provided early retry hint, so a hint cannot spin the queue. */
@@ -343,7 +343,7 @@ export function startDurableInboxPrimaryConsumer(
         failureStreaks.delete(failureStreaks.keys().next().value!);
       }
       if (failures >= maxAttempts
-          || claim.attempts >= maxAttempts * ATTEMPT_CEILING_PER_MAX_ATTEMPT) {
+          || now() - claim.event.createdAt >= FAILING_ROW_MAX_AGE_MS) {
         failureStreaks.delete(eventId);
         const completed = await options.store.completeInboxClaim(claim);
         if (completed.kind === 'stale') {

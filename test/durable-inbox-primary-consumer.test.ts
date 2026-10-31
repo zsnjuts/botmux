@@ -422,6 +422,7 @@ describe('durable inbox primary consumer', () => {
       concurrency: 1,
       intervalMs: 60_000,
       maxAttempts: 3,
+      now: () => 9_000,
       dispatch: async message => {
         call += 1;
         if (call === 1) return { kind: 'retry', reason: 'session has an unfinished turn' };
@@ -452,6 +453,7 @@ describe('durable inbox primary consumer', () => {
       concurrency: 1,
       intervalMs: 60_000,
       maxAttempts: 3,
+      now: () => 9_000,
       dispatch: async message => {
         const outcome = outcomes[call++];
         if (outcome === 'fail') throw new Error('provider unavailable');
@@ -467,10 +469,10 @@ describe('durable inbox primary consumer', () => {
     await consumer.stop();
   });
 
-  it('settles a failing row that crossed the absolute claim ceiling', async () => {
+  it('settles a failing row that has been queued for hours', async () => {
     const dropped: Array<[string, number]> = [];
     const store = inboxStore({
-      claims: [{ ...claim('om_ceiling'), attempts: 3 * 64 }],
+      claims: [{ ...claim('om_ceiling'), attempts: 192 }],
       completed: [],
       retried: [],
     });
@@ -480,6 +482,7 @@ describe('durable inbox primary consumer', () => {
       concurrency: 1,
       intervalMs: 60_000,
       maxAttempts: 3,
+      now: () => 1 + 7 * 60 * 60 * 1000,
       dispatch: async () => { throw new Error('provider unavailable'); },
       onExhausted: ({ message, attempts }) => { dropped.push([message.messageId, attempts]); },
     });
@@ -511,6 +514,7 @@ describe('durable inbox primary consumer', () => {
       concurrency: 1,
       intervalMs: 60_000,
       maxAttempts: 3,
+      now: () => 9_000,
       dispatch: async message => {
         if (message.messageId === 'om_exhausted') throw new Error('provider unavailable');
         return committed(message);
@@ -591,6 +595,7 @@ describe('durable inbox primary consumer', () => {
       workerId: 'primary-boot',
       concurrency: 1,
       intervalMs: 60_000,
+      now: () => 9_000,
       dispatch: async () => ({ kind: 'committed' } as never),
     });
     await consumer.ready;
@@ -608,6 +613,7 @@ describe('durable inbox primary consumer', () => {
       workerId: 'primary-boot',
       concurrency: 1,
       intervalMs: 60_000,
+      now: () => 9_000,
       dispatch: async message => {
         const result = committed(message);
         return {
