@@ -1755,9 +1755,11 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     findSession: findActiveBySessionId,
     ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
+  // A lookup timeout is transient: 503 tells the Runner to retry instead of
+  // reporting a blocked actor.
   return result.ok
     ? jsonRes(res, 200, result.document)
-    : jsonRes(res, 403, {
+    : jsonRes(res, result.error === 'current_actor_lookup_timeout' ? 503 : 403, {
         schema: 'botmux.current-actor.v2',
         status: 'blocked',
         error: result.error,

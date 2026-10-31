@@ -65,6 +65,25 @@ describe('POST /api/current-actor', () => {
     });
   });
 
+  it.skipIf(process.platform !== 'linux')('answers 503 with a retryable code when the contact lookup exceeds its budget', async () => {
+    // Mew #70：Runner 只对这个状态码和错误码重试；403 仍表示身份确认不了。
+    const { resolveVerifiedUserIdentity } = await import('../src/im/lark/identity-cache.js');
+    vi.mocked(resolveVerifiedUserIdentity).mockImplementationOnce(() => new Promise(() => {}));
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(activeSession());
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 's-actor' }),
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      schema: 'botmux.current-actor.v2',
+      status: 'blocked',
+      error: 'current_actor_lookup_timeout',
+    });
+  }, 15_000);
+
   it('fails closed when daemon live-turn state has no human caller', async () => {
     const ds = activeSession();
     delete ds.managedTurnOrigin.callerOpenId;
