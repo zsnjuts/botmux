@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { config } from '../config.js';
 import {
@@ -27,9 +28,28 @@ const DEFAULT_GROUP_CONTEXT_SETTINGS: GroupContextSettings = {
   maxMessages: 10_000,
 };
 
-interface GroupContextSettingsRegistry {
+export interface GroupContextSettingsRegistry {
   schemaVersion: 1;
   configs: Record<string, GroupContextSettings>;
+}
+
+interface GroupContextSettingsReadSnapshot {
+  path: string;
+  read: () => GroupContextSettingsRegistry;
+  /** Receives the registry a same-process write just committed. */
+  publish?: (registry: GroupContextSettingsRegistry) => void;
+}
+
+let registrySnapshot: GroupContextSettingsReadSnapshot | null = null;
+
+/** Serve reads of one settings file from memory instead of opening shared
+ *  storage on every access (Mew #33). Returns a disposer. */
+export function installGroupContextSettingsReadSnapshot(provider: GroupContextSettingsReadSnapshot): () => void {
+  const previous = registrySnapshot;
+  registrySnapshot = provider;
+  return () => {
+    if (registrySnapshot === provider) registrySnapshot = previous;
+  };
 }
 
 export function groupContextSettingsStorePath(dataDir: string = config.session.dataDir): string {
@@ -74,7 +94,23 @@ function validateSettings(value: unknown, label: string): asserts value is Group
 
 function readRegistry(path: string): GroupContextSettingsRegistry {
   if (!existsSync(path)) return emptyRegistry();
-  const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  return parseRegistry(JSON.parse(readFileSync(path, 'utf8')));
+}
+
+/** Read and validate the settings file off the event loop; a missing file is
+ *  the empty registry, anything invalid rejects. */
+export async function readGroupContextSettingsDocument(path: string): Promise<GroupContextSettingsRegistry> {
+  let text: string;
+  try {
+    text = await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyRegistry();
+    throw error;
+  }
+  return parseRegistry(JSON.parse(text));
+}
+
+function parseRegistry(parsed: unknown): GroupContextSettingsRegistry {
   if (!isRecord(parsed)) {
     throw new Error(`${GROUP_CONTEXT_SETTINGS_STORE_FILE} must contain an object`);
   }
@@ -109,7 +145,7 @@ export function getGroupContextSettings(
   if (!GROUP_CHAT_ID_PATTERN.test(chatId)) return { ...DEFAULT_GROUP_CONTEXT_SETTINGS };
   try {
     const path = groupContextSettingsStorePath(dataDir);
-    const configs = readRegistry(path).configs;
+    const configs = (registrySnapshot?.path === path ? registrySnapshot.read() : readRegistry(path)).configs;
     const settings = Object.hasOwn(configs, chatId) ? configs[chatId] : undefined;
     return { ...(settings ?? DEFAULT_GROUP_CONTEXT_SETTINGS) };
   } catch (error) {
@@ -161,6 +197,7 @@ export async function setGroupContextSettings(
         };
         registry.configs[chatId] = result;
         writeRegistry(path, registry);
+        if (registrySnapshot?.path === path) registrySnapshot.publish?.(registry);
       });
       return { ...result };
     },

@@ -13,7 +13,10 @@ import { join } from 'node:path';
 import {
   GROUP_CONTEXT_SETTINGS_FILE_ENV,
   getGroupContextSettings,
+  installGroupContextSettingsReadSnapshot,
+  readGroupContextSettingsDocument,
   setGroupContextSettings,
+  type GroupContextSettingsRegistry,
 } from '../src/services/group-context-settings-store.js';
 import { createDurableConfigCoordinator } from '../src/services/durable-config-coordinator.js';
 import { setDurableConfigCoordinator } from '../src/services/durable-config-mutation.js';
@@ -35,6 +38,34 @@ function dataDir(): string {
 }
 
 describe('group context settings store', () => {
+  it('serves an installed snapshot for its file and publishes same-process writes', async () => {
+    // Mew #33: the daemon must not open this NFS-backed file on every access.
+    const dir = dataDir();
+    const path = join(dir, 'group-context-settings.json');
+    await expect(readGroupContextSettingsDocument(path)).resolves.toEqual({ schemaVersion: 1, configs: {} });
+    let registry: GroupContextSettingsRegistry = {
+      schemaVersion: 1,
+      configs: { oc_group: { enabled: true, maxContextChars: 24_000, retentionDays: 30, maxMessages: 10_000 } },
+    };
+    const uninstall = installGroupContextSettingsReadSnapshot({
+      path,
+      read: () => registry,
+      publish: next => { registry = next; },
+    });
+    try {
+      expect(getGroupContextSettings('app_one', 'oc_group', dir).enabled).toBe(true);
+
+      await setGroupContextSettings('oc_other', { enabled: true }, dir);
+
+      expect(registry.configs.oc_other?.enabled).toBe(true);
+      expect(getGroupContextSettings('app_one', 'oc_other', dir).enabled).toBe(true);
+      expect(getGroupContextSettings('app_one', 'oc_group', dir).enabled).toBe(false);
+      expect(getGroupContextSettings('app_one', 'oc_group', dataDir()).enabled).toBe(false);
+    } finally {
+      uninstall();
+    }
+  });
+
   it('defaults sharing off for every managed bot in an unconfigured group', () => {
     const dir = dataDir();
     const expected = {
