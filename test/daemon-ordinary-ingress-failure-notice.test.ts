@@ -1125,8 +1125,10 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       vi.useRealTimers();
     }
 
+    // Mew #72：挂在持有 worker 的本副本上，晚到的回执直接唤醒它补写 admission。
     expect(ctx.ingressAdmission).toMatchObject({
       retryReason: 'provider submit receipt is still pending after worker refork',
+      retryWakeKey: `session:${ds.session.sessionId}`,
     });
     // The worker may still die before ready; its startup failure must reach the user.
     expect(ds.suppressRecoveryCard).toBeUndefined();
@@ -1299,9 +1301,11 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     // Not the 60 s receipt timeout, and not "admitted": an admitted retry
     // would be deduplicated away and the follow-up lost.
     expect(Date.now() - started).toBeLessThan(5_000);
+    // Parked on this replica until the target turn ends (or a late receipt).
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'provider submit receipt is still pending',
+      retryWakeKey: `session:${ds.session.sessionId}`,
     });
     expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
   });
@@ -1336,6 +1340,39 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       content: `<at user_id="${OWNER}"></at> 收到，引导成功`,
       providerUuid: expect.stringMatching(/^turn_steer_accepted_[a-f0-9]{24}$/),
     }));
+  });
+
+  it('admits a follow-up on retry when its receipt landed after the previous attempt gave up', async () => {
+    // Mew #72：冷恢复超过回执等待，第一次尝试已把输入送进 worker 后转 retry。
+    // 回执晚到之后，重投必须直接确认接纳（写 canonical admission），不能再发一遍。
+    const anchor = 'om_thread_primary_late_receipt';
+    const turnId = 'om_primary_late_receipt_follow_up';
+    const caller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(
+      anchor,
+      caller,
+      turnId,
+      { providerSteer: false },
+    );
+    ds.session.durablePrimaryInputCommits = [];
+    // No attempt is waiting any more: the daemon must hand the row back now.
+    expect(__testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId,
+      dispatchAttempt: 1,
+      durablePrimaryInbox: true,
+    }, 12)).toBe(false);
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 2, signal: new AbortController().signal };
+
+    await handleThreadReply(makeEventData(turnId, 'follow-up after cold restore', anchor), ctx);
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
   });
 
   it('keeps a same-principal follow-up waiting when the live provider did not negotiate steer', async () => {

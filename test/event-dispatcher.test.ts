@@ -1832,6 +1832,66 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('redelivers an admitted turn whose provider receipt wait expired until admission commits', async () => {
+    // Mew #72：送进 worker 后回执等待超时（冷恢复、等名额）。这次重试不能被
+    // 「已触发」去重吞掉，否则 canonical admission 永远不写，最终答案被丢弃。
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-primary-receipt',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-receipt-root',
+      scope: 'thread' as const,
+      title: 'Cold restore',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => canonical);
+    handlers.isSessionOwner = vi.fn(() => true);
+    let receiptArrived = false;
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.ingressAdmission.admitted = true;
+      if (!receiptArrived) {
+        ctx.ingressAdmission.retryReason = 'provider submit receipt is still pending';
+      }
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession: async () => canonical,
+      },
+    );
+    const messageId = 'msg-primary-receipt-followup';
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow-up after cold restore' }),
+      messageId,
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_receipt',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, messageId))
+      .resolves.toEqual({ kind: 'retry', reason: 'provider submit receipt is still pending' });
+    expect(hasTriggeredMessage(MY_APP_ID, messageId)).toBe(false);
+
+    receiptArrived = true;
+    await expect(processPrimary(runtime, data, messageId))
+      .resolves.toEqual({ kind: 'admitted', session: canonical });
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
+    expect(hasTriggeredMessage(MY_APP_ID, messageId)).toBe(true);
+    runtime.close();
+  });
+
   it('applies the active canonical owner fence to bot-to-bot follow-ups', async () => {
     setupBotState({ allowedUsers: [] });
     mockGetChatMode.mockResolvedValue('topic');

@@ -23716,12 +23716,13 @@ function durablePrimaryAdmissibleRetryWakeKey(ds: DaemonSession): string | undef
     : undefined;
 }
 
+/** Returns whether a live Inbox attempt was still waiting for this receipt. */
 function recordDurablePrimaryInputCommit(
   ds: DaemonSession,
   receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
   workerGeneration: number,
-): void {
-  if (!receipt.durablePrimaryInbox) return;
+): boolean {
+  if (!receipt.durablePrimaryInbox) return false;
   if (receipt.activeTurnSteer) {
     // Before waking waiters: whichever attempt observes this commit owns the
     // acceptance notice.
@@ -23744,13 +23745,14 @@ function recordDurablePrimaryInputCommit(
   }
   const key = durablePrimaryInputCommitKey(ds.session.sessionId, receipt.turnId);
   const waiters = durablePrimaryInputCommitWaiters.get(key);
-  if (!waiters) return;
+  if (!waiters) return false;
   durablePrimaryInputCommitWaiters.delete(key);
   for (const waiter of waiters) {
     clearTimeout(waiter.timer);
     waiter.signal.removeEventListener('abort', waiter.onAbort);
     waiter.resolve();
   }
+  return true;
 }
 
 export const __testOnly_recordDurablePrimaryInputCommit = recordDurablePrimaryInputCommit;
@@ -24070,7 +24072,8 @@ async function submitDurablePrimaryRetryTurn(
     // Do not let command-handler's broad catch turn that into a direct
     // submit-failed side effect from the stale owner.
     if (dispatch.signal.aborted) return { kind: 'retry', inputAccepted: true };
-    retryDurablePrimaryIngress(ctx, 'retry provider submit receipt is still pending');
+    // Park on this replica (it holds the worker): the late receipt wakes it.
+    retryDurablePrimaryIngress(ctx, 'retry provider submit receipt is still pending', ds);
     logger.warn(
       `[${tag(ds)}] Durable-primary /retry ${turnId.slice(0, 12)} will retry `
       + `after provider submit receipt wait failed: `
@@ -28241,7 +28244,10 @@ async function handleThreadReplyAdmitted(
             );
           } catch (error) {
             if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
-            retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending');
+            // Park on this replica (it holds the worker) instead of handing the
+            // row to the queue, where the other replica may keep claiming it
+            // while the final output waits for this admission (Mew #72).
+            retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending', ds);
             logger.warn(
               `[${tag(ds)}] Durable-primary turn ${parsed.messageId.slice(0, 12)} `
               + `will retry after provider submit receipt wait failed: `
@@ -28748,7 +28754,8 @@ async function handleThreadReplyAdmitted(
         );
       } catch (error) {
         if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
-        retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending after worker refork');
+        // Park on this replica (it holds the worker): the late receipt wakes it.
+        retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending after worker refork', ds);
         logger.warn(
           `[${tag(ds)}] Durable-primary reforked turn ${parsed.messageId.slice(0, 12)} `
           + `will retry after provider submit receipt wait failed: `
@@ -31103,7 +31110,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (durableCoordinationRuntime?.mode !== 'primary'
           || !durablePrimaryRuntimeByApp.has(ds.larkAppId)) return;
       if (ds.session.workerGeneration !== context.workerGeneration) return;
-      recordDurablePrimaryInputCommit(ds, receipt, context.workerGeneration);
+      const waited = recordDurablePrimaryInputCommit(ds, receipt, context.workerGeneration);
+      // The submitting attempt already gave up waiting (cold restore, capacity
+      // wait) and handed its row back. Redeliver it now so it commits the
+      // canonical admission before this turn's final output needs it (Mew #72).
+      if (!waited && receipt.durablePrimaryInbox) {
+        durablePrimaryRuntimeByApp.get(ds.larkAppId)?.inbox.wakeRetry(durablePrimaryRetryWakeKey(ds));
+      }
     },
     onNativeInputConsumed(ds, receipt, context) {
       // The worker proved this exact input entered its native conversation.
