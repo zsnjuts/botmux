@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { logger } from '../../utils/logger.js';
 import type {
+  ActiveTurnInterruptResult,
+  ActiveTurnInterruptTarget,
   BackendTurnFailure,
   BackendTurnInput,
   BackendTurnSubmission,
@@ -71,6 +73,13 @@ type SessionToolOperation = {
 };
 
 const MAX_OUTBOUND_MESSAGES_PER_TURN = 10;
+/** A provider that has not natively started the turn yet is asked again at
+ * this pace until the caller's stop deadline. */
+const ACTIVE_TURN_INTERRUPT_RETRY_MS = 1_000;
+/** Slack between the Lark clock that stamps a stop message and this host's
+ * clock, plus the ingest latency of the message that started the turn. A turn
+ * submitted later than this after the stop was issued is a successor. */
+const ACTIVE_TURN_INTERRUPT_ISSUE_GRACE_MS = 2_000;
 const MAX_SESSION_TOOLS_PER_TURN = 30;
 const MAX_DEFERRED_RECOVERED_EVENTS = 128;
 
@@ -123,6 +132,12 @@ export class RemoteRunnerBackend implements SessionBackend {
   private activeTurnHostContext: RemoteRunnerTurnHostContext = {};
   private activeTurnAccepted = false;
   private activeTurnAcceptedCb: (() => void) | null = null;
+  /** Host clock when the active turn was handed to submitTurn; null for a turn
+   * recovered from an earlier host generation (it predates this process). */
+  private activeTurnSubmittedAtMs: number | null = null;
+  /** interruptActiveTurn callers waiting for the active turn to be accepted or
+   * to end; woken on either edge and re-check state themselves. */
+  private readonly activeTurnEdgeWaiters = new Set<() => void>();
   private ready = false;
   private killed = false;
   private closing = false;
@@ -279,7 +294,91 @@ export class RemoteRunnerBackend implements SessionBackend {
     return true;
   }
 
+  /**
+   * Ctrl-C the active turn and report what the provider proved, instead of the
+   * fire-and-forget `write('\x03')`. A turn that is not acknowledged yet, or
+   * that the provider has not natively started, cannot take Ctrl-C (prompt
+   * submission would swallow it); keep asking until `deadlineMs`.
+   */
+  async interruptActiveTurn(
+    deadlineMs: number,
+    target: ActiveTurnInterruptTarget = {},
+  ): Promise<ActiveTurnInterruptResult> {
+    const turnId = this.activeTurnId;
+    if (!turnId || (target.expectedTurnId !== undefined && target.expectedTurnId !== turnId)) {
+      return { outcome: 'no_active_turn' };
+    }
+    if (target.issuedAtMs !== undefined && this.activeTurnSubmittedAtMs !== null
+        && this.activeTurnSubmittedAtMs > target.issuedAtMs + ACTIVE_TURN_INTERRUPT_ISSUE_GRACE_MS) {
+      logger.info(`[remote-runner] stop issued before turn ${turnId.substring(0, 12)} was submitted; leaving it running`);
+      return { outcome: 'no_active_turn' };
+    }
+    if (!this.providerCapabilities.has('terminal_input')) return { outcome: 'unknown', turnId };
+    while (this.activeTurnId === turnId && !this.activeTurnAccepted) {
+      if (Date.now() >= deadlineMs) return { outcome: 'not_ready', turnId };
+      await this.waitForActiveTurnEdge(deadlineMs);
+    }
+    for (;;) {
+      if (this.activeTurnId !== turnId) return { outcome: 'no_active_turn', turnId };
+      const generation = this.state?.generation;
+      if (!this.ready || !this.child || this.killed || generation === undefined) {
+        return { outcome: 'unknown', turnId };
+      }
+      const requestId = this.requestId('terminal-input');
+      // The request keeps the normal operation timeout so a late receipt is
+      // still consumed as its answer rather than as a protocol violation; only
+      // this caller stops waiting at its deadline.
+      const receipt = this.request(
+        remoteRunnerCommand('terminal_input', { requestId, generation, data: '\x03' }),
+        event => event.type === 'status',
+        this.operationTimeoutMs,
+      );
+      try {
+        await this.withTimeout(
+          receipt,
+          Math.max(1, deadlineMs - Date.now()),
+          'remote runner terminal_input receipt missed the stop deadline',
+        );
+        return { outcome: 'sent', turnId };
+      } catch (error) {
+        const failure = error instanceof RemoteRunnerRequestError ? error.event : null;
+        if (failure?.code === 'terminal_input_no_active_turn') return { outcome: 'no_active_turn', turnId };
+        // `not_applied` is what providers without the not_ready split answer
+        // while the turn is still starting; both prove Ctrl-C was not sent.
+        const notYet = failure !== null && failure.status !== 'ambiguous' && failure.retryable
+          && (failure.code === 'terminal_input_not_ready' || failure.code === 'terminal_input_not_applied');
+        if (!notYet) {
+          logger.warn(`[remote-runner] stop of turn ${turnId.substring(0, 12)} is unconfirmed: ${error instanceof Error ? error.message : String(error)}`);
+          return { outcome: 'unknown', turnId };
+        }
+        if (deadlineMs - Date.now() <= ACTIVE_TURN_INTERRUPT_RETRY_MS) return { outcome: 'not_ready', turnId };
+        await this.waitForActiveTurnEdge(Date.now() + ACTIVE_TURN_INTERRUPT_RETRY_MS);
+      }
+    }
+  }
+
+  /** Resolve when the active turn is accepted or ends, or at `deadlineMs`. */
+  private waitForActiveTurnEdge(deadlineMs: number): Promise<void> {
+    return new Promise(resolve => {
+      const wake = (): void => {
+        clearTimeout(timer);
+        this.activeTurnEdgeWaiters.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, Math.max(0, deadlineMs - Date.now()));
+      timer.unref?.();
+      this.activeTurnEdgeWaiters.add(wake);
+    });
+  }
+
+  private wakeActiveTurnEdgeWaiters(): void {
+    for (const wake of [...this.activeTurnEdgeWaiters]) wake();
+  }
+
   async submitTurn(input: BackendTurnInput): Promise<BackendTurnSubmission> {
+    // Stamped before startup: a turn handed over while the provider is still
+    // starting was submitted when the user sent it, not when startup finished.
+    const submittedAtMs = Date.now();
     try {
       if (!this.startupPromise) throw new Error('remote runner has not spawned');
       await this.startupPromise;
@@ -308,6 +407,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       };
     }
     this.activeTurnId = input.turnId;
+    this.activeTurnSubmittedAtMs = submittedAtMs;
     this.activeTurnHostContext = input.linkRefMode ? { linkRefMode: input.linkRefMode } : {};
     this.activeTurnAccepted = false;
     this.outboundOperations.clear();
@@ -941,6 +1041,16 @@ export class RemoteRunnerBackend implements SessionBackend {
         pending.resolve(event);
         return;
       }
+      if (pending) {
+        // A failure answering any other request (terminal_input, resize, …)
+        // settles only that request. Older providers attach the active turnId to
+        // such receipts as context; it is not that turn's terminal, and treating
+        // it as an unrelated turn failure used to kill the provider mid-turn.
+        clearTimeout(pending.timer);
+        this.pendingRequests.delete(pendingTurnRequestId!);
+        pending.reject(new RemoteRunnerRequestError(event));
+        return;
+      }
       if (event.turnId) {
         if (event.requestId && event.requestId !== this.activeTurnRequestId) {
           this.failProtocol('remote runner emitted a turn failure for an unrelated request');
@@ -990,6 +1100,7 @@ export class RemoteRunnerBackend implements SessionBackend {
         return;
       }
       this.activeTurnId = event.recoveredTurn.turnId;
+      this.activeTurnSubmittedAtMs = null;
       this.activeTurnHostContext = {};
       this.recoveredTurnHostContextPending = true;
       this.deferredRecoveredEvents = [];
@@ -999,6 +1110,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.recoveredTurn = event.recoveredTurn;
       this.turnRecoveredCb?.(event.recoveredTurn);
       this.activeTurnAcceptedCb?.();
+      this.wakeActiveTurnEdgeWaiters();
     }
     if (event.type === 'ready' && event.pendingFinals) {
       if (!this.providerCapabilities.has('final_ack')) {
@@ -1018,7 +1130,10 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     if (event.type === 'failure') pending.reject(new RemoteRunnerRequestError(event));
     else pending.resolve(event);
-    if (turnJustAccepted) this.activeTurnAcceptedCb?.();
+    if (turnJustAccepted) {
+      this.activeTurnAcceptedCb?.();
+      this.wakeActiveTurnEdgeWaiters();
+    }
   }
 
   private acceptActiveTurn(turnId: string): boolean {
@@ -1256,6 +1371,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private finishActiveTurn(): void {
     const turnId = this.activeTurnId;
     this.activeTurnId = null;
+    this.activeTurnSubmittedAtMs = null;
     this.activeTurnHostContext = {};
     this.activeTurnAccepted = false;
     this.activeTurnRequestId = null;
@@ -1271,6 +1387,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     const settle = this.settleTurn;
     this.settleTurn = null;
     settle?.();
+    this.wakeActiveTurnEdgeWaiters();
   }
 
   private applyState(value: RemoteRunnerBackendState): boolean {

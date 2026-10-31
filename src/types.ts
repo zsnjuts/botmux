@@ -2004,6 +2004,12 @@ type DaemonToWorkerBase =
   /** Exact turn-level interruption. The worker verifies `turnId` against its
    * own active turn before injecting Ctrl+C and acknowledges the result. */
   | { type: 'interrupt_turn'; requestId: string; turnId: string }
+  /** Remote Runner `/stop`: interrupt whatever turn the worker is running and
+   * report what the provider proved before `deadline` (epoch ms). `issuedAt`
+   * is the stop message's Lark create_time; a turn submitted clearly after it
+   * is left alone. Separate from `interrupt_turn`, whose callers name an exact
+   * turn. */
+  | { type: 'stop_active_turn'; requestId: string; deadline: number; issuedAt?: number }
   | { type: 'refresh_screen' }
   // Claude-family SessionStart 信号：CLI hook 经 `botmux session-ready` 调到
   // daemon。requestId 让 daemon 等到 worker 已清掉启动选择器留下的旧 prompt
@@ -2320,6 +2326,10 @@ export type WorkerToDaemon =
          *  ever correct a card still claiming the unsubmitted turn runs. */
         | 'input_not_submitted' }
   | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' }
+  /** Receipt of `stop_active_turn`. `sent` only means Ctrl-C reached a turn
+   * the provider had natively started; that turn's own `turn_terminal` says
+   * whether it stopped. */
+  | { type: 'stop_active_turn_result'; requestId: string; turnId?: string; outcome: 'sent' | 'not_ready' | 'no_active_turn' | 'unknown' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
    * botmux/Lark reply route. This must never enter the attention path. */
