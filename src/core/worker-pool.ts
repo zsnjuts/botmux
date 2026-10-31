@@ -4798,6 +4798,18 @@ export function reconcileRestoredStreamingCardPins(larkAppId: string): void {
 
 const RESTORED_CARD_STATUS_CONCURRENCY = 4;
 
+type RestoredRemoteTurnReattachHandler = (ds: DaemonSession) => Promise<void>;
+
+let restoredRemoteTurnReattachHandler: RestoredRemoteTurnReattachHandler | undefined;
+
+/** The daemon re-attaches a restored, worker-less Remote Runner whose card still
+ *  claims work (it owns the Session lease rules). Unset: such cards are left as is. */
+export function setRestoredRemoteTurnReattachHandler(
+  handler: RestoredRemoteTurnReattachHandler | undefined,
+): void {
+  restoredRemoteTurnReattachHandler = handler;
+}
+
 /** Which restored, worker-less sessions' CLI is provably not running, so a card
  *  claiming 「工作中」 is wrong. A pty CLI dies with its worker; a pane the probe
  *  reports missing took its CLI with it (one batched probe for all of them). An
@@ -4836,7 +4848,12 @@ function restoredSessionsWithCliGone(sessions: readonly DaemonSession[]): Set<Da
  *  header is read back from Lark, and only a card still claiming work is
  *  touched — PATCHed to 「等待输入」, or withdrawn once Lark's 14-day edit window
  *  has closed (the next turn's card would withdraw it anyway). No card is
- *  posted and nobody is mentioned. */
+ *  posted and nobody is mentioned.
+ *
+ *  A worker-less Remote Runner whose card still claims work is different: its
+ *  provider may still own that turn, and restore spawns nothing until the next
+ *  message, so the result would sit undelivered (Mew #55). That card is handed
+ *  to the re-attach handler instead of being PATCHed. */
 export async function reconcileRestoredStreamingCardStatus(larkAppId: string): Promise<void> {
   if (!activeSessionsRegistry) return;
   const candidates = [...new Set(activeSessionsRegistry.values())].filter(ds =>
@@ -4854,9 +4871,11 @@ export async function reconcileRestoredStreamingCardStatus(larkAppId: string): P
     && retainsLarkStreamingCardTransport(ds)
     && !streamingCardDisabled(ds);
   const cliGone = restoredSessionsWithCliGone(candidates.filter(ds => owns(ds, ds.streamCardId!)));
+  const reattach = restoredRemoteTurnReattachHandler;
   const reconcileOne = async (ds: DaemonSession): Promise<void> => {
     const messageId = ds.streamCardId!;
-    if (!cliGone.has(ds) || !owns(ds, messageId)) return;
+    const remoteTurn = !!reattach && isRemoteBackendSession(ds);
+    if ((!remoteTurn && !cliGone.has(ds)) || !owns(ds, messageId)) return;
     let title: string | undefined;
     try {
       title = cardMessageTitle(await getTopicMessageDetail(ds.larkAppId, messageId, { timeoutMs: 10_000 }));
@@ -4865,6 +4884,14 @@ export async function reconcileRestoredStreamingCardStatus(larkAppId: string): P
       return;
     }
     if (!streamingCardTitleClaimsWork(title) || !owns(ds, messageId)) return;
+    if (remoteTurn) {
+      logger.info(`[${tag(ds)}] Restored card ${messageId.substring(0, 12)} still claims work with no Remote Runner attached — re-attaching`);
+      // Not awaited: the handler may wait out the previous owner's Session lease.
+      void reattach!(ds).catch(err => logger.warn(
+        `[${tag(ds)}] restored Remote Runner re-attach failed: ${err instanceof Error ? err.message : String(err)}`,
+      ));
+      return;
+    }
     try {
       await updateMessage(ds.larkAppId, messageId, buildStreamingCardJson(ds, 'idle'), { beforeWrite: () => {
         if (!owns(ds, messageId)) throw new Error('Restored card no longer owned by a worker-less session');

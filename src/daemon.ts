@@ -466,6 +466,7 @@ import {
   ensureAutomaticTaskContinuationLease,
   ensurePrincipalLaneInboundTurnBinding,
   setDurableBridgeFinalOutputHandler,
+  setRestoredRemoteTurnReattachHandler,
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
 } from './core/worker-pool.js';
@@ -19956,6 +19957,11 @@ function onQueuedActivationSubmitted(ds: DaemonSession, activationToken?: string
 export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitted;
 
 const ACTIVE_TURN_OWNER_LIMIT = 16;
+/** A crashed daemon's Session lease (60s) must lapse before a restored Remote
+ * Runner can be re-attached; retry for a few lease periods, then leave it to
+ * the next message or the orphan reconciler. */
+const RESTORED_REMOTE_TURN_REATTACH_ATTEMPTS = 10;
+const RESTORED_REMOTE_TURN_REATTACH_RETRY_MS = 20_000;
 
 /** Persist the daemon-authenticated owner of a started interactive turn so a
  * replacement owner can restore it (see Session.activeTurnOwners). */
@@ -30354,6 +30360,47 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const durableRemoteOrphanReconcilers: DurableRemoteOrphanReconciler[] = [];
   const durableConfigReloadWatchers: DurableConfigReloadWatcher[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
+  // A restart restores Remote Runner Sessions without a worker. When the card
+  // still claims work, re-attach now so the provider's recovered-turn path
+  // delivers that turn instead of waiting for the next message (Mew #55). Under
+  // primary coordination the previous daemon's Session lease must lapse first.
+  setRestoredRemoteTurnReattachHandler(async ds => {
+    const key = activeSessionKey(ds);
+    const stillRestored = (): boolean => activeSessions.get(key) === ds
+      && !ds.worker
+      && ds.session.status === 'active';
+    if (durableCoordinationRuntime) {
+      if (durableCoordinationRuntime.mode !== 'primary') return;
+      for (let attempt = 0; ; attempt++) {
+        const runtime = durablePrimaryRuntimeByApp.get(ds.larkAppId);
+        if (runtime) {
+          await runtime.ready;
+          if (!stillRestored()) return;
+          const claimed = await claimDurableLarkActiveSession({
+            facade: runtime.session,
+            sessionKey: key,
+            expectedSessionId: ds.session.sessionId,
+            expectedLarkAppId: ds.larkAppId,
+          });
+          if (claimed.kind === 'claimed') break;
+          if (claimed.kind !== 'occupied') {
+            logger.info(`[${tag(ds)}] Restored Remote Runner re-attach skipped: Session lease ${claimed.kind}`);
+            return;
+          }
+        }
+        if (attempt >= RESTORED_REMOTE_TURN_REATTACH_ATTEMPTS) {
+          logger.warn(`[${tag(ds)}] Restored Remote Runner re-attach gave up: Session lease is still occupied`);
+          return;
+        }
+        await delay(RESTORED_REMOTE_TURN_REATTACH_RETRY_MS);
+      }
+    }
+    if (!stillRestored()) return;
+    forkWorker(ds, '', { resume: true }, {
+      remoteResumeMode: 'reattach',
+      deferDuringDeviceIsolation: false,
+    });
+  });
   /** A Session's CLI became ready or its turn ended: hand back now the Inbox
    * retries that were waiting for it, instead of at their retry delay. */
   const wakeDurablePrimaryRetries = (ds: DaemonSession): void => {
