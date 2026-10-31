@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import * as scheduler from './scheduler.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import { logger } from '../utils/logger.js';
-import { assertSchedulePreconditionFilePathTrusted } from '../services/schedule-precondition-file.js';
+import {
+  assertSchedulePreconditionFilePathTrusted,
+  SchedulePreconditionFileError,
+} from '../services/schedule-precondition-file.js';
 import {
   abortSchedulePrecondition,
   activateSchedulePrecondition,
@@ -40,6 +43,14 @@ export type SchedulePreconditionUpdateInput =
 
 function assertWritableSchedulePreconditionSource(source: SchedulePreconditionSource): void {
   if (source.kind === 'file') {
+    // Replicated (durable primary) schedules may fire on any replica, but the
+    // trusted-files root is one Pod's local disk. Inline scripts replicate.
+    if (scheduler.isDurableScheduleAuthorityActive()) {
+      throw new SchedulePreconditionFileError(
+        'unsupported_replicated',
+        'Scheduled task precondition files are not available for replicated schedules; use an inline script',
+      );
+    }
     // Reject lexical escapes before creating anything. Then create/tighten the
     // daemon-owned trusted root and inspect the completed layout once more so
     // a symlinked root or existing ancestor can never be authorized.
