@@ -26,7 +26,8 @@ export const DURABLE_COORDINATION_PROVIDER_METHODS = [
   'retryOutboxAttempt',
   'markOutboxAmbiguous',
   'reserveAmbiguousOutbox',
-  'abandonOutboxReservation',
+  'requeueAmbiguousOutbox',
+  'abandonAmbiguousOutbox',
   'readOutbox',
   'enqueueControlOperation',
   'beginControlOperationAttempt',
@@ -314,7 +315,8 @@ export function validateDurableCoordinationProviderResult(
     case 'completeOutboxAttempt':
     case 'retryOutboxAttempt':
     case 'markOutboxAmbiguous':
-    case 'abandonOutboxReservation': {
+    case 'requeueAmbiguousOutbox':
+    case 'abandonAmbiguousOutbox': {
       const item = oneOfKinds(value, ['applied', 'stale']);
       valid = !!item && (item.kind === 'stale' || outboxRecord(item.record));
       break;

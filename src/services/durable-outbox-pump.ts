@@ -57,10 +57,11 @@ export interface DurableOutboxPumpOptions {
   /**
    * Mew #35: an ambiguous row is otherwise terminal and fences every later row
    * of its Session forever. Once it has been the Session head for
-   * `minAmbiguousAgeMs`, the call site decides: `retry` re-attempts it (only when
-   * the target is provably idempotent, e.g. the same provider UUID is still in
-   * its dedupe window), `abandon` settles it with an abandoned receipt so later
-   * rows can flow. Without this callback ambiguous rows are left untouched.
+   * `minAmbiguousAgeMs`, the call site decides: `retry` requeues it for the
+   * normal FIFO (only when the target is provably idempotent, e.g. the same
+   * provider UUID is still in its dedupe window), `abandon` settles it with an
+   * abandoned receipt so later rows can flow. Without this callback ambiguous
+   * rows are left untouched.
    */
   reconcileAmbiguous?: (
     record: DurableOutboxRecord,
@@ -68,6 +69,7 @@ export interface DurableOutboxPumpOptions {
   ) => { kind: 'retry' } | { kind: 'abandon'; reason: string };
   ambiguousIntervalMs?: number;
   minAmbiguousAgeMs?: number;
+  onRequeued?: (record: DurableOutboxRecord) => void;
   onAbandoned?: (record: DurableOutboxRecord) => void;
   onLateResult?: (attempt: OutboxAttempt, result: DurableOutboxDeliveryResult | Error) => void;
   onError?: (error: unknown) => void;
@@ -317,8 +319,9 @@ export function startDurableOutboxPump(options: DurableOutboxPumpOptions): Durab
   const reconcileAmbiguousRows = async (): Promise<void> => {
     const reconcile = options.reconcileAmbiguous;
     const reserve = options.store.reserveAmbiguousOutbox?.bind(options.store);
-    const abandon = options.store.abandonOutboxReservation?.bind(options.store);
-    if (!reconcile || !reserve || !abandon) return;
+    const requeue = options.store.requeueAmbiguousOutbox?.bind(options.store);
+    const abandon = options.store.abandonAmbiguousOutbox?.bind(options.store);
+    if (!reconcile || !reserve || !requeue || !abandon) return;
     const ambiguousWorkerId = `${workerId}:ambiguous`;
     for (let index = 0; index < batchSize && !stopped; index++) {
       let reservation;
@@ -348,11 +351,21 @@ export function startDurableOutboxPump(options: DurableOutboxPumpOptions): Durab
           reason: `ambiguous reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
         };
       }
-      if (decision.kind === 'retry') {
-        await processReservation(reservation);
-        continue;
-      }
+      // A failed settle leaves the row ambiguous; it is reclaimed after the
+      // claim expires, never resent by the normal FIFO without a decision.
       try {
+        if (decision.kind === 'retry') {
+          const mutation = await requeue({
+            reservation,
+            error: 'ambiguous delivery requeued within the target idempotency window',
+          });
+          if (mutation.kind === 'stale') {
+            reportError(new Error(`durable outbox requeue lost reservation ${reservation.record.messageId}`));
+          } else {
+            observe(options.onRequeued, mutation.record, 'requeue');
+          }
+          continue;
+        }
         const mutation = await abandon({
           reservation,
           error: boundedText(decision.reason, 'abandon reason'),
