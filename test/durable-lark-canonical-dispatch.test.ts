@@ -174,6 +174,23 @@ describe('durable Lark canonical dispatch', () => {
     await facade.stop();
   });
 
+  it('keeps the failure-budget flag of a retry whose input never got through', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async () => ({
+        kind: 'retry', reason: 'provider submit receipt is still pending', countsAsFailure: true,
+      }),
+    });
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .resolves.toEqual({
+        kind: 'retry', reason: 'provider submit receipt is still pending', countsAsFailure: true,
+      });
+    await facade.stop();
+  });
+
   it('carries the retry wake key to the Inbox consumer', async () => {
     const { store } = fakeStore();
     const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });

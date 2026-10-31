@@ -1919,6 +1919,10 @@ type DaemonToWorkerBase =
    *  with no model). It never affects the CLI already running. */
   | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; activeTurnSteer?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
+  /** Answer to a `final_output` that carried `persistAckRequestId`: `ok` once
+   *  the daemon durably handed the final off (or deliberately did not post
+   *  it); false keeps the provider's copy for a later re-attach (Mew #101). */
+  | { type: 'final_output_persisted'; requestId: string; ok: boolean }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
    *  IPCs would race: process.on('message') handlers don't serialize, and the
@@ -2381,6 +2385,9 @@ export type WorkerToDaemon =
       dispatchAttempt?: number;
       /** Admission-frozen mode for this exact turn. Absence is disabled. */
       linkRefMode?: 'observe' | 'enabled';
+      /** The worker waits for `final_output_persisted` with this id before
+       *  letting the provider forget the final (Mew #101). */
+      persistAckRequestId?: string;
       // Discriminator for the daemon-side renderer. Default ('bridge' /
       // omitted) renders `content` through the regular markdown card. The
       // local-turn variants ship the user prompt as a separate field so

@@ -75,6 +75,25 @@ describe('remote runner protocol', () => {
     expect(parseRemoteRunnerEventLine(line({ stage: 'cli_start', turnId: '' }))).toBeUndefined();
   });
 
+  it('accepts unconfirmed finals on ready only in their exact shape', () => {
+    const ready = (pendingFinals: unknown) => JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION, type: 'ready',
+      requestId: 'resume-1', state: { version: 1, provider: 'tae-traex', generation: 2 }, pendingFinals,
+    });
+    expect(parseRemoteRunnerEventLine(ready([{ turnId: 'om_turn', content: '结论' }])))
+      .toEqual(expect.objectContaining({ pendingFinals: [{ turnId: 'om_turn', content: '结论' }] }));
+    // A malformed offer rejects the whole ready rather than dropping an answer silently.
+    for (const invalid of [
+      [],
+      [{ turnId: 'om_turn' }],
+      [{ turnId: 'om_turn', content: 'a', extra: true }],
+      [{ turnId: 'om_turn', content: 'a' }, { turnId: 'om_turn', content: 'b' }],
+      Array.from({ length: 5 }, (_, index) => ({ turnId: `om_turn_${index}`, content: 'x' })),
+    ]) {
+      expect(parseRemoteRunnerEventLine(ready(invalid))).toBeUndefined();
+    }
+  });
+
   it('keeps event types closed while accepting additive provider capabilities', () => {
     const event = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,

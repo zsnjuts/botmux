@@ -383,6 +383,14 @@ export interface SessionBackend {
     turnId?: string,
     hostContext?: RemoteRunnerTurnHostContext,
   ) => void): void;
+  /** Finals of earlier turns that the provider still holds because no host
+   * confirmed their durable delivery (Mew #101). They are not the active
+   * turn's answer: deliver each by its own turn id, then acknowledge it. */
+  onPendingFinal?(cb: (final: { turnId: string; content: string }) => void): void;
+  /** Tell the provider that the final of `turnId` is durably handed off, so it
+   * stops offering it to later hosts. Resolves false when not negotiated or
+   * the provider could not record it; the final is then offered again. */
+  acknowledgeFinal?(turnId: string): Promise<boolean>;
   /** Exact provider-reported terminal failure for a submitted turn. */
   onTurnFailure?(cb: (failure: BackendTurnFailure) => void): void;
   /** Provider-requested chat output for the active turn. A negotiated final

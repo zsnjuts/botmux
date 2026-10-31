@@ -32,7 +32,16 @@ export type DurableLarkCanonicalHandlerResult =
   | { kind: 'ignored'; reason: string }
   /** `wakeKey`: see DurableInboxPrimaryDispatchResult — redeliver as soon as
    * the consumer is woken for it. */
-  | { kind: 'retry'; reason: string; wakeKey?: string; retryAfterMs?: number };
+  | {
+      kind: 'retry';
+      reason: string;
+      wakeKey?: string;
+      retryAfterMs?: number;
+      /** The input never got through (e.g. the provider submit receipt timed
+       *  out): spend the failure budget like an error instead of waiting up to
+       *  the age ceiling behind a Session that cannot start. */
+      countsAsFailure?: true;
+    };
 
 export interface DurableLarkCanonicalHandlerContext extends DurableInboxPrimaryDispatchContext {
   /** Raw event data after the durable envelope identity has been validated. */
@@ -129,6 +138,7 @@ export function createDurableLarkCanonicalDispatch(
         reason,
         ...(wakeKey ? { wakeKey } : {}),
         ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+        ...(result.countsAsFailure ? { countsAsFailure: true as const } : {}),
       };
     }
     if (result.kind === 'ignored') {

@@ -28,6 +28,7 @@ import {
   type RemoteRunnerOutboundMessage,
   type RemoteRunnerOutboundMessageResult,
   type RemoteRunnerOrphanVerdict,
+  type RemoteRunnerPendingFinal,
   type RemoteRunnerRecoveredTurn,
   type RemoteRunnerSessionToolOperation,
   type RemoteRunnerSessionToolResult,
@@ -160,6 +161,9 @@ export class RemoteRunnerBackend implements SessionBackend {
   private recoveredTurnHostContextPending = false;
   private deferredRecoveredEvents: RemoteRunnerEvent[] = [];
   private turnRecoveredCb: ((turn: RemoteRunnerRecoveredTurn) => void) | null = null;
+  private pendingFinalCb: ((final: RemoteRunnerPendingFinal) => void) | null = null;
+  /** Unconfirmed finals from the last `ready`, held until a callback takes them. */
+  private undeliveredPendingFinals: RemoteRunnerPendingFinal[] = [];
   private outboundMessageCb: ((
     message: RemoteRunnerOutboundMessage,
     hostContext: RemoteRunnerTurnHostContext,
@@ -447,6 +451,34 @@ export class RemoteRunnerBackend implements SessionBackend {
         if (this.turnRecoveredCb === cb && this.recoveredTurn === recovered) cb(recovered);
       });
     }
+  }
+  onPendingFinal(cb: (final: RemoteRunnerPendingFinal) => void): void {
+    this.pendingFinalCb = cb;
+    this.flushPendingFinals();
+  }
+
+  async acknowledgeFinal(turnId: string): Promise<boolean> {
+    if (!this.ready || !this.child || !this.providerCapabilities.has('final_ack')) return false;
+    try {
+      await this.request(
+        remoteRunnerCommand('final_ack', { requestId: this.requestId('final-ack'), turnId }),
+        event => event.type === 'status',
+        this.handshakeTimeoutMs,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private flushPendingFinals(): void {
+    const cb = this.pendingFinalCb;
+    if (!cb || this.undeliveredPendingFinals.length === 0) return;
+    const finals = this.undeliveredPendingFinals;
+    this.undeliveredPendingFinals = [];
+    queueMicrotask(() => {
+      for (const final of finals) cb(final);
+    });
   }
   setRecoveredTurnHostContext(
     turnId: string,
@@ -967,6 +999,14 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.recoveredTurn = event.recoveredTurn;
       this.turnRecoveredCb?.(event.recoveredTurn);
       this.activeTurnAcceptedCb?.();
+    }
+    if (event.type === 'ready' && event.pendingFinals) {
+      if (!this.providerCapabilities.has('final_ack')) {
+        this.failProtocol('remote runner offered pending finals without advertising final_ack');
+        return;
+      }
+      this.undeliveredPendingFinals = [...event.pendingFinals];
+      this.flushPendingFinals();
     }
     clearTimeout(pending.timer);
     this.pendingRequests.delete(id);

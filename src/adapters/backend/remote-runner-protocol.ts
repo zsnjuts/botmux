@@ -63,6 +63,15 @@ export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
   'orphan_reconciliation_turn_inflight',
 ] as const;
 
+/** Optional delivery confirmation of a turn's final answer. The provider keeps
+ * each emitted final until the host reports it durably handed off, and offers
+ * unconfirmed ones again in `ready.pendingFinals` to whichever host attaches
+ * next — a host that froze or restarted after receiving a final no longer
+ * loses it (Mew #101). */
+export const REMOTE_RUNNER_FINAL_ACK_CAPABILITIES = [
+  'final_ack',
+] as const;
+
 /** Optional in-turn user steering. The steer augments one already-active
  * execution; it never creates another final-owning model turn. */
 export const REMOTE_RUNNER_TURN_STEER_CAPABILITIES = [
@@ -81,7 +90,32 @@ export const REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES = [
   'orphan_reconciliation_verdict',
   'orphan_reconciliation_turn_inflight',
   'startup_progress',
+  'final_ack',
 ] as const;
+
+export interface RemoteRunnerPendingFinal {
+  turnId: string;
+  content: string;
+}
+
+/** Provider-side bound on unconfirmed finals carried by one `ready`. */
+export const MAX_REMOTE_RUNNER_PENDING_FINALS = 4;
+
+function normalizePendingFinals(raw: unknown): RemoteRunnerPendingFinal[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_REMOTE_RUNNER_PENDING_FINALS) {
+    return undefined;
+  }
+  const finals: RemoteRunnerPendingFinal[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+    const value = entry as Record<string, unknown>;
+    if (Object.keys(value).some(key => key !== 'turnId' && key !== 'content')) return undefined;
+    if (typeof value.turnId !== 'string' || !ID_RE.test(value.turnId)
+        || typeof value.content !== 'string') return undefined;
+    finals.push({ turnId: value.turnId, content: value.content });
+  }
+  return new Set(finals.map(final => final.turnId)).size === finals.length ? finals : undefined;
+}
 
 /** Structured answer to an `orphan-reconcile` resume when the Session is not
  * an orphan. Only sent after `orphan_reconciliation_verdict` was negotiated. */
@@ -131,6 +165,7 @@ export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES,
   ...REMOTE_RUNNER_TURN_STEER_CAPABILITIES,
   ...REMOTE_RUNNER_STARTUP_PROGRESS_CAPABILITIES,
+  ...REMOTE_RUNNER_FINAL_ACK_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -407,6 +442,11 @@ export type RemoteRunnerCommand =
       dispatchAttempt?: number;
       trustedCaller?: RemoteRunnerTrustedCaller;
     })
+  | (RemoteRunnerCommandBase & {
+      /** The final of `turnId` is durably handed off; the provider may drop it. */
+      type: 'final_ack';
+      turnId: string;
+    })
   | (RemoteRunnerCommandBase & { type: 'cancel' })
   | (RemoteRunnerCommandBase & { type: 'detach' })
   | (RemoteRunnerCommandBase & { type: 'reattach' })
@@ -456,6 +496,8 @@ export type RemoteRunnerEvent =
       state: RemoteRunnerBackendState;
       recoveredTurn?: RemoteRunnerRecoveredTurn;
       orphanReconciliation?: RemoteRunnerOrphanVerdict;
+      /** Finals emitted earlier that no host has confirmed yet (`final_ack`). */
+      pendingFinals?: RemoteRunnerPendingFinal[];
     })
   | (RemoteRunnerEventBase & {
       type: 'progress';
@@ -1100,10 +1142,15 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         ? undefined
         : normalizeRemoteRunnerOrphanVerdict(raw.orphanReconciliation);
       if (raw.orphanReconciliation !== undefined && !orphanReconciliation) return undefined;
+      const pendingFinals = raw.pendingFinals === undefined
+        ? undefined
+        : normalizePendingFinals(raw.pendingFinals);
+      if (raw.pendingFinals !== undefined && !pendingFinals) return undefined;
       return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
         type: 'ready', requestId: id, state,
         ...(recoveredTurn ? { recoveredTurn } : {}),
-        ...(orphanReconciliation ? { orphanReconciliation } : {}) };
+        ...(orphanReconciliation ? { orphanReconciliation } : {}),
+        ...(pendingFinals ? { pendingFinals } : {}) };
     }
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'lineage_changed', state };

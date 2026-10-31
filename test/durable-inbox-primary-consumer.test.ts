@@ -438,6 +438,62 @@ describe('durable inbox primary consumer', () => {
     await consumer.stop();
   });
 
+  it('settles a row whose input keeps failing to reach the worker', async () => {
+    // 会话永远起不来（提交回执一直超时）：这类重试按失败计，到上限就收尾并提示，
+    // 不再挂到 6 小时兜底、期间挡住同群后面的无键行。普通忙等仍不计。
+    const completed: InboxClaim[] = [];
+    const dropped: string[] = [];
+    let call = 0;
+    const store = inboxStore({
+      claims: [1, 2, 3, 4].map(attempts => ({ ...claim('om_stuck'), attempts })),
+      completed,
+      retried: [],
+    });
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      now: () => 9_000,
+      dispatch: async () => {
+        call += 1;
+        return call === 2
+          ? { kind: 'retry', reason: 'session has an unfinished turn' }
+          : { kind: 'retry', reason: 'provider submit receipt is still pending', countsAsFailure: true };
+      },
+      onExhausted: ({ message }) => { dropped.push(message.messageId); },
+    });
+    await consumer.ready;
+
+    // 1 counted, 2 plain (streak resets), 3 and 4 counted: still below 3 in a row.
+    expect(dropped).toEqual([]);
+    expect(completed).toEqual([]);
+    await consumer.stop();
+
+    const stuckStore = inboxStore({
+      claims: [1, 2, 3].map(attempts => ({ ...claim('om_stuck'), attempts })),
+      completed,
+      retried: [],
+    });
+    const stuck = startDurableInboxPrimaryConsumer({
+      store: stuckStore,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      now: () => 9_000,
+      dispatch: async () => ({
+        kind: 'retry', reason: 'provider submit receipt is still pending', countsAsFailure: true,
+      }),
+      onExhausted: ({ message }) => { dropped.push(message.messageId); },
+    });
+    await stuck.ready;
+    expect(dropped).toEqual(['om_stuck']);
+    expect(completed.map(item => item.attempts)).toEqual([3]);
+    await stuck.stop();
+  });
+
   it('restarts the failure streak after an explicit retry', async () => {
     const dropped: string[] = [];
     const outcomes = ['fail', 'fail', 'retry', 'fail', 'fail', 'commit'];

@@ -4983,6 +4983,23 @@ const codexAppPendingDaemonAcks = new Map<string, {
   resolve: (ok: boolean) => void;
   timer: NodeJS.Timeout;
 }>();
+/** Remote Runner finals waiting for the daemon to persist them (Mew #101).
+ *  An unanswered request simply leaves the provider's copy in place. */
+const FINAL_PERSIST_ACK_TIMEOUT_MS = 5 * 60_000;
+const finalPersistAcks = new Map<string, {
+  resolve: (ok: boolean) => void;
+  timer: NodeJS.Timeout;
+}>();
+
+function awaitFinalPersisted(requestId: string, onPersisted: (ok: boolean) => void): void {
+  const timer = setTimeout(() => {
+    if (!finalPersistAcks.delete(requestId)) return;
+    log(`Final persistence not confirmed within ${FINAL_PERSIST_ACK_TIMEOUT_MS / 1000}s; provider keeps its copy`);
+    onPersisted(false);
+  }, FINAL_PERSIST_ACK_TIMEOUT_MS);
+  timer.unref?.();
+  finalPersistAcks.set(requestId, { resolve: onPersisted, timer });
+}
 let codexAppCompletionAwaitingFinal = false;
 let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
@@ -6921,8 +6938,14 @@ function deliverRemoteTurnFinal(
   text: string,
   exactTurnId?: string,
   linkRefMode?: 'observe' | 'enabled',
+  /** Called once the daemon persisted the final, or it was deliberately not
+   *  posted (true), or it may still be undelivered (false). */
+  onPersisted?: (ok: boolean) => void,
 ): void {
-  if (!text.trim()) return;
+  if (!text.trim()) {
+    onPersisted?.(true);
+    return;
+  }
   // A mark from an EARLIER turn must not gate this one: its window opened
   // before the previous turn's sends, which would suppress this answer for the
   // wrong reason. Falling back to an unmarked window degrades to "always
@@ -6935,6 +6958,7 @@ function deliverRemoteTurnFinal(
   // belongs to no Lark turn.
   if (!turnId) {
     log('Remote final bridge skipped: no turn id for this answer');
+    onPersisted?.(true);
     return;
   }
   const dispatchAttempt = mark?.dispatchAttempt ?? currentBotmuxDispatchAttempt;
@@ -6961,12 +6985,18 @@ function deliverRemoteTurnFinal(
     // Same as the structured bridge: an explicit send IS this turn's reply, so
     // tell observers rather than leaving them waiting on a final that the gate
     // deliberately swallowed.
+    onPersisted?.(true);
     return;
   }
   // Strip a trailing sentinel line: "prose + sentinel" with no send is the
   // "did the work, forgot to send" shape — post the prose, never the token.
   const postContent = bridgePostText(text, adoptMode);
-  if (!postContent.trim()) return;
+  if (!postContent.trim()) {
+    onPersisted?.(true);
+    return;
+  }
+  const persistAckRequestId = onPersisted ? `final-persist:${randomUUID()}` : undefined;
+  if (persistAckRequestId && onPersisted) awaitFinalPersisted(persistAckRequestId, onPersisted);
   send({
     type: 'final_output',
     content: postContent,
@@ -6976,8 +7006,23 @@ function deliverRemoteTurnFinal(
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(linkRefMode ? { linkRefMode } : {}),
+    ...(persistAckRequestId ? { persistAckRequestId } : {}),
   });
-  log(`Remote final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
+  // Handed to the daemon IPC only; the provider keeps its copy until the
+  // daemon confirms persistence (Mew #101).
+  log(`Remote final bridge handed off ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
+}
+
+function acknowledgeRemoteFinalWhenPersisted(
+  finalBackend: SessionBackend,
+  turnId: string,
+): (ok: boolean) => void {
+  return ok => {
+    if (!ok || !finalBackend.acknowledgeFinal) return;
+    void finalBackend.acknowledgeFinal(turnId).then(acknowledged => {
+      if (!acknowledged) log(`Provider did not record final acknowledgement for turn ${turnId.substring(0, 12)}`);
+    });
+  };
 }
 
 async function deliverRemoteRunnerOutboundMessage(
@@ -22999,7 +23044,12 @@ async function spawnCli(
       return;
     }
     try {
-      deliverRemoteTurnFinal(text, turnId, hostContext?.linkRefMode);
+      deliverRemoteTurnFinal(
+        text,
+        turnId,
+        hostContext?.linkRefMode,
+        turnId ? acknowledgeRemoteFinalWhenPersisted(observedBackend, turnId) : undefined,
+      );
     } catch (err) {
       log(`Remote final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -23011,6 +23061,23 @@ async function spawnCli(
         undefined,
         currentBotmuxDispatchAttempt,
       );
+    }
+  });
+  // Finals of earlier turns that a previous host received but never confirmed
+  // as persisted (it froze or restarted in between). They are not this turn's
+  // answer: post each by its own turn id, then let the provider drop it.
+  backend.onPendingFinal?.((final) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) return;
+    log(`Re-delivering unconfirmed remote final for turn ${final.turnId.substring(0, 12)}`);
+    try {
+      deliverRemoteTurnFinal(
+        final.content,
+        final.turnId,
+        undefined,
+        acknowledgeRemoteFinalWhenPersisted(observedBackend, final.turnId),
+      );
+    } catch (err) {
+      log(`Remote final re-delivery failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
   backend.onOutboundMessage?.(async (message, hostContext) => {
@@ -27241,6 +27308,16 @@ process.on('message', async (raw: unknown) => {
         await sendFatalWorkerErrorAndExit(err);
         return;
       }
+      break;
+    }
+
+    case 'final_output_persisted': {
+      const pending = finalPersistAcks.get(msg.requestId);
+      if (!pending) break;
+      finalPersistAcks.delete(msg.requestId);
+      clearTimeout(pending.timer);
+      if (!msg.ok) log('Daemon did not persist the remote final; provider keeps its copy');
+      pending.resolve(msg.ok);
       break;
     }
 
