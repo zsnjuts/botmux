@@ -64,19 +64,24 @@ function candidateForApp(
 }
 
 /**
- * Orphan controls are pinned to the canonical lineage they were scanned from:
- * the remote generation and the canonical record revision. A control whose
- * Session moved on (a local owner took over and committed, or the remote was
- * replaced) is stale and must settle as a no-op instead of terminalizing a
- * Session that is no longer orphaned. The revision also keeps a later orphan
- * of the same generation from colliding with an earlier, settled control.
- * Controls enqueued by older daemons carry only the generation.
+ * Orphan controls are pinned to the remote generation they were scanned from
+ * and to a coarse scan epoch: one lineage is proved at most once per epoch.
+ *
+ * The canonical record revision is deliberately not part of the id. Proving a
+ * Session "not an orphan" takes it over in orphan-reconcile mode and abandons
+ * that owner again, and both steps write the canonical record; a
+ * revision-pinned id therefore changed on every scan and re-proved dormant
+ * resumable Sessions every minute, each proof starting a provider. A remote
+ * replacement or resume advances the generation, which still yields a fresh
+ * control; terminalization always waits for the provider's authoritative
+ * missing-remote proof, so a stale control cannot close a live Session.
+ * Older daemons enqueued `<generation>:r<revision>[:e<epoch>]` ids, which the
+ * parser keeps accepting.
  */
 export function durableRemoteOrphanOperationId(input: {
   larkAppId: string;
   sessionId: string;
   generation: number;
-  revision: number;
   epoch: number;
 }): string {
   return [
@@ -84,7 +89,6 @@ export function durableRemoteOrphanOperationId(input: {
     input.larkAppId,
     input.sessionId,
     String(input.generation),
-    `r${input.revision}`,
     `e${input.epoch}`,
   ].join(':');
 }
@@ -102,7 +106,6 @@ export function parseDurableRemoteOrphanOperationId(
   };
   const epoch = take('e');
   const revision = take('r');
-  if (epoch !== undefined && revision === undefined) return undefined;
   const generationText = parts[parts.length - 1] ?? '';
   if (parts.length < 4 || !/^\d+$/.test(generationText)) return undefined;
   const generation = Number(generationText);
@@ -187,7 +190,6 @@ export async function scanDurableRemoteOrphans(
           larkAppId: options.larkAppId,
           sessionId: currentParsed.session.sessionId,
           generation: remote.generation,
-          revision: current.revision,
           epoch: durableRemoteOrphanScanEpoch(now()),
         });
         const inserted = await options.store.enqueueInboxWithLease({
