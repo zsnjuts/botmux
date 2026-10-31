@@ -264,4 +264,35 @@ describe("worker-pool startup failure × suppressRecoveryCard", () => {
       { sourceSessionId: 'sid-recovery-transient' },
     );
   });
+
+  it('posts one card per turn and reason across re-forks, and again after a generation reaches ready (Mew #105)', async () => {
+    const ds = makeDs('sid-refork-once', makeFakeWorker());
+    const failGeneration = async (message: Record<string, unknown>) => {
+      const worker = makeFakeWorker();
+      ds.worker = worker;
+      __testOnly_setupWorkerHandlers(ds, worker);
+      worker.emit('message', { type: 'error', message: DETERMINISTIC_REASON, ...message });
+      await flush();
+      return worker;
+    };
+
+    // 收件箱对同一条消息显式重试，每次重新 fork：只发第一张。
+    await failGeneration({ turnId: 'om_retry', dispatchAttempt: 1 });
+    await failGeneration({ turnId: 'om_retry', dispatchAttempt: 2 });
+    await failGeneration({ turnId: 'om_retry', dispatchAttempt: 3 });
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+
+    // 换了消息照常通知。
+    await failGeneration({ turnId: 'om_next', dispatchAttempt: 1 });
+    expect(sessionReplyMock).toHaveBeenCalledTimes(2);
+
+    // 某一代 worker 起来过之后，同一条消息再失败也重新通知。
+    const healthy = makeFakeWorker();
+    ds.worker = healthy;
+    __testOnly_setupWorkerHandlers(ds, healthy);
+    healthy.emit('message', { type: 'ready', port: 1234, token: 'tok' });
+    await flush();
+    await failGeneration({ turnId: 'om_next', dispatchAttempt: 2 });
+    expect(sessionReplyMock).toHaveBeenCalledTimes(3);
+  });
 });
