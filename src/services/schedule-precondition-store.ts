@@ -737,6 +737,30 @@ export function getSchedulePreconditionSummary(
   };
 }
 
+/** Durable primary replication: the protected record exactly as stored. */
+export function readSchedulePreconditionRecord(
+  appId: string,
+  taskId: string,
+  options: SchedulePreconditionStoreOptions = {},
+): SchedulePreconditionRecord | undefined {
+  return readRecord(appId, taskId, options);
+}
+
+/** Durable primary replication: install a record copied from another replica
+ * verbatim, after the same strict schema and identity validation as a read. */
+export function writeSchedulePreconditionRecord(
+  record: SchedulePreconditionRecord,
+  options: SchedulePreconditionStoreOptions = {},
+): void {
+  if (!isPlainRecord(record)) fail('invalid_input', 'replicated record must be an object');
+  assertIdentityPart(record.larkAppId, 'larkAppId');
+  assertIdentityPart(record.taskId, 'taskId');
+  assertStorageLayout(record.larkAppId, options.dataDir, true);
+  const path = schedulePreconditionPath(record.larkAppId, record.taskId, options.dataDir);
+  const validated = parseRecord(JSON.stringify(record), record.larkAppId, record.taskId, path);
+  withFileLockSync(path, () => writeRecord(validated, options));
+}
+
 export function removeSchedulePrecondition(
   appId: string,
   taskId: string,

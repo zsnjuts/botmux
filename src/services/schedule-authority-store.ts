@@ -52,6 +52,26 @@ export interface ScheduleSelfCleanupReceipt {
   messageId: string;
 }
 
+/** One authority row as replicated to the durable primary store (record plus
+ * the creation timestamp that orders `listRecords`). */
+export interface ScheduleAuthorityReplicaRow extends ScheduleAuthorityRecord {
+  createdAt: string;
+}
+
+/** Committed local mutation, reported so durable primary mode can replay it
+ * against the shared copy. `before`/`row` are snapshots taken at commit time. */
+export type ScheduleAuthorityMutation =
+  | { kind: 'created'; appId: string; taskId: string; row: ScheduleAuthorityReplicaRow }
+  | {
+      kind: 'updated';
+      appId: string;
+      taskId: string;
+      before: ScheduleAuthorityReplicaRow;
+      mutate: (task: ScheduledTask) => ScheduledTask | undefined;
+    }
+  | { kind: 'revoked'; appId: string; taskId: string; row: ScheduleAuthorityReplicaRow }
+  | { kind: 'rolled_back'; appId: string; taskId: string };
+
 export type CommitDelegatedScheduleResult =
   | { ok: true; task: ScheduledTask; replay: boolean }
   | { ok: false; error: 'grant_conflict' | 'grant_task_limit' | 'task_id_conflict' };
@@ -96,7 +116,7 @@ function assertSelfCleanupReceipt(input: ScheduleSelfCleanupReceipt): void {
   }
 }
 
-function stateFor(task: ScheduledTask): ScheduleAuthorityState {
+export function scheduleAuthorityStateFor(task: ScheduledTask): ScheduleAuthorityState {
   if (!task.enabled) return task.disabledReason === 'once_completed' ? 'completed' : 'paused';
   return 'active';
 }
@@ -183,8 +203,27 @@ function migrateLegacyGrantUnique(db: DatabaseSyncLike): void {
   db.exec(`ALTER TABLE ${replacement} RENAME TO schedule_authority_tasks;`);
 }
 
+const AUTHORITY_KINDS: readonly ScheduleAuthorityKind[] = ['legacy', 'direct', 'delegated'];
+const AUTHORITY_STATES: readonly ScheduleAuthorityState[] = ['active', 'paused', 'completed', 'revoked'];
+
 export class ScheduleAuthorityStore {
+  private mutationObserver?: (mutation: ScheduleAuthorityMutation) => void;
+
   private constructor(private readonly db: DatabaseSyncLike) {}
+
+  /** Durable primary mode only: observe committed task mutations. Rows written
+   * through `putReplicaRow` are never reported. */
+  setMutationObserver(observer?: (mutation: ScheduleAuthorityMutation) => void): void {
+    this.mutationObserver = observer;
+  }
+
+  private notify(mutation: () => ScheduleAuthorityMutation | undefined): void {
+    if (!this.mutationObserver) return;
+    try {
+      const value = mutation();
+      if (value) this.mutationObserver(value);
+    } catch { /* replication is best effort; the local commit already succeeded */ }
+  }
 
   static open(dataDir: string): ScheduleAuthorityStore {
     const path = scheduleAuthorityDbPath(dataDir);
@@ -259,7 +298,7 @@ export class ScheduleAuthorityStore {
         `);
         for (const task of validated) {
           insert.run(
-            appId, task.id, stateFor(task), JSON.stringify(task), taskHash(task),
+            appId, task.id, scheduleAuthorityStateFor(task), JSON.stringify(task), taskHash(task),
             task.ownerOpenId ?? null, task.ownerUnionId ?? null, now, now,
           );
         }
@@ -332,6 +371,59 @@ export class ScheduleAuthorityStore {
       ...(typeof row.target_turn_id === 'string' ? { targetTurnId: row.target_turn_id } : {}),
       ...(typeof row.target_generation === 'number' ? { targetGeneration: row.target_generation } : {}),
     };
+  }
+
+  getReplicaRow(appId: string, taskId: string): ScheduleAuthorityReplicaRow | undefined {
+    const record = this.getRecord(appId, taskId);
+    if (!record) return;
+    const row = this.db.prepare(
+      'SELECT created_at FROM schedule_authority_tasks WHERE app_id = ? AND task_id = ?',
+    ).get(appId, taskId) as { created_at?: unknown } | undefined;
+    return { ...record, createdAt: String(row?.created_at) };
+  }
+
+  /** Every row of the app, revoked tombstones included. */
+  listReplicaRows(appId: string): ScheduleAuthorityReplicaRow[] {
+    return this.db.prepare(`
+      SELECT task_id FROM schedule_authority_tasks WHERE app_id = ? ORDER BY created_at ASC, task_id ASC
+    `).all(appId).flatMap(row => {
+      const replica = this.getReplicaRow(appId, String((row as { task_id: unknown }).task_id));
+      return replica ? [replica] : [];
+    });
+  }
+
+  /** Install a row copied from the durable primary store verbatim. */
+  putReplicaRow(appId: string, row: ScheduleAuthorityReplicaRow): void {
+    const task = parseTask(JSON.stringify(row.task), appId);
+    const runScopes = [...row.runScopes];
+    if (!AUTHORITY_KINDS.includes(row.kind) || !AUTHORITY_STATES.includes(row.state)
+        || typeof row.createdAt !== 'string' || !row.createdAt
+        || runScopes.some(scope => scope !== 'bytedcli') || new Set(runScopes).size !== runScopes.length) {
+      throw new Error('schedule_authority_replica_row_invalid');
+    }
+    this.db.prepare(`
+      INSERT INTO schedule_authority_tasks
+        (schema_version, app_id, task_id, kind, state, task_json, canonical_hash,
+         control_open_id, control_union_id, credential_open_id, run_scopes_json, self_manage, grant_id,
+         request_hash, source_message_id, source_session_id, target_turn_id,
+         target_generation, created_at, updated_at)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(app_id, task_id) DO UPDATE SET
+        kind = excluded.kind, state = excluded.state, task_json = excluded.task_json,
+        canonical_hash = excluded.canonical_hash, control_open_id = excluded.control_open_id,
+        control_union_id = excluded.control_union_id, credential_open_id = excluded.credential_open_id,
+        run_scopes_json = excluded.run_scopes_json, self_manage = excluded.self_manage,
+        grant_id = excluded.grant_id, request_hash = excluded.request_hash,
+        source_message_id = excluded.source_message_id, source_session_id = excluded.source_session_id,
+        target_turn_id = excluded.target_turn_id, target_generation = excluded.target_generation,
+        created_at = excluded.created_at, updated_at = excluded.updated_at
+    `).run(
+      appId, task.id, row.kind, row.state, JSON.stringify(task), taskHash(task),
+      row.controlOpenId ?? null, row.controlUnionId ?? null, row.credentialOpenId ?? null,
+      JSON.stringify(runScopes), row.selfManage ? 1 : 0, row.grantId ?? null, row.requestHash ?? null,
+      row.sourceMessageId ?? null, row.sourceSessionId ?? null, row.targetTurnId ?? null,
+      row.targetGeneration ?? null, row.createdAt, new Date().toISOString(),
+    );
   }
 
   getSelfCleanupReceipt(
@@ -429,6 +521,7 @@ export class ScheduleAuthorityStore {
         throw new Error('schedule_self_cleanup_revoke_failed');
       }
       this.db.exec('COMMIT;');
+      this.notifyRevoked(input.appId, input.taskId);
       return { task: authority.task, replay: false };
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
@@ -456,10 +549,11 @@ export class ScheduleAuthorityStore {
            control_open_id, control_union_id, run_scopes_json, created_at, updated_at)
         VALUES (1, ?, ?, 'direct', ?, ?, ?, ?, ?, '[]', ?, ?)
       `).run(
-        appId, task.id, stateFor(task), JSON.stringify(task), taskHash(task),
+        appId, task.id, scheduleAuthorityStateFor(task), JSON.stringify(task), taskHash(task),
         task.ownerOpenId ?? null, task.ownerUnionId ?? null, now, now,
       );
       this.db.exec('COMMIT;');
+      this.notifyCreated(appId, task.id);
       return task;
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
@@ -530,6 +624,7 @@ export class ScheduleAuthorityStore {
       );
       beforeCommitTestHook?.();
       this.db.exec('COMMIT;');
+      this.notifyCreated(input.appId, input.task.id);
       return { ok: true, task: input.task, replay: false };
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
@@ -550,13 +645,17 @@ export class ScheduleAuthorityStore {
         this.db.exec('COMMIT;');
         return record.task;
       }
-      const state = stateFor(next);
+      const state = scheduleAuthorityStateFor(next);
       this.db.prepare(`
         UPDATE schedule_authority_tasks
         SET state = ?, task_json = ?, canonical_hash = ?, updated_at = ?
         WHERE app_id = ? AND task_id = ?
       `).run(state, JSON.stringify(next), taskHash(next), new Date().toISOString(), appId, taskId);
       this.db.exec('COMMIT;');
+      this.notify(() => {
+        const after = this.getReplicaRow(appId, taskId);
+        return after && { kind: 'updated', appId, taskId, before: { ...record, createdAt: after.createdAt }, mutate };
+      });
       return next;
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
@@ -569,6 +668,7 @@ export class ScheduleAuthorityStore {
       UPDATE schedule_authority_tasks SET state = 'revoked', updated_at = ?
       WHERE app_id = ? AND task_id = ? AND state != 'revoked'
     `).run(new Date().toISOString(), appId, taskId);
+    if (Number(result.changes) > 0) this.notifyRevoked(appId, taskId);
     return Number(result.changes) > 0;
   }
 
@@ -580,7 +680,22 @@ export class ScheduleAuthorityStore {
       DELETE FROM schedule_authority_tasks
       WHERE app_id = ? AND task_id = ? AND kind = 'direct' AND grant_id IS NULL
     `).run(appId, taskId);
+    if (Number(result.changes) > 0) this.notify(() => ({ kind: 'rolled_back', appId, taskId }));
     return Number(result.changes) > 0;
+  }
+
+  private notifyCreated(appId: string, taskId: string): void {
+    this.notify(() => {
+      const row = this.getReplicaRow(appId, taskId);
+      return row && { kind: 'created', appId, taskId, row };
+    });
+  }
+
+  private notifyRevoked(appId: string, taskId: string): void {
+    this.notify(() => {
+      const row = this.getReplicaRow(appId, taskId);
+      return row && { kind: 'revoked', appId, taskId, row };
+    });
   }
 }
 

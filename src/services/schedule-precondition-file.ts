@@ -24,7 +24,8 @@ export type SchedulePreconditionFileErrorCode =
   | 'file_too_large'
   | 'file_changed'
   | 'invalid_utf8'
-  | 'invalid_content';
+  | 'invalid_content'
+  | 'unsupported_replicated';
 
 /**
  * File-condition errors deliberately carry no source path or underlying fs
