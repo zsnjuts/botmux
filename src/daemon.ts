@@ -78,7 +78,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getCachedChatMode, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getLastKnownChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -212,7 +212,7 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
-import { larkInboxOrderingKey } from './services/durable-inbox-ordering.js';
+import { resolveLarkInboxOrderingKey } from './services/durable-inbox-ordering.js';
 import { setTurnResultRuntime } from './core/turn-result-runtime.js';
 
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
@@ -32562,14 +32562,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             store: durableCoordinationRuntime.store,
             larkAppId: cfg.larkAppId,
             handleCanonical: eventRuntime.processDurableMessage,
-            resolveOrderingKey: ({ eventType, data }) => {
-              const chatId = larkEventChatId(data);
-              if (!chatId) return undefined;
-              const chatMode = getCachedChatMode(cfg.larkAppId, chatId);
-              // Warm the cache so the next message of this chat can get a key.
-              if (chatMode === undefined) void getChatMode(cfg.larkAppId, chatId).catch(() => undefined);
-              return larkInboxOrderingKey({ eventType, data, chatMode });
-            },
+            resolveOrderingKey: ({ eventType, data }) => resolveLarkInboxOrderingKey({
+              eventType,
+              data,
+              chatId: larkEventChatId(data),
+              lastKnownChatMode: chatId => getLastKnownChatMode(cfg.larkAppId, chatId),
+              refreshChatMode: chatId => {
+                void getChatMode(cfg.larkAppId, chatId).catch(() => undefined);
+              },
+            }),
             onInboxRetried: async ({ message, result }) => {
               try {
                 await enqueueDurableInboxRetryNotice({

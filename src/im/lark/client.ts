@@ -1106,6 +1106,16 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
   }
 }
 
+/** The last topology this process learned for a chat, however old, and whether it is still within the TTL. */
+export function getLastKnownChatMode(
+  larkAppId: string,
+  chatId: string,
+): { mode: ChatMode; fresh: boolean } | undefined {
+  const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
+  if (!cached) return undefined;
+  return { mode: cached.mode, fresh: Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS };
+}
+
 export function getCachedChatMode(larkAppId: string, chatId: string): ChatMode | undefined {
   const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
   if (cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
