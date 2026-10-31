@@ -19849,9 +19849,14 @@ function setupWorkerHandlers(
         // transcript JSONL and forwarded it to us. Dedup with a session-scoped
         // key so a re-drain can't re-send the same answer or cross-suppress
         // another session.
-        if (!msg.content || !msg.content.trim()) break;
-        if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
-        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
+        // Mew #101: a worker that asked for confirmation keeps the provider's
+        // copy until this answers. Deliberately not posting it settles the
+        // request; a wrong session or a failed hand-off leaves the copy for
+        // the next attach.
+        const answerPersisted = finalOutputPersistAck(worker, msg);
+        if (!msg.content || !msg.content.trim()) { answerPersisted(true); break; }
+        if (shouldDropMismatchedFinalOutput(ds, msg, t)) { answerPersisted(false); break; }
+        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) { answerPersisted(true); break; }
         const triggerFailureNotice = msg.turnFailed === true
           && isTriggerFinalSuppressed(ds, msg.turnId)
           ? msg.turnFailureNotice?.trim()
@@ -19859,6 +19864,7 @@ function setupWorkerHandlers(
         if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt, Boolean(triggerFailureNotice))
           || (triggerFailureNotice && managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt))) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
+          answerPersisted(true);
           break;
         }
         // Keep suppressed partial answers and machine receipts out of chat.
@@ -19870,6 +19876,7 @@ function setupWorkerHandlers(
         const dedupeKey = finalOutputDedupeKey(ds, msg);
         if (ds.lastBridgeEmittedUuid === dedupeKey) {
           logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
+          answerPersisted(true);
           break;
         }
         // Worker pops the turn off its queue right after emit, so it will
@@ -19891,7 +19898,7 @@ function setupWorkerHandlers(
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
-        deliverFinalOutputWithShutdownDrain(ds, finalOutput, t, ownsLifecycleMutation);
+        deliverFinalOutputWithShutdownDrain(ds, finalOutput, t, ownsLifecycleMutation, answerPersisted);
         break;
       }
 
@@ -20299,11 +20306,29 @@ export function setDurableBridgeFinalOutputHandler(
  * shutdown drain registration alive across all bounded retry attempts; the
  * provider terminal alone must not allow its worker generation to retire while
  * attempt 0 is still queued on the event loop. */
+/** Answer a worker's `persistAckRequestId` exactly once (Mew #101). */
+function finalOutputPersistAck(
+  worker: ChildProcess,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+): (ok: boolean) => void {
+  const requestId = msg.persistAckRequestId;
+  if (!requestId) return () => {};
+  let answered = false;
+  return ok => {
+    if (answered) return;
+    answered = true;
+    try {
+      worker.send({ type: 'final_output_persisted', requestId, ok } as DaemonToWorker);
+    } catch { /* the provider keeps its copy for the next attach */ }
+  };
+}
+
 function deliverFinalOutputWithShutdownDrain(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   isStillOwned: () => boolean,
+  onSettled: (owned: boolean) => void = () => {},
 ): void {
   const finishDrain = beginFinalOutputDelivery(ds, msg.turnId);
   // Must run synchronously in the IPC handler, before the trailing
@@ -20315,7 +20340,10 @@ function deliverFinalOutputWithShutdownDrain(
       msg,
       t,
       0,
-      () => finishDrain(),
+      owned => {
+        finishDrain();
+        onSettled(owned);
+      },
       isStillOwned,
       undefined,
       undefined,
@@ -20325,6 +20353,7 @@ function deliverFinalOutputWithShutdownDrain(
     );
   } catch (error) {
     finishDrain();
+    onSettled(false);
     throw error;
   }
 }

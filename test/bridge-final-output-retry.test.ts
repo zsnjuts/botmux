@@ -813,6 +813,52 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     },
   );
 
+  // Mew #101：worker 只在 daemon 确认后才让 provider 删掉结论副本。
+  describe('persistence confirmation for a provider-held final', () => {
+    const persisted = (worker: { send: ReturnType<typeof vi.fn> }) => worker.send.mock.calls
+      .map(([message]) => message as Record<string, unknown>)
+      .filter(message => message.type === 'final_output_persisted');
+
+    it('confirms only after the durable handler settled the final', async () => {
+      const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { setDurableBridgeFinalOutputHandler } = await import('../src/core/worker-pool.js');
+      let settle!: (value: { kind: 'delivered'; messageId: string }) => void;
+      const durable = vi.fn(() => new Promise<{ kind: 'delivered'; messageId: string }>(resolve => { settle = resolve; }));
+      setDurableBridgeFinalOutputHandler(durable);
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      (ds.worker as any).emit('message', {
+        type: 'final_output', sessionId: ds.session.sessionId, turnId: 'om_turn_final',
+        content: '排查结论', lastUuid: 'om_turn_final', persistAckRequestId: 'final-persist:1',
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(durable).toHaveBeenCalledTimes(1);
+      expect(persisted(ds.worker as any)).toEqual([]);
+
+      settle({ kind: 'delivered', messageId: 'om_durable' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(persisted(ds.worker as any)).toEqual([
+        { type: 'final_output_persisted', requestId: 'final-persist:1', ok: true },
+      ]);
+    });
+
+    it('keeps the provider copy when the final belongs to another session', async () => {
+      initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      (ds.worker as any).emit('message', {
+        type: 'final_output', sessionId: 'another-session', turnId: 'om_turn_final',
+        content: '排查结论', lastUuid: 'om_turn_final', persistAckRequestId: 'final-persist:2',
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(persisted(ds.worker as any)).toEqual([
+        { type: 'final_output_persisted', requestId: 'final-persist:2', ok: false },
+      ]);
+    });
+  });
+
   it('does not freeze an origin for a final_output that arrives after its turn_terminal', async () => {
     const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });

@@ -1,4 +1,6 @@
-import { resolve } from 'node:path';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RemoteRunnerBackend } from '../src/adapters/backend/remote-runner-backend.js';
 import type {
@@ -20,6 +22,7 @@ const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.
 const orphanProofRunner = resolve('test/fixtures/remote-runner-orphan-proof.mjs');
 const turnSteerRunner = resolve('test/fixtures/remote-runner-turn-steer.mjs');
 const startupProgressRunner = resolve('test/fixtures/remote-runner-startup-progress.mjs');
+const finalAckRunner = resolve('test/fixtures/remote-runner-final-ack.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -836,6 +839,44 @@ describe('RemoteRunnerBackend', () => {
       text: 'recovered final',
       turnId: 'turn-survived',
     });
+  });
+
+  // Mew #101：上一个宿主收到结论后冻住或重启、没确认落库，provider 在 ready 里
+  // 把它重新交给下一个接管的宿主；宿主确认后 provider 才删除。
+  it('hands an unconfirmed final from ready to the host and confirms it back', async () => {
+    const ackLog = resolve(mkdtempSync(join(tmpdir(), 'final-ack-')), 'acks.log');
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'final-ack-test',
+      generation: 2,
+      remoteSessionId: 'remote-existing',
+    };
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'final-ack-test' }, 'session-final-ack', initialState);
+    children.push(backend);
+    const pending = once<{ turnId: string; content: string }>(cb => backend.onPendingFinal(cb));
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, finalAckRunner, { FINAL_ACK_LOG: ackLog });
+    await ready;
+    await expect(pending).resolves.toEqual({ turnId: 'turn-unconfirmed', content: 'unconfirmed final' });
+    await expect(backend.acknowledgeFinal('turn-unconfirmed')).resolves.toBe(true);
+    expect(readFileSync(ackLog, 'utf8')).toBe('turn-unconfirmed\n');
+  });
+
+  it('fails closed when a provider offers pending finals without negotiating final_ack', async () => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'final-ack-test' }, 'session-final-ack-unnegotiated', {
+      version: 1,
+      provider: 'final-ack-test',
+      generation: 2,
+      remoteSessionId: 'remote-existing',
+    });
+    children.push(backend);
+    const offered = vi.fn();
+    backend.onPendingFinal(offered);
+    const exited = once<void>(cb => backend.onExit(() => cb()));
+    spawnBackend(backend, finalAckRunner, { FINAL_ACK_CAPABLE: '0' });
+    await exited;
+    expect(offered).not.toHaveBeenCalled();
+    await expect(backend.acknowledgeFinal('turn-unconfirmed')).resolves.toBe(false);
   });
 
   it('requires an explicit closed-session rebuild to advance the remote generation', async () => {
