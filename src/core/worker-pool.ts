@@ -16,6 +16,7 @@ import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from 
  * Extracted from daemon.ts for modularity.
  */
 import { execSync, type ChildProcess } from 'node:child_process';
+import { workerStartFailedMessageKey } from './worker-start-failure.js';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
@@ -14761,7 +14762,7 @@ export function forkWorker(
       return;
     }
     const cliName = sessionCliDisplayName(ds, botCfg);
-    const message = tr('worker.start_failed', { cliName, reason }, botLocale(botCfg));
+    const message = tr(workerStartFailedMessageKey(reason), { cliName, reason }, botLocale(botCfg));
     void cb.sessionReply(
       sessionAnchorId(ds),
       message,
@@ -15613,7 +15614,7 @@ function setupWorkerHandlers(
     }
     startupState.failureSurfaced = true;
     const cliName = sessionCliDisplayName(ds, botCfg);
-    const message = tr('worker.start_failed', { cliName, reason }, loc);
+    const message = tr(workerStartFailedMessageKey(reason), { cliName, reason }, loc);
     try {
       await scopedReply(message, 'text', turnId);
     } catch (err: any) {
