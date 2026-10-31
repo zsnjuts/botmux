@@ -29,6 +29,8 @@ export interface DurableLarkMessageObservation {
   larkAppId: string;
   messageId: string;
   attempts: number;
+  /** See {@link DurableLarkMessageEnvelope.orderingKey}. */
+  orderingKey?: string;
 }
 
 export interface DurableLarkMessageClaim extends DurableLarkMessageObservation {
@@ -105,6 +107,10 @@ export function parseDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMess
     larkAppId,
     messageId,
     attempts: claim.attempts,
+    ...(typeof payload.orderingKey === 'string' && payload.orderingKey
+        && payload.orderingKey.length <= 256
+      ? { orderingKey: payload.orderingKey }
+      : {}),
     data: payload.event as DurableJson,
   };
 }
