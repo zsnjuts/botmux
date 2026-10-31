@@ -23,6 +23,7 @@ const orphanProofRunner = resolve('test/fixtures/remote-runner-orphan-proof.mjs'
 const turnSteerRunner = resolve('test/fixtures/remote-runner-turn-steer.mjs');
 const startupProgressRunner = resolve('test/fixtures/remote-runner-startup-progress.mjs');
 const finalAckRunner = resolve('test/fixtures/remote-runner-final-ack.mjs');
+const turnInterruptRunner = resolve('test/fixtures/remote-runner-turn-interrupt.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -1433,5 +1434,117 @@ describe('RemoteRunnerBackend', () => {
       code: 'remote_runner_protocol_error',
     })));
     expect(finals).toEqual([]);
+  });
+
+  describe('Ctrl-C receipts for the active turn', () => {
+    type Failure = { turnId: string; code: string; status: string };
+
+    async function interruptibleBackend(sessionId: string): Promise<{
+      backend: RemoteRunnerBackend;
+      failures: Failure[];
+      finals: Array<string | undefined>;
+    }> {
+      const backend = new RemoteRunnerBackend({ expectedProvider: 'turn-interrupt' }, sessionId);
+      children.push(backend);
+      const failures: Failure[] = [];
+      const finals: Array<string | undefined> = [];
+      backend.onTurnFailure(failure => failures.push(failure));
+      backend.onTurnFinal((_text, turnId) => finals.push(turnId));
+      const ready = once<void>(cb => backend.onReady(cb));
+      spawnBackend(backend, turnInterruptRunner);
+      await ready;
+      return { backend, failures, finals };
+    }
+
+    it('keeps the provider alive when an older provider answers Ctrl-C with the active turnId', async () => {
+      // Regression: a pre-split provider attached the active turnId to its
+      // terminal_input receipt; the host took it for an unrelated turn failure,
+      // ended the turn ambiguous and killed the provider mid-turn.
+      const { backend, failures, finals } = await interruptibleBackend('session-legacy-receipt');
+      await backend.submitTurn({ turnId: 'turn-legacy', content: 'legacy-not-applied finish-after:300' });
+
+      expect(backend.write('\x03')).toBe(true);
+
+      await vi.waitFor(() => expect(finals).toEqual(['turn-legacy']));
+      expect(failures).toEqual([]);
+      expect(backend.activeTurnControls().interrupt).toBe(true);
+    });
+
+    it('reports no_active_turn without sending anything when no turn runs', async () => {
+      const { backend } = await interruptibleBackend('session-idle-stop');
+
+      await expect(backend.interruptActiveTurn(Date.now() + 2_000)).resolves.toEqual({ outcome: 'no_active_turn' });
+    });
+
+    it('sends Ctrl-C once the turn is acknowledged and its native turn started', async () => {
+      const { backend, failures } = await interruptibleBackend('session-stop-sent');
+      const submitted = backend.submitTurn({ turnId: 'turn-stop', content: 'ack-after:200 native-after:1' });
+      await vi.waitFor(() => expect(backend.activeTurnSteerReadiness()).toBe('pending'));
+
+      await expect(backend.interruptActiveTurn(Date.now() + 5_000, { expectedTurnId: 'turn-stop' }))
+        .resolves.toEqual({ outcome: 'sent', turnId: 'turn-stop' });
+      await expect(submitted).resolves.toEqual({ submitted: true });
+      await vi.waitFor(() => expect(failures).toEqual([
+        expect.objectContaining({ turnId: 'turn-stop', status: 'cancelled' }),
+      ]));
+    });
+
+    it('still reports sent when the cancelled terminal overtakes the receipt', async () => {
+      const { backend, failures } = await interruptibleBackend('session-stop-raced');
+      await backend.submitTurn({ turnId: 'turn-raced', content: 'cancel-first' });
+
+      await expect(backend.interruptActiveTurn(Date.now() + 2_000))
+        .resolves.toEqual({ outcome: 'sent', turnId: 'turn-raced' });
+      expect(failures).toEqual([expect.objectContaining({ turnId: 'turn-raced', status: 'cancelled' })]);
+    });
+
+    it('reports not_ready when the native turn does not start before the deadline', async () => {
+      const { backend, failures } = await interruptibleBackend('session-stop-not-ready');
+      await backend.submitTurn({ turnId: 'turn-slow', content: 'native-never' });
+
+      await expect(backend.interruptActiveTurn(Date.now() + 1_500))
+        .resolves.toEqual({ outcome: 'not_ready', turnId: 'turn-slow' });
+      expect(failures).toEqual([]);
+      expect(backend.activeTurnSteerReadiness()).toBe('ready');
+    });
+
+    it('reports not_ready when the turn is never acknowledged before the deadline', async () => {
+      const { backend } = await interruptibleBackend('session-stop-unacked');
+      void backend.submitTurn({ turnId: 'turn-unacked', content: 'ack-after:5000' });
+      await vi.waitFor(() => expect(backend.activeTurnSteerReadiness()).toBe('pending'));
+
+      await expect(backend.interruptActiveTurn(Date.now() + 300))
+        .resolves.toEqual({ outcome: 'not_ready', turnId: 'turn-unacked' });
+    });
+
+    it.each([
+      ['an ambiguous receipt', 'unknown'],
+      ['no receipt before the deadline', 'silent'],
+    ])('reports unknown on %s without retiring the provider', async (_label, content) => {
+      const { backend, failures } = await interruptibleBackend(`session-stop-${content}`);
+      await backend.submitTurn({ turnId: `turn-${content}`, content });
+
+      await expect(backend.interruptActiveTurn(Date.now() + 500))
+        .resolves.toEqual({ outcome: 'unknown', turnId: `turn-${content}` });
+      expect(failures).toEqual([]);
+      expect(backend.activeTurnControls().interrupt).toBe(true);
+      expect(backend.activeTurnSteerReadiness()).toBe('ready');
+    });
+
+    it('leaves a turn alone when it is not the one the stop targeted', async () => {
+      const { backend, failures } = await interruptibleBackend('session-stop-successor');
+      await backend.submitTurn({ turnId: 'turn-successor', content: 'native-after:0' });
+
+      await expect(backend.interruptActiveTurn(Date.now() + 2_000, { expectedTurnId: 'turn-previous' }))
+        .resolves.toEqual({ outcome: 'no_active_turn' });
+      // A redelivered stop issued well before this turn was submitted.
+      await expect(backend.interruptActiveTurn(Date.now() + 2_000, { issuedAtMs: Date.now() - 60_000 }))
+        .resolves.toEqual({ outcome: 'no_active_turn' });
+      expect(failures).toEqual([]);
+      expect(backend.activeTurnSteerReadiness()).toBe('ready');
+
+      await expect(backend.interruptActiveTurn(Date.now() + 2_000, { issuedAtMs: Date.now() }))
+        .resolves.toEqual({ outcome: 'sent', turnId: 'turn-successor' });
+    });
   });
 });

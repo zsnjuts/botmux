@@ -11272,6 +11272,99 @@ export function interruptExactWorkerTurn(
   });
 }
 
+export type ActiveTurnStopResult =
+  /** The stopped turn's own terminal arrived: `stopped` when it ended
+   * cancelled, `finished` when it ended some other way first; `unconfirmed`
+   * when Ctrl-C was delivered but no terminal arrived within the budget. */
+  | { outcome: 'stopped' | 'finished' | 'unconfirmed'; turnId: string }
+  | { outcome: 'not_ready' | 'no_active_turn' | 'unknown'; turnId?: string };
+
+/** Share of a stop budget kept for the interrupted turn's terminal; the worker
+ * spends the rest asking a provider whose turn is still starting. */
+const STOP_TERMINAL_RESERVE_MS = 5_000;
+
+/** Remote Runner `/stop`: ask the worker to Ctrl-C the turn it is running, then
+ * wait — inside one budget — for that same turn's terminal, so the reply says
+ * what happened rather than only that a key was sent. The terminal listener is
+ * attached before the request, because a cancelled turn may settle before the
+ * worker's receipt arrives. `issuedAt` (the stop message's create_time) keeps a
+ * redelivered stop away from a turn submitted after it. */
+export function stopActiveWorkerTurn(
+  ds: DaemonSession,
+  budgetMs = 15_000,
+  issuedAt?: number,
+): Promise<ActiveTurnStopResult> {
+  const worker = ds.worker;
+  if (!worker || worker.killed) return Promise.resolve({ outcome: 'no_active_turn' });
+  const requestId = randomUUID();
+  const deadline = Date.now() + Math.max(1_000, budgetMs - STOP_TERMINAL_RESERVE_MS);
+  return new Promise(resolve => {
+    let settled = false;
+    let stoppingTurnId: string | undefined;
+    const terminals = new Map<string, Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status']>();
+    let lastTerminalTurnId: string | undefined;
+    const finish = (result: ActiveTurnStopResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      resolve(result);
+    };
+    const byTerminal = (turnId: string, status: Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status']): void => {
+      finish({ outcome: status === 'cancelled' ? 'stopped' : 'finished', turnId });
+    };
+    const onMessage = (msg: WorkerToDaemon): void => {
+      if (msg.type === 'turn_terminal') {
+        if (msg.sessionId !== ds.session.sessionId) return;
+        if (stoppingTurnId !== undefined) {
+          if (msg.turnId === stoppingTurnId) byTerminal(msg.turnId, msg.status);
+          return;
+        }
+        terminals.set(msg.turnId, msg.status);
+        lastTerminalTurnId = msg.turnId;
+        return;
+      }
+      if (msg.type !== 'stop_active_turn_result' || msg.requestId !== requestId) return;
+      // A terminal that raced the receipt decides the outcome: the turn the
+      // worker targeted is already over, whichever way the receipt went.
+      const targetTurnId = msg.turnId ?? (msg.outcome === 'no_active_turn' ? lastTerminalTurnId : undefined);
+      const seen = targetTurnId !== undefined ? terminals.get(targetTurnId) : undefined;
+      if (targetTurnId !== undefined && seen !== undefined) return byTerminal(targetTurnId, seen);
+      if (msg.outcome === 'sent' && msg.turnId) {
+        stoppingTurnId = msg.turnId;
+        return;
+      }
+      finish({
+        outcome: msg.outcome === 'sent' ? 'unknown' : msg.outcome,
+        ...(msg.turnId ? { turnId: msg.turnId } : {}),
+      });
+    };
+    const unresolved = (): ActiveTurnStopResult => stoppingTurnId !== undefined
+      ? { outcome: 'unconfirmed', turnId: stoppingTurnId }
+      : { outcome: 'unknown' };
+    const onExit = (): void => finish(unresolved());
+    const timer = setTimeout(() => finish(unresolved()), budgetMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', onExit);
+    const queued = afterWorkerIpcBootstrap(worker, () => {
+      if (settled) return;
+      try {
+        worker.send({
+          type: 'stop_active_turn',
+          requestId,
+          deadline,
+          ...(issuedAt !== undefined ? { issuedAt } : {}),
+        } satisfies DaemonToWorker);
+      } catch {
+        finish({ outcome: 'unknown' });
+      }
+    });
+    if (!queued) finish({ outcome: 'no_active_turn' });
+  });
+}
+
 function settleTransferInputGate(
   ds: DaemonSession,
   gate: TransferInputGate,

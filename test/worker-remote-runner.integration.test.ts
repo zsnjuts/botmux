@@ -1283,6 +1283,138 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
+  it('answers /stop with the provider receipt once Ctrl-C reaches a natively started turn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-stop-'));
+    tempDirs.push(root);
+    const provider = join(root, 'provider.mjs');
+    const commandsPath = join(root, 'commands.jsonl');
+    // Like the TAE provider: Ctrl-C before the native turn row exists is
+    // answered not_ready (no turnId); the next one interrupts the turn.
+    writeFileSync(provider, `#!/usr/bin/env node
+import readline from 'node:readline';
+import { appendFileSync } from 'node:fs';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const state = { version: 1, provider: 'stop-provider', generation: 1, remoteSessionId: 'remote-stop-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+let activeTurnId;
+let notReadyLeft = 1;
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(command) + '\\n');
+  if (command.type === 'hello') {
+    emit({ type: 'hello', requestId: command.requestId, provider: 'stop-provider', capabilities: ['start','resume','turn','cancel','detach','reattach','status','terminal_input'] });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    activeTurnId = command.turnId;
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+  } else if (command.type === 'terminal_input') {
+    if (!activeTurnId) {
+      emit({ type: 'failure', requestId: command.requestId, code: 'terminal_input_no_active_turn', message: 'idle', status: 'failed', retryable: false });
+    } else if (notReadyLeft-- > 0) {
+      emit({ type: 'failure', requestId: command.requestId, code: 'terminal_input_not_ready', message: 'starting', status: 'failed', retryable: true });
+    } else {
+      emit({ type: 'status', requestId: command.requestId, status: 'busy' });
+      const turnId = activeTurnId;
+      activeTurnId = undefined;
+      emit({ type: 'failure', turnId, code: 'tae_traex_turn_cancelled', message: 'stopped', status: 'cancelled', retryable: false });
+    }
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  } else if (command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_stop_turn',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: { expectedProvider: 'stop-provider' },
+    }]));
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-stop-turn',
+        LARK_APP_ID: 'app_stop_turn',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    const commands = () => (existsSync(commandsPath) ? readFileSync(commandsPath, 'utf8') : '')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-stop-turn',
+      chatId: 'oc_stop_turn',
+      rootMessageId: 'om_stop_turn',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'stop-provider' },
+      prompt: 'long task',
+      turnId: 'turn-stoppable',
+      trustedCaller: {
+        requestUserOpenId: 'ou_remote_user',
+        requestLarkAppId: 'app_stop_turn',
+        senderType: 'user',
+      },
+      larkAppId: 'app_stop_turn',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => commands().some(command => command.type === 'turn'),
+      () => `turn was not submitted\n${logs.join('')}`,
+    );
+    child.send({
+      type: 'stop_active_turn',
+      requestId: 'stop-request',
+      deadline: Date.now() + 8_000,
+      issuedAt: Date.now(),
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'stop_active_turn_result'),
+      () => `stop was not answered\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.find(message => message.type === 'stop_active_turn_result')).toEqual({
+      type: 'stop_active_turn_result',
+      requestId: 'stop-request',
+      outcome: 'sent',
+      turnId: 'turn-stoppable',
+    });
+    expect(commands().filter(command => command.type === 'terminal_input')).toHaveLength(2);
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'turn-stoppable'
+        && message.status === 'cancelled'),
+      () => `stopped turn did not settle\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.some(message => message.type === 'error')).toBe(false);
+  });
+
   it('does not re-post a remote final that the same turn attempt already delivered via botmux send', async () => {
     // Remote Runner has no transcript mark window, so only the exact
     // (turnId, dispatchAttempt) identity of a delivered final marker can stop
