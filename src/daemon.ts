@@ -33552,8 +33552,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // and its successor during rolling deploys (Mew #93); let the successor
     // take them. A drain waits for this Pod's own turns, so it keeps claiming.
     const pauseInboxClaims = REMOTE_SHUTDOWN_MODE === 'handoff';
-    if (pauseInboxClaims) {
+    if (pauseInboxClaims && durablePrimaryRuntimes.length > 0) {
       for (const runtime of durablePrimaryRuntimes) runtime.inbox.pauseClaims();
+      logger.info('[durable-primary] shutdown: inbox claims paused; successors take new messages');
     }
     const resumeInboxClaims = (): void => {
       if (!pauseInboxClaims) return;
