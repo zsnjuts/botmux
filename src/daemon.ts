@@ -33517,9 +33517,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       async () => {
     setSessionLifecycleShutdown(true);
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
+    // The primary runtime only stops at the very end, after handoff and worker
+    // exit. Claiming Lark messages in that window bounced them between this Pod
+    // and its successor during rolling deploys (Mew #93); let the successor
+    // take them. A drain waits for this Pod's own turns, so it keeps claiming.
+    const pauseInboxClaims = REMOTE_SHUTDOWN_MODE === 'handoff';
+    if (pauseInboxClaims && durablePrimaryRuntimes.length > 0) {
+      for (const runtime of durablePrimaryRuntimes) runtime.inbox.pauseClaims();
+      logger.info('[durable-primary] shutdown: inbox claims paused; successors take new messages');
+    }
+    const resumeInboxClaims = (): void => {
+      if (!pauseInboxClaims) return;
+      for (const runtime of durablePrimaryRuntimes) runtime.inbox.resumeClaims();
+    };
 
     const initialShutdownFleet = collectUniqueDaemonShutdownSessions(activeSessions.values());
     if (!initialShutdownFleet.ok) {
+      resumeInboxClaims();
       setSessionLifecycleShutdown(false);
       shuttingDown = false;
       logger.error(`Daemon remains online: ${initialShutdownFleet.error}`);
@@ -33640,6 +33654,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `${result.error ?? 'unknown'}; admission remains fail-closed`,
         );
       }
+      resumeInboxClaims();
       setSessionLifecycleShutdown(false);
       shuttingDown = false;
       logger.error(`Daemon remains online: ${reason}`);
