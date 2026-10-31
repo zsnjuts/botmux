@@ -3270,6 +3270,7 @@ async function dispatchHumanMessageViaHandlers(
       durablePrimaryDispatch: !!payload.ctx.durablePrimaryDispatch,
       handlerCompleted: completed,
       admitted: payload.ctx.ingressAdmission?.admitted === true,
+      retryPending: !!payload.ctx.ingressAdmission?.retryReason?.trim(),
     })) {
       markMessageTriggered(appId, messageId);
     }

@@ -137,6 +137,15 @@ describe('durable primary existing-turn admission', () => {
     })).toBe(true);
   });
 
+  it('keeps an admitted primary attempt replayable while it still asks for a retry', () => {
+    expect(shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: true,
+      handlerCompleted: true,
+      admitted: true,
+      retryPending: true,
+    })).toBe(false);
+  });
+
   it('dedupes commit markers and retains only the newest bounded history', () => {
     const first = appendDurablePrimaryInputCommit([], {
       turnId: 'om_1', workerGeneration: 1, dispatchAttempt: 1,

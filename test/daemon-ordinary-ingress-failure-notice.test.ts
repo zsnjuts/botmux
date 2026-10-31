@@ -1338,6 +1338,39 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }));
   });
 
+  it('admits a follow-up on retry when its receipt landed after the previous attempt gave up', async () => {
+    // Mew #72：冷恢复超过回执等待，第一次尝试已把输入送进 worker 后转 retry。
+    // 回执晚到之后，重投必须直接确认接纳（写 canonical admission），不能再发一遍。
+    const anchor = 'om_thread_primary_late_receipt';
+    const turnId = 'om_primary_late_receipt_follow_up';
+    const caller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    const { ds, workerSend } = seedActiveRemoteRunnerSession(
+      anchor,
+      caller,
+      turnId,
+      { providerSteer: false },
+    );
+    ds.session.durablePrimaryInputCommits = [];
+    // No attempt is waiting any more: the daemon must hand the row back now.
+    expect(__testOnly_recordDurablePrimaryInputCommit(ds, {
+      type: 'turn_input_committed',
+      turnId,
+      dispatchAttempt: 1,
+      durablePrimaryInbox: true,
+    }, 12)).toBe(false);
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = { attempt: 2, signal: new AbortController().signal };
+
+    await handleThreadReply(makeEventData(turnId, 'follow-up after cold restore', anchor), ctx);
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
   it('keeps a same-principal follow-up waiting when the live provider did not negotiate steer', async () => {
     const anchor = 'om_thread_primary_active_no_steer';
     const turnId = 'om_primary_active_no_steer_follow_up';

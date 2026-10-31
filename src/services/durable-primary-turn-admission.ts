@@ -53,14 +53,18 @@ export function durablePrimaryRejectedLiveSendDisposition(
   return durablePrimaryDispatch ? 'retry' : 'ignored';
 }
 
-/** Primary retries remain replayable until canonical admission is committed. */
+/** Primary retries remain replayable until canonical admission is committed.
+ * An admitted attempt that still asked the Inbox to retry (its provider
+ * receipt wait expired) must stay replayable too: only the redelivery can see
+ * the late receipt and commit the canonical admission (Mew #72). */
 export function shouldPersistTriggeredMessage(input: {
   durablePrimaryDispatch: boolean;
   handlerCompleted: boolean;
   admitted: boolean;
+  retryPending?: boolean;
 }): boolean {
   return input.durablePrimaryDispatch
-    ? input.admitted
+    ? input.admitted && !input.retryPending
     : input.handlerCompleted || input.admitted;
 }
 

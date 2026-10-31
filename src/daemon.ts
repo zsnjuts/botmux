@@ -23716,12 +23716,13 @@ function durablePrimaryAdmissibleRetryWakeKey(ds: DaemonSession): string | undef
     : undefined;
 }
 
+/** Returns whether a live Inbox attempt was still waiting for this receipt. */
 function recordDurablePrimaryInputCommit(
   ds: DaemonSession,
   receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
   workerGeneration: number,
-): void {
-  if (!receipt.durablePrimaryInbox) return;
+): boolean {
+  if (!receipt.durablePrimaryInbox) return false;
   if (receipt.activeTurnSteer) {
     // Before waking waiters: whichever attempt observes this commit owns the
     // acceptance notice.
@@ -23744,13 +23745,14 @@ function recordDurablePrimaryInputCommit(
   }
   const key = durablePrimaryInputCommitKey(ds.session.sessionId, receipt.turnId);
   const waiters = durablePrimaryInputCommitWaiters.get(key);
-  if (!waiters) return;
+  if (!waiters) return false;
   durablePrimaryInputCommitWaiters.delete(key);
   for (const waiter of waiters) {
     clearTimeout(waiter.timer);
     waiter.signal.removeEventListener('abort', waiter.onAbort);
     waiter.resolve();
   }
+  return true;
 }
 
 export const __testOnly_recordDurablePrimaryInputCommit = recordDurablePrimaryInputCommit;
@@ -31103,7 +31105,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (durableCoordinationRuntime?.mode !== 'primary'
           || !durablePrimaryRuntimeByApp.has(ds.larkAppId)) return;
       if (ds.session.workerGeneration !== context.workerGeneration) return;
-      recordDurablePrimaryInputCommit(ds, receipt, context.workerGeneration);
+      const waited = recordDurablePrimaryInputCommit(ds, receipt, context.workerGeneration);
+      // The submitting attempt already gave up waiting (cold restore, capacity
+      // wait) and handed its row back. Redeliver it now so it commits the
+      // canonical admission before this turn's final output needs it (Mew #72).
+      if (!waited && receipt.durablePrimaryInbox) {
+        durablePrimaryRuntimeByApp.get(ds.larkAppId)?.inbox.wakeRetry(durablePrimaryRetryWakeKey(ds));
+      }
     },
     onNativeInputConsumed(ds, receipt, context) {
       // The worker proved this exact input entered its native conversation.
