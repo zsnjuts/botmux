@@ -164,6 +164,10 @@ import {
   setDurableChatSessionlessState,
 } from './services/durable-chat-sessionless-state.js';
 import {
+  createDurableScheduleAuthority,
+  type DurableScheduleAuthority,
+} from './services/durable-schedule-authority.js';
+import {
   createDurableConfigCoordinator,
   DURABLE_CONFIG_SCOPES,
   type DurableConfigInspection,
@@ -30787,12 +30791,29 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.setScheduleScope(cfg.larkAppId);
   migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
+  let durableScheduleAuthority: DurableScheduleAuthority | undefined;
   try {
     scheduleAuthorityStore ??= ScheduleAuthorityStore.open(config.session.dataDir);
-    scheduleAuthorityStore.initializeApp(cfg.larkAppId, scheduleStore.listTasks());
+    if (durableCoordinationRuntime?.mode === 'primary') {
+      // The Pod-local data dir does not survive a rebuild and every replica has
+      // its own: tasks live in the coordination store, the local SQLite is a
+      // cache, and each due run is CAS-claimed there by exactly one replica.
+      durableScheduleAuthority = createDurableScheduleAuthority({
+        store: durableCoordinationRuntime.store,
+        local: scheduleAuthorityStore,
+        bootId: getDaemonBootId(),
+        onRowReplaced: (appId, row) => row.state === 'revoked'
+          ? scheduleStore.removeAuthoritativeTaskProjection(row.task.id, appId)
+          : scheduleStore.projectAuthoritativeTask(row.task, appId),
+      });
+      await durableScheduleAuthority.hydrate(cfg.larkAppId, () => scheduleStore.listTasks());
+    } else {
+      scheduleAuthorityStore.initializeApp(cfg.larkAppId, scheduleStore.listTasks());
+    }
     const authoritativeTasks = scheduleAuthorityStore.listTasks(cfg.larkAppId);
     scheduleStore.replaceAuthoritativeProjection(authoritativeTasks, cfg.larkAppId);
     scheduler.setScheduleAuthorityStore(scheduleAuthorityStore);
+    scheduler.setDurableScheduleAuthority(durableScheduleAuthority ?? null);
     setScheduledSelfCleanupReceiptHandler(request => {
       if (!scheduleAuthorityStore) return false;
       const receipt: ScheduleSelfCleanupReceipt = {
@@ -30834,6 +30855,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       `[scheduler] authority initialization failed for ${cfg.larkAppId}; `
       + `scheduled execution and mutations are disabled until recovery: ${detail}`,
     );
+    void durableScheduleAuthority?.stop(0).catch(() => undefined);
+    durableScheduleAuthority = undefined;
+    scheduler.setDurableScheduleAuthority(null);
     try { scheduleAuthorityStore?.close(); } catch { /* no-op */ }
     scheduleAuthorityStore = null;
     setScheduledSelfCleanupReceiptHandler(null);
@@ -34143,6 +34167,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         + `unreleased=${durableChatSessionlessStop.unreleasedSessionKeys.length})`,
       );
     }
+    // Started by scheduler.stopScheduler(); wait for its runner lease release
+    // before the coordination provider closes.
+    await durableScheduleAuthority?.stop(durableStopBudget()).catch(() => undefined);
     const durableRecallStop = await durableGroupContextRecallFacade?.stop(durableStopBudget());
     if (durableRecallStop?.kind === 'timed_out') {
       logger.warn(
