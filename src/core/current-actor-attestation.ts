@@ -13,6 +13,7 @@ import {
   procStatStartTimeDigits,
 } from '../utils/proc-stat.js';
 import { isLoopbackPeer } from '../utils/loopback-peers.js';
+import { logger } from '../utils/logger.js';
 
 const TCP_ESTABLISHED_STATE = '01';
 
@@ -188,7 +189,17 @@ function peerBelongsToCurrentTurn(input: {
 
 export type CurrentActorDaemonResult =
   | { ok: true; document: CurrentActorDocument }
-  | { ok: false; error: 'current_actor_unverified' };
+  | { ok: false; error: 'current_actor_unverified' | 'current_actor_lookup_timeout' };
+
+/**
+ * Budget for the contact lookup behind `/api/current-actor` (Mew #70). The
+ * Runner gives the whole request 5 s; answering a distinct, retryable error
+ * inside that window beats letting its socket time out as "daemon unreachable".
+ */
+export const CURRENT_ACTOR_LOOKUP_BUDGET_MS = 3_000;
+/** A lookup this slow is still answered, but logged so the next timeout has context. */
+const CURRENT_ACTOR_SLOW_LOOKUP_MS = 1_000;
+const LOOKUP_TIMED_OUT = Symbol('current actor lookup timed out');
 
 export interface CurrentTurnPeerAttestation {
   ds: DaemonSession;
@@ -338,6 +349,7 @@ export async function resolveDaemonCurrentActor(input: {
   resolveIdentity?: typeof resolveVerifiedUserIdentity;
   procRoot?: string;
   expectedScheduledTurnId?: string;
+  lookupBudgetMs?: number;
 }): Promise<CurrentActorDaemonResult> {
   const procRoot = input.procRoot ?? '/proc';
   const attestInput = {
@@ -350,7 +362,34 @@ export async function resolveDaemonCurrentActor(input: {
   const frozen = attestCurrentTurnLoopbackPeer(attestInput);
   if (!frozen) return { ok: false, error: 'current_actor_unverified' };
 
-  const identity = await (input.resolveIdentity ?? resolveVerifiedUserIdentity)(frozen.ds.larkAppId, frozen.callerOpenId);
+  const budgetMs = input.lookupBudgetMs ?? CURRENT_ACTOR_LOOKUP_BUDGET_MS;
+  const startedAt = Date.now();
+  let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+  const identity = await Promise.race([
+    (input.resolveIdentity ?? resolveVerifiedUserIdentity)(frozen.ds.larkAppId, frozen.callerOpenId, {
+      // The request itself gets a little longer than the budget so the budget
+      // timer wins: an SDK abort at the same instant must still read as a
+      // timeout, not as an unknown user.
+      timeoutMs: budgetMs + 1_000,
+    }),
+    new Promise<typeof LOOKUP_TIMED_OUT>(resolve => {
+      budgetTimer = setTimeout(() => resolve(LOOKUP_TIMED_OUT), budgetMs);
+    }),
+  ]).finally(() => clearTimeout(budgetTimer));
+  const elapsedMs = Date.now() - startedAt;
+  if (identity === LOOKUP_TIMED_OUT) {
+    logger.warn(
+      `[current-actor] contact lookup exceeded ${budgetMs}ms `
+      + `(session ${input.sessionId.slice(0, 8)}, caller ${frozen.callerOpenId.slice(0, 12)})`,
+    );
+    return { ok: false, error: 'current_actor_lookup_timeout' };
+  }
+  if (elapsedMs >= CURRENT_ACTOR_SLOW_LOOKUP_MS) {
+    logger.warn(
+      `[current-actor] slow contact lookup ${elapsedMs}ms `
+      + `(session ${input.sessionId.slice(0, 8)}, caller ${frozen.callerOpenId.slice(0, 12)})`,
+    );
+  }
   if (!identity || identity.type !== 'user' || identity.openId !== frozen.callerOpenId) {
     return { ok: false, error: 'current_actor_unverified' };
   }
