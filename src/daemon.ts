@@ -24072,7 +24072,8 @@ async function submitDurablePrimaryRetryTurn(
     // Do not let command-handler's broad catch turn that into a direct
     // submit-failed side effect from the stale owner.
     if (dispatch.signal.aborted) return { kind: 'retry', inputAccepted: true };
-    retryDurablePrimaryIngress(ctx, 'retry provider submit receipt is still pending');
+    // Park on this replica (it holds the worker): the late receipt wakes it.
+    retryDurablePrimaryIngress(ctx, 'retry provider submit receipt is still pending', ds);
     logger.warn(
       `[${tag(ds)}] Durable-primary /retry ${turnId.slice(0, 12)} will retry `
       + `after provider submit receipt wait failed: `
@@ -28243,7 +28244,10 @@ async function handleThreadReplyAdmitted(
             );
           } catch (error) {
             if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
-            retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending');
+            // Park on this replica (it holds the worker) instead of handing the
+            // row to the queue, where the other replica may keep claiming it
+            // while the final output waits for this admission (Mew #72).
+            retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending', ds);
             logger.warn(
               `[${tag(ds)}] Durable-primary turn ${parsed.messageId.slice(0, 12)} `
               + `will retry after provider submit receipt wait failed: `
@@ -28750,7 +28754,8 @@ async function handleThreadReplyAdmitted(
         );
       } catch (error) {
         if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
-        retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending after worker refork');
+        // Park on this replica (it holds the worker): the late receipt wakes it.
+        retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending after worker refork', ds);
         logger.warn(
           `[${tag(ds)}] Durable-primary reforked turn ${parsed.messageId.slice(0, 12)} `
           + `will retry after provider submit receipt wait failed: `

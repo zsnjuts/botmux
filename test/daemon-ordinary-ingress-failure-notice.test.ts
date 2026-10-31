@@ -1125,8 +1125,10 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       vi.useRealTimers();
     }
 
+    // Mew #72：挂在持有 worker 的本副本上，晚到的回执直接唤醒它补写 admission。
     expect(ctx.ingressAdmission).toMatchObject({
       retryReason: 'provider submit receipt is still pending after worker refork',
+      retryWakeKey: `session:${ds.session.sessionId}`,
     });
     // The worker may still die before ready; its startup failure must reach the user.
     expect(ds.suppressRecoveryCard).toBeUndefined();
@@ -1299,9 +1301,11 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     // Not the 60 s receipt timeout, and not "admitted": an admitted retry
     // would be deduplicated away and the follow-up lost.
     expect(Date.now() - started).toBeLessThan(5_000);
+    // Parked on this replica until the target turn ends (or a late receipt).
     expect(ctx.ingressAdmission).toEqual({
       admitted: false,
       retryReason: 'provider submit receipt is still pending',
+      retryWakeKey: `session:${ds.session.sessionId}`,
     });
     expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
   });
