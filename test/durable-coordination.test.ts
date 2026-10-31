@@ -995,8 +995,7 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
-  it('reopens only an aged ambiguous Session head and lets an abandoned head release its successors', async () => {
-    // Mew #35: an ambiguous row otherwise fences every later row of its Session forever.
+  async function ambiguousHeadStore() {
     let now = 1;
     const store = makeStore(() => now);
     const lease = acquired(await store.acquireSessionLease({
@@ -1013,34 +1012,50 @@ describe('SQLite durable coordination contract', () => {
     const begun = await store.beginOutboxAttempt({ reservation: reservation! });
     if (begun.kind !== 'applied') throw new Error('expected begun attempt');
     await store.markOutboxAmbiguous({ attempt: begun.attempt, error: 'socket reset after write' });
+    return { store, attempt: begun.attempt, setNow: (value: number) => { now = value; } };
+  }
 
-    now = 50;
-    expect(await store.reserveAmbiguousOutbox({
-      workerId: 'reconciler', leaseDurationMs: 100, minAmbiguousAgeMs: 100,
-    })).toBeUndefined();
+  it('claims only an aged ambiguous Session head in place and lets an abandoned head release its successors', async () => {
+    // Mew #35: an ambiguous row otherwise fences every later row of its Session forever.
+    const { store, attempt, setNow } = await ambiguousHeadStore();
+    const claimInput = { workerId: 'reconciler', leaseDurationMs: 100, minAmbiguousAgeMs: 100 };
+
+    setNow(50);
+    expect(await store.reserveAmbiguousOutbox(claimInput)).toBeUndefined();
     expect(await store.reserveNextOutbox({ workerId: 'sender-b', leaseDurationMs: 100 })).toBeUndefined();
 
-    now = 200;
-    const reopened = await store.reserveAmbiguousOutbox({
-      workerId: 'reconciler', leaseDurationMs: 100, minAmbiguousAgeMs: 100,
-    });
-    expect(reopened).toMatchObject({
+    setNow(200);
+    const claimed = await store.reserveAmbiguousOutbox(claimInput);
+    expect(claimed).toMatchObject({
       workerId: 'reconciler',
-      record: { messageId: 'message-head', state: 'reserved', attempts: 1 },
+      record: { messageId: 'message-head', state: 'ambiguous', attempts: 1 },
     });
-    expect(reopened!.claimEpoch).toBeGreaterThan(begun.attempt.claimEpoch);
+    expect(claimed!.claimEpoch).toBeGreaterThan(attempt.claimEpoch);
+    expect(await store.reserveAmbiguousOutbox({ ...claimInput, workerId: 'reconciler-b' })).toBeUndefined();
     // The superseded attempt can no longer settle the row.
     expect(await store.completeOutboxAttempt({
-      attempt: begun.attempt, receipt: { platformMessageId: 'om_superseded' },
+      attempt, receipt: { platformMessageId: 'om_superseded' },
     })).toEqual({ kind: 'stale' });
 
-    expect(await store.abandonOutboxReservation({
-      reservation: { ...reopened!, claimEpoch: reopened!.claimEpoch + 1 },
+    // A reconciler that dies before deciding leaves the row ambiguous: the
+    // normal FIFO never resends it, and it is claimable again once expired.
+    setNow(400);
+    expect(await store.reserveNextOutbox({ workerId: 'sender-b', leaseDurationMs: 100 })).toBeUndefined();
+    expect(await store.abandonAmbiguousOutbox({
+      reservation: claimed!,
+      receipt: { kind: 'abandoned', reason: 'expired claim' },
+      error: 'expired claim',
+    })).toEqual({ kind: 'stale' });
+    const reclaimed = await store.reserveAmbiguousOutbox({ ...claimInput, workerId: 'reconciler-b' });
+    expect(reclaimed).toMatchObject({ workerId: 'reconciler-b', record: { messageId: 'message-head' } });
+
+    expect(await store.abandonAmbiguousOutbox({
+      reservation: { ...reclaimed!, claimEpoch: reclaimed!.claimEpoch + 1 },
       receipt: { kind: 'abandoned', reason: 'wrong claim' },
       error: 'wrong claim',
     })).toEqual({ kind: 'stale' });
-    expect(await store.abandonOutboxReservation({
-      reservation: reopened!,
+    expect(await store.abandonAmbiguousOutbox({
+      reservation: reclaimed!,
       receipt: { kind: 'abandoned', reason: 'dedupe window exhausted' },
       error: 'dedupe window exhausted',
     })).toMatchObject({
@@ -1051,6 +1066,24 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.reserveNextOutbox({ workerId: 'sender-b', leaseDurationMs: 100 })).toMatchObject({
       record: { messageId: 'message-next' },
     });
+    await store.close();
+  });
+
+  it('requeues a claimed ambiguous head for the normal FIFO', async () => {
+    const { store, setNow } = await ambiguousHeadStore();
+    setNow(200);
+    const claimed = await store.reserveAmbiguousOutbox({
+      workerId: 'reconciler', leaseDurationMs: 100, minAmbiguousAgeMs: 100,
+    });
+    expect(await store.requeueAmbiguousOutbox({
+      reservation: claimed!, error: 'requeued within idempotency window',
+    })).toMatchObject({ kind: 'applied', record: { state: 'pending', visibleAt: 200, attempts: 1 } });
+    expect(await store.requeueAmbiguousOutbox({
+      reservation: claimed!, error: 'requeued twice',
+    })).toEqual({ kind: 'stale' });
+
+    const resent = await store.reserveNextOutbox({ workerId: 'sender-b', leaseDurationMs: 100 });
+    expect(resent).toMatchObject({ record: { messageId: 'message-head', state: 'reserved', attempts: 1 } });
     await store.close();
   });
 
