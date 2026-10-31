@@ -47,7 +47,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, stopActiveWorkerTurn, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -1815,6 +1815,33 @@ function replyTransferInProgress(send: GuardReply, loc: Locale): Promise<unknown
   return send(t('cmd.session.transfer_in_progress', undefined, loc));
 }
 
+/** Remote Runner 的 /stop 最多等这么久：先停这一轮，再等它的终态，然后才回复。 */
+const REMOTE_RUNNER_STOP_BUDGET_MS = 15_000;
+
+/**
+ * Remote Runner 的 /stop：按停止结果回复，而不是只说「已发送停止信号」。
+ * Ctrl-C 在远端原生轮次开始前会被提交提示词吞掉，所以要等 Runner 确认送达，
+ * 再在同一预算内等这一轮的终态。消息的 create_time 一并传下去：收件箱至少一次
+ * 投递时，重投的旧 /stop 不会停掉在它之后才提交的轮次。
+ */
+async function remoteRunnerStopReply(ds: DaemonSession, message: LarkMessage, loc: Locale, logTag: string): Promise<string> {
+  if (!ds.worker || ds.worker.killed) return t('cmd.stop.no_active_turn', undefined, loc);
+  // 停止能力随 provider 的就绪握手上报；还没报上来就是 provider 仍在启动。
+  if (ds.activeTurnControls?.worker !== ds.worker) return t('cmd.stop.not_ready', undefined, loc);
+  if (!ds.activeTurnControls.interrupt) return t('cmd.stop.unsupported', undefined, loc);
+  const issuedAt = Number(message.createTime);
+  const result = await stopActiveWorkerTurn(
+    ds,
+    REMOTE_RUNNER_STOP_BUDGET_MS,
+    Number.isSafeInteger(issuedAt) && issuedAt > 0 ? issuedAt : undefined,
+  );
+  logger.info(`[${logTag}] /stop: remote turn ${result.outcome}${result.turnId ? ` (${result.turnId.substring(0, 12)})` : ''}`);
+  if (result.outcome === 'unconfirmed') {
+    return t('cmd.stop.unconfirmed', { seconds: Math.round(REMOTE_RUNNER_STOP_BUDGET_MS / 1000) }, loc);
+  }
+  return t(`cmd.stop.${result.outcome}`, undefined, loc);
+}
+
 /** 「恢复会话」结果 → 回复文案；`/adopt <id>` 与 `/resume` 共用，失败口径与卡片按钮一致。 */
 function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, loc: Locale): string {
   if (result.ok) {
@@ -2870,14 +2897,14 @@ export async function handleCommand(
         }
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
         const effectiveBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
-        const remoteRunnerInterrupt = effectiveBackendType === 'remote-runner'
-          && !!ds.worker
-          && ds.activeTurnControls?.worker === ds.worker
-          && ds.activeTurnControls.interrupt;
+        const remoteRunner = effectiveBackendType === 'remote-runner';
         if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app'
-            || ((isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds))
-              && !remoteRunnerInterrupt)) {
+            || ((isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) && !remoteRunner)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
+          break;
+        }
+        if (remoteRunner) {
+          await sessionReply(rootId, await remoteRunnerStopReply(ds, message, loc, logTag));
           break;
         }
         if (!ds.worker || ds.worker.killed) {

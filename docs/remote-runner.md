@@ -88,6 +88,14 @@ steer 成功只提交 `steerId` 的输入收据，不创建第二个 final owner
 
 用户显式 `/queue <正文>` 永远作为当前 turn 之后的独立新轮，不设置 `activeTurnSteer`；用户显式 `/stop` 仍走终端控制通道。provider 声明 `terminal_input` 后 Remote Runner 才支持 `/stop`，否则回复不支持；provider 可以把该能力收窄为只接受当前 generation active turn 的 Ctrl-C。provider 确认该轮因用户中断而结束时应发送 `status: cancelled` 的关联 `failure`；Host 只用它结算 turn 生命周期，不把其中的诊断文案再次投递成 `final_output`，停止命令或控制卡的原回执继续负责用户可见反馈。
 
+`/stop` 按结果回复，而不是只说已发送：Host 等这一轮被 provider 接收，再发 Ctrl-C；拿到 `status` 回执后，在同一预算（15 秒）内等这一轮的终态，`cancelled` 回复已停止，其它终态回复「停止前已结束」，等不到回复未确认。Ctrl-C 的失败回执只是这条请求的答复，不是轮次终态，provider 不应带 `turnId`（Host 也只按 `requestId` 结算它，不会因此结束 provider）：
+
+- `terminal_input_not_ready`（`retryable: true`）：轮次还没在远端真正开始，Ctrl-C 没有发出；Host 约每秒重试一次，到期回复「还在启动」。
+- `terminal_input_no_active_turn`：provider 没有进行中的轮次。
+- `terminal_input_unknown`（`status: ambiguous`）：不确定是否送达，Host 回复结果不确定，不重试。
+
+`/stop` 还带上消息的 `create_time`：比它晚 2 秒以上才提交的轮次不会被停（收件箱至少一次投递时，重投的旧 `/stop` 不会停掉后来的轮次）。
+
 ### 可选启动进度
 
 BotMux 在 hello 的 `optionalCapabilities` 里列出 `startup_progress`。provider hello 也声明它之后，可以在启动还没完成时发送只用于展示的 `startup_progress` 事件：`{"type":"startup_progress","stage":"sandbox_create"}`，turn 准备期间再带上该 turn 的 `turnId`。

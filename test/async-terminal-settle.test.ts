@@ -93,7 +93,7 @@ vi.mock('../src/services/async-trigger-store.js', async importOriginal => {
   };
 });
 
-import { initWorkerPool, interruptExactWorkerTurn, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { initWorkerPool, interruptExactWorkerTurn, stopActiveWorkerTurn, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
@@ -159,6 +159,97 @@ describe('interruptExactWorkerTurn', () => {
       type: 'turn_interrupt_result', requestId: sent.requestId, turnId: 'turn-exact', delivered: true,
     });
     await expect(pending).resolves.toEqual({ ok: true });
+  });
+});
+
+describe('stopActiveWorkerTurn', () => {
+  const terminal = (turnId: string, status: 'completed' | 'cancelled' | 'failed') => ({
+    type: 'turn_terminal', sessionId: 'sid-async-settle', turnId, status,
+  });
+  const request = (ds: DaemonSession) => (ds.worker as any).send.mock.calls[0][0];
+
+  it('waits for the interrupted turn\'s own terminal after the worker delivered Ctrl-C', async () => {
+    const ds = makeDs();
+    const startedAt = Date.now();
+    const pending = stopActiveWorkerTurn(ds, 5_000, 1_700_000_000_000);
+    const sent = request(ds);
+    expect(sent).toMatchObject({ type: 'stop_active_turn', issuedAt: 1_700_000_000_000 });
+    // The worker must stop asking early enough to leave budget for the terminal.
+    expect(sent.deadline).toBeLessThan(startedAt + 5_000);
+    (ds.worker as any).emit('message', {
+      type: 'stop_active_turn_result', requestId: sent.requestId, outcome: 'sent', turnId: 'turn-a',
+    });
+    (ds.worker as any).emit('message', terminal('turn-other', 'completed'));
+    (ds.worker as any).emit('message', terminal('turn-a', 'cancelled'));
+    await expect(pending).resolves.toEqual({ outcome: 'stopped', turnId: 'turn-a' });
+  });
+
+  it('reports finished when the interrupted turn ended some other way first', async () => {
+    const ds = makeDs();
+    const pending = stopActiveWorkerTurn(ds, 5_000);
+    const sent = request(ds);
+    (ds.worker as any).emit('message', {
+      type: 'stop_active_turn_result', requestId: sent.requestId, outcome: 'sent', turnId: 'turn-a',
+    });
+    (ds.worker as any).emit('message', terminal('turn-a', 'completed'));
+    await expect(pending).resolves.toEqual({ outcome: 'finished', turnId: 'turn-a' });
+  });
+
+  it('settles from a terminal that overtook the worker receipt', async () => {
+    const ds = makeDs();
+    const pending = stopActiveWorkerTurn(ds, 5_000);
+    const sent = request(ds);
+    (ds.worker as any).emit('message', terminal('turn-a', 'cancelled'));
+    (ds.worker as any).emit('message', {
+      type: 'stop_active_turn_result', requestId: sent.requestId, outcome: 'sent', turnId: 'turn-a',
+    });
+    await expect(pending).resolves.toEqual({ outcome: 'stopped', turnId: 'turn-a' });
+  });
+
+  it('reports a turn that ended while the stop was being asked as finished', async () => {
+    const ds = makeDs();
+    const pending = stopActiveWorkerTurn(ds, 5_000);
+    const sent = request(ds);
+    (ds.worker as any).emit('message', terminal('turn-a', 'completed'));
+    (ds.worker as any).emit('message', {
+      type: 'stop_active_turn_result', requestId: sent.requestId, outcome: 'no_active_turn',
+    });
+    await expect(pending).resolves.toEqual({ outcome: 'finished', turnId: 'turn-a' });
+  });
+
+  it('reports unconfirmed when the interrupted turn has no terminal within the budget', async () => {
+    const ds = makeDs();
+    const pending = stopActiveWorkerTurn(ds, 50);
+    const sent = request(ds);
+    (ds.worker as any).emit('message', {
+      type: 'stop_active_turn_result', requestId: sent.requestId, outcome: 'sent', turnId: 'turn-a',
+    });
+    await expect(pending).resolves.toEqual({ outcome: 'unconfirmed', turnId: 'turn-a' });
+  });
+
+  it.each(['not_ready', 'no_active_turn', 'unknown'] as const)(
+    'passes a %s receipt through without waiting',
+    async outcome => {
+      const ds = makeDs();
+      const pending = stopActiveWorkerTurn(ds, 5_000);
+      const sent = request(ds);
+      (ds.worker as any).emit('message', {
+        type: 'stop_active_turn_result', requestId: 'other-request', outcome: 'sent', turnId: 'turn-a',
+      });
+      (ds.worker as any).emit('message', {
+        type: 'stop_active_turn_result', requestId: sent.requestId, outcome, turnId: 'turn-a',
+      });
+      await expect(pending).resolves.toEqual({ outcome, turnId: 'turn-a' });
+    },
+  );
+
+  it('reports unknown when the worker never answers or exits', async () => {
+    const silent = makeDs();
+    await expect(stopActiveWorkerTurn(silent, 50)).resolves.toEqual({ outcome: 'unknown' });
+    const exiting = makeDs();
+    const pending = stopActiveWorkerTurn(exiting, 5_000);
+    (exiting.worker as any).emit('exit', 1, null);
+    await expect(pending).resolves.toEqual({ outcome: 'unknown' });
   });
 });
 
