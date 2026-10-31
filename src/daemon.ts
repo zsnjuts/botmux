@@ -23738,18 +23738,22 @@ function retryDurablePrimaryIngress(
   return true;
 }
 
-/** A retry after the provider submit receipt never arrived: the input did not
- * get through, so it spends the Inbox failure budget. A Session that can never
- * start (e.g. its remote lineage no longer resumes) then settles its row after
- * the usual number of attempts instead of holding a group-wide barrier for
- * hours behind it. */
-function retryDurablePrimaryIngressAfterReceiptTimeout(
+/** Retry after the provider submit receipt wait failed. When the receipt never
+ * came the input did not get through, so the retry spends the Inbox failure
+ * budget: a Session that can never start (e.g. its remote lineage no longer
+ * resumes) then settles its row after the usual number of attempts instead of
+ * holding a group-wide barrier for hours. A handed-back steer whose target turn
+ * ended first is an ordinary race and retries without counting. */
+function retryDurablePrimaryIngressAfterReceiptWait(
   ctx: RoutingContext,
   reason: string,
   waitFor: DaemonSession,
+  error: unknown,
 ): void {
   if (!retryDurablePrimaryIngress(ctx, reason, waitFor)) return;
-  ctx.ingressAdmission!.retryCountsAsFailure = true;
+  if (error instanceof DurablePrimaryInputCommitTimeoutError) {
+    ctx.ingressAdmission!.retryCountsAsFailure = true;
+  }
 }
 
 function durablePrimaryRetryWakeKey(ds: DaemonSession): string {
@@ -23857,6 +23861,9 @@ function queueTurnSteerAcceptedNotice(
   });
 }
 
+/** The provider never confirmed receiving the input within the wait. */
+class DurablePrimaryInputCommitTimeoutError extends Error {}
+
 function waitForDurablePrimaryInputCommit(
   ds: DaemonSession,
   turnId: string,
@@ -23876,7 +23883,9 @@ function waitForDurablePrimaryInputCommit(
       resolve() { settle(); resolve(); },
       reject(error) { settle(); reject(error); },
       timer: setTimeout(() => {
-        waiter.reject(new Error(`durable primary provider submit receipt timed out for ${turnId}`));
+        waiter.reject(new DurablePrimaryInputCommitTimeoutError(
+          `durable primary provider submit receipt timed out for ${turnId}`,
+        ));
       }, DURABLE_PRIMARY_INPUT_COMMIT_TIMEOUT_MS),
       signal,
       onAbort() {
@@ -24121,7 +24130,7 @@ async function submitDurablePrimaryRetryTurn(
     // submit-failed side effect from the stale owner.
     if (dispatch.signal.aborted) return { kind: 'retry', inputAccepted: true };
     // Park on this replica (it holds the worker): the late receipt wakes it.
-    retryDurablePrimaryIngressAfterReceiptTimeout(ctx, 'retry provider submit receipt is still pending', ds);
+    retryDurablePrimaryIngressAfterReceiptWait(ctx, 'retry provider submit receipt is still pending', ds, error);
     logger.warn(
       `[${tag(ds)}] Durable-primary /retry ${turnId.slice(0, 12)} will retry `
       + `after provider submit receipt wait failed: `
@@ -28295,7 +28304,7 @@ async function handleThreadReplyAdmitted(
             // Park on this replica (it holds the worker) instead of handing the
             // row to the queue, where the other replica may keep claiming it
             // while the final output waits for this admission (Mew #72).
-            retryDurablePrimaryIngressAfterReceiptTimeout(ctx, 'provider submit receipt is still pending', ds);
+            retryDurablePrimaryIngressAfterReceiptWait(ctx, 'provider submit receipt is still pending', ds, error);
             logger.warn(
               `[${tag(ds)}] Durable-primary turn ${parsed.messageId.slice(0, 12)} `
               + `will retry after provider submit receipt wait failed: `
@@ -28803,7 +28812,7 @@ async function handleThreadReplyAdmitted(
       } catch (error) {
         if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
         // Park on this replica (it holds the worker): the late receipt wakes it.
-        retryDurablePrimaryIngressAfterReceiptTimeout(ctx, 'provider submit receipt is still pending after worker refork', ds);
+        retryDurablePrimaryIngressAfterReceiptWait(ctx, 'provider submit receipt is still pending after worker refork', ds, error);
         logger.warn(
           `[${tag(ds)}] Durable-primary reforked turn ${parsed.messageId.slice(0, 12)} `
           + `will retry after provider submit receipt wait failed: `
