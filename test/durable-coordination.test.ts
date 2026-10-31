@@ -209,6 +209,8 @@ describe('SQLite durable coordination contract', () => {
     await put('topic-b-1', 'om_root_b');
     await put('group-command');
     await put('topic-c-1', 'om_root_c');
+    // Another replica without the chat mode cached writes the same event keyless.
+    expect(await put('topic-a-1')).toEqual({ kind: 'duplicate' });
 
     const a1 = await store.claimNextInbox({ workerId: 'w1', leaseDurationMs: 100 });
     expect(a1).toMatchObject({ event: { eventId: 'topic-a-1' } });
