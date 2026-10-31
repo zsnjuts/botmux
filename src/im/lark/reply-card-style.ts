@@ -413,6 +413,21 @@ export function buildReplyLayoutHeader(
   };
 }
 
+/** Header for a Remote Runner interim message (`botmux send` progress /
+ * auxiliary from a remote turn). Those sends cannot choose a `--layout`, so
+ * without a header they look exactly like the turn's final reply card; the
+ * header marks them as in-flight updates. The caller supplies the localized
+ * title so this module stays dictionary-free. */
+export function buildRemoteOutboundInterimHeader(
+  kind: 'progress' | 'auxiliary',
+  title: string,
+): ReplyCardHeader {
+  return {
+    template: kind === 'progress' ? 'blue' : 'grey',
+    title: { tag: 'plain_text', content: title },
+  };
+}
+
 /** Backward-compatible default-theme helper used by the first implementation
  * block and external callers that do not need per-bot configuration. */
 export function buildDefaultReplyLayoutHeader(

@@ -4,6 +4,7 @@ import {
   projectGroupContextCard,
 } from '../src/im/lark/group-context-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
+import { buildTurnTerminalFooterPatch } from '../src/im/lark/card-builder.js';
 import { buildCanonicalFinalReplyCard, buildImageCardElements } from '../src/im/lark/md-card.js';
 import { extractCardContent, extractResources } from '../src/im/lark/message-parser.js';
 import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
@@ -293,6 +294,16 @@ describe('group-context card projection', () => {
     const projected = conversation(JSON.stringify(final));
     expect(projected.text).toBe('LEGACY_FINAL');
     expect(projected.resources).toEqual([]);
+    expect(projected.turnReply).toBe(true);
+  });
+
+  it('keeps the legacy final boundary after the turn-end label is patched onto its footer', () => {
+    const final = JSON.parse(buildCanonicalFinalReplyCard({ markdown: 'LEGACY_FINAL' }));
+    final.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: '✅ **已完成**' });
+    const footer = final.body.elements.find((element: any) => element.element_id === 'botmux_reply_footer');
+    footer.content = buildTurnTerminalFooterPatch(JSON.stringify(final), 'completed', 'zh')!.content;
+    const projected = conversation(JSON.stringify(final));
+    expect(projected.text).toBe('LEGACY_FINAL');
     expect(projected.turnReply).toBe(true);
   });
 
