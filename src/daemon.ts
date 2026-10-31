@@ -23619,6 +23619,16 @@ function activeTurnInputCommitted(ds: DaemonSession, turnId: string): boolean {
     && receipt.workerGeneration === ds.session.workerGeneration;
 }
 
+/** Whether a local live Session already got this durable input to its worker. */
+function durablePrimaryInputReachedWorker(larkAppId: string, messageId: string): boolean {
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId === larkAppId && activeTurnInputCommitted(ds, messageId)) return true;
+  }
+  return false;
+}
+
+export const __testOnly_durablePrimaryInputReachedWorker = durablePrimaryInputReachedWorker;
+
 function durablePrimaryTurnDisposition(
   ds: DaemonSession,
   turnId: string,
@@ -32503,6 +32513,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   store: durableCoordinationRuntime.store,
                   message,
                   ownerId: `retry-notice:${getDaemonBootId()}`,
+                  inputReachedWorker: durablePrimaryInputReachedWorker(
+                    message.larkAppId,
+                    message.messageId,
+                  ),
                 });
               } catch (error) {
                 logger.warn(

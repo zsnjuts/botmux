@@ -7,6 +7,8 @@ import {
   durableInboxRetryNotice,
   enqueueDurableInboxExhaustedNotice,
   enqueueDurableInboxRetryNotice,
+  MESSAGE_DELIVERY_UNCONFIRMED_NOTICE_ZH,
+  MESSAGE_DROPPED_NOTICE_ZH,
   MESSAGE_QUOTA_INFRASTRUCTURE_RETRY,
   MESSAGE_QUOTA_RETRY_NOTICE_ZH,
 } from '../src/services/durable-inbox-retry-notice.js';
@@ -107,5 +109,16 @@ describe('durable Inbox retry notice', () => {
     });
     expect(durableInboxExhaustedNotice(claim('lark.im.message.updated_v1'))).toBeUndefined();
     store.close();
+  });
+
+  it('does not tell the user an executed message was not executed', () => {
+    // Mew #68：输入已经送进 worker 的消息，用尽时不能再提示「没有被执行」，否则用户会重发、重复执行。
+    const message = claim();
+    const dropped = durableInboxExhaustedNotice(message)!;
+    const delivered = durableInboxExhaustedNotice(message, { inputReachedWorker: true })!;
+    expect(dropped.content).toBe(MESSAGE_DROPPED_NOTICE_ZH);
+    expect(delivered.content).toBe(MESSAGE_DELIVERY_UNCONFIRMED_NOTICE_ZH);
+    // Same row, same Feishu UUID: a replica that disagrees cannot add a second notice.
+    expect(delivered.providerUuid).toBe(dropped.providerUuid);
   });
 });
