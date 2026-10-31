@@ -156,6 +156,24 @@ describe('durable Lark canonical dispatch', () => {
     await facade.stop();
   });
 
+  it('carries an early retry hint to the Inbox consumer and rejects invalid hints', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    let hint = 300;
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async () => ({ kind: 'retry', reason: 'owned by a live peer', retryAfterMs: hint }),
+    });
+
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .resolves.toEqual({ kind: 'retry', reason: 'owned by a live peer', retryAfterMs: 300 });
+    hint = Number.NaN;
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .rejects.toThrow('retryAfterMs');
+    await facade.stop();
+  });
+
   it('carries the retry wake key to the Inbox consumer', async () => {
     const { store } = fakeStore();
     const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });

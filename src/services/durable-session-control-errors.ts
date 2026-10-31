@@ -13,3 +13,10 @@ export class DurableSessionControlOwnerHandoffError extends Error {
 export class DurableSessionControlDeferredError extends Error {
   override name = 'DurableSessionControlDeferredError';
 }
+
+/** The canonical active Session can never be taken over by any replica (for
+ * example its Remote Runner never published a resumable remote session). A
+ * lifecycle control must settle it instead of retrying the takeover forever. */
+export class DurableActiveTakeoverUnsupportedError extends Error {
+  override name = 'DurableActiveTakeoverUnsupportedError';
+}

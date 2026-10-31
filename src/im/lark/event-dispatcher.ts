@@ -1094,6 +1094,18 @@ const GRANT_REPLAY_MARKER = '__botmuxGrantReplay';
 const GRANT_REPLAY_EVENT_TAG = 'botmux-grant-replay';
 /** 等待授权在领取副本上生效的最多领取次数（Inbox 默认每次间隔 5s）。 */
 const GRANT_REPLAY_MAX_ATTEMPTS = 6;
+/** 续轮落到非 owner 副本时的快速退回间隔（第 1、2 次领取），让 owner 尽快领到；
+ *  之后回到 Inbox 默认间隔，owner 长时间不领（宕机等租约过期）时不空转轮询。 */
+const PEER_OWNED_RETRY_DELAYS_MS = [300, 600] as const;
+
+function peerOwnedRetryDelayMs(attempts: number): number | undefined {
+  return Number.isSafeInteger(attempts) && attempts >= 1
+    ? PEER_OWNED_RETRY_DELAYS_MS[attempts - 1]
+    : undefined;
+}
+
+/** primary 编辑事件（非授权重放）最多领取几次：Inbox 默认每次间隔约 5 秒。 */
+const PRIMARY_EDIT_RETRY_LIMIT = 3;
 
 const PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS = new Set([
   'close',
@@ -2697,6 +2709,9 @@ export interface RoutingContext {
     /** Durable-primary only: the retry waits for this local condition (e.g. a
      * Session finishing its turn) and is redelivered as soon as it holds. */
     retryWakeKey?: string;
+    /** Durable-primary only: redeliver sooner than the Inbox default because
+     * another live replica (the Session owner) is expected to claim it. */
+    retryAfterMs?: number;
   };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
@@ -4596,6 +4611,12 @@ export interface LarkEventDispatcherRuntimeOptions {
    */
   readPrimarySession?: (sessionKey: string) => Promise<Session | undefined>;
   /**
+   * Primary-only：回读权威 Session 最近准入过的消息 id。本地 triggered 记录只覆盖
+   * 本副本派发过的消息；编辑事件（链接预览等也会触发）落到另一副本时，必须以这份
+   * 共享记录判重，否则会把早已派发的消息当成「补 @」重跑，并在整个群的分区里反复重试。
+   */
+  readPrimaryAdmittedMessageIds?: (sessionKey: string) => Promise<readonly string[] | undefined>;
+  /**
    * Primary-only failover seam. The callback must acquire a fresh canonical
    * Session owner epoch before it materializes the active runtime locally.
    * Returning without installing that exact Session keeps the route fenced.
@@ -4603,7 +4624,7 @@ export interface LarkEventDispatcherRuntimeOptions {
   takeOverPrimarySession?: (
     sessionKey: string,
     canonical: Session,
-  ) => Promise<Session | { kind: 'retry'; reason: string } | undefined>;
+  ) => Promise<Session | { kind: 'retry'; reason: string; ownedByPeer?: boolean } | undefined>;
   /** Test seam; production defaults to a 2s post-ready REST quiet period. */
   primaryRecoverySettleMs?: number;
 }
@@ -4734,7 +4755,19 @@ export function createLarkEventDispatcherRuntime(
     const retryReason = ctx.ingressAdmission?.retryReason?.trim();
     if (retryReason) {
       const wakeKey = ctx.ingressAdmission?.retryWakeKey;
-      return { kind: 'retry', reason: retryReason, ...(wakeKey ? { wakeKey } : {}) };
+      const retryAfterMs = ctx.ingressAdmission?.retryAfterMs;
+      // 重试本身不是错误，但没有这一行就无从判断一条消息为什么排了很久（Mew #93 / #49）。
+      logger.info(
+        `[durable-primary:${larkAppId}] inbox retry msg=${primary.message.messageId.substring(0, 16)} `
+        + `attempt=${primary.message.attempts} reason=${retryReason.substring(0, 120)}`
+        + `${wakeKey ? ' wake=session' : ''}${retryAfterMs !== undefined ? ` after=${retryAfterMs}ms` : ''}`,
+      );
+      return {
+        kind: 'retry',
+        reason: retryReason,
+        ...(wakeKey ? { wakeKey } : {}),
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      };
     }
     if (!ctx.ingressAdmission?.admitted) {
       return { kind: 'ignored', reason: 'canonical handler completed without task admission' };
@@ -4779,6 +4812,11 @@ export function createLarkEventDispatcherRuntime(
         ctx.ingressAdmission ??= { admitted: false };
         ctx.ingressAdmission.retryReason = takeover.reason;
         ctx.ingressAdmission.retryWakeKey = undefined;
+        // 另一个活着的副本持有这个会话：它自己会很快领到这条消息，没必要整整等一个
+        // Inbox 间隔。前两次快速退回，之后回到默认间隔。
+        ctx.ingressAdmission.retryAfterMs = takeover.ownedByPeer
+          ? peerOwnedRetryDelayMs(primary.message.attempts)
+          : undefined;
         return 'retry';
       }
       local = handlers.resolveDurableSession?.(ctx);
@@ -6003,6 +6041,29 @@ export function createLarkEventDispatcherRuntime(
    *
    * 语义因此是「一次延迟的首次 @」，而不是「编辑即重新执行」。
    */
+  /** 被编辑的消息是否已在它可能所属的权威 Session（话题根 / 所在话题 / 整群）里准入过。 */
+  async function primaryMessageAlreadyAdmitted(message: any): Promise<boolean> {
+    const read = runtimeOptions.readPrimaryAdmittedMessageIds;
+    const messageId = message?.message_id;
+    if (!read || typeof messageId !== 'string' || !messageId) return false;
+    const anchors = new Set<string>();
+    for (const anchor of [message.root_id, messageId, message.chat_id]) {
+      if (typeof anchor === 'string' && anchor) anchors.add(anchor);
+    }
+    for (const anchor of anchors) {
+      try {
+        const admitted = await read(sessionKey(anchor, larkAppId));
+        if (admitted?.includes(messageId)) return true;
+      } catch (error) {
+        logger.warn(
+          `[message-updated:${larkAppId}] 回读权威准入记录失败，按未准入处理 msg=${messageId.substring(0, 12)}: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return false;
+  }
+
   async function processMessageUpdatedEvent(
     rawData: any,
     primary?: PrimaryProcessContext,
@@ -6082,6 +6143,12 @@ export function createLarkEventDispatcherRuntime(
       // 已触发过任务（原消息本就 @、p2p、免@ 策略等）→ 不因编辑再触发一遍。
       if (isMessageTriggerClaimed(larkAppId, messageId)) {
         logger.info(`[message-updated:${larkAppId}] 消息已派发或正在排队，忽略编辑补 @ msg=${messageId.substring(0, 12)}`);
+        return;
+      }
+      // primary 多副本：原消息可能由另一副本派发，本副本的本地记录看不到，改看权威准入记录。
+      if (primary && await primaryMessageAlreadyAdmitted(data.message)) {
+        markMessageTriggered(larkAppId, messageId);
+        logger.info(`[message-updated:${larkAppId}] 消息已在权威会话中准入，忽略编辑补 @ msg=${messageId.substring(0, 12)}`);
         return;
       }
       // 正处在 never/ambient 的 topic 种子延迟队列里：它马上会以原快照派发，
@@ -6801,78 +6868,97 @@ export function createLarkEventDispatcherRuntime(
         throw new Error('durable primary message belongs to another Lark application');
       }
       const primary = { message, context };
-      const result = await serializeByAnchor(
-        message.partitionKey,
-        async () => {
-          if (message.eventType === 'lark.im.message.recalled_v1') {
-            const ev = (message.data as any)?.event ?? message.data as any;
-            const chatId = ev?.chat_id ?? ev?.message?.chat_id;
-            const messageId = ev?.message_id ?? ev?.message?.message_id;
-            const deletedAt = Math.trunc(Number(ev?.recall_time)) || Date.now();
-            if (typeof chatId !== 'string' || !chatId
-                || typeof messageId !== 'string' || !messageId) {
-              throw new Error('durable primary recall is missing chat/message identity');
-            }
-            if (isGroupContextEnabled(larkAppId, chatId)) {
-              if (!runtimeOptions.persistPrimaryGroupContextRecall) {
-                throw new Error('durable primary recall persistence is not configured');
+      // 编辑事件与新消息共用整个群的 FIFO 分区。它只是「延迟的首次 @」兜底，不值得为它
+      // 长时间占住分区：重试预算用完就放弃，避免同群所有新话题和续轮跟着排队。
+      const editRetryBudgetSpent = message.eventType === 'lark.im.message.updated_v1'
+        && !(message.data as any)?.[GRANT_REPLAY_MARKER]
+        && message.attempts >= PRIMARY_EDIT_RETRY_LIMIT;
+      const giveUpEdit = (reason: string): DurableLarkCanonicalHandlerResult => {
+        logger.warn(
+          `[message-updated:${larkAppId}] 编辑事件第 ${message.attempts} 次仍未完成，放弃以免阻塞同群消息 `
+          + `msg=${message.messageId.substring(0, 12)}: ${reason}`,
+        );
+        return { kind: 'ignored', reason: 'edited message retry budget exhausted' };
+      };
+      let result: DurableLarkCanonicalHandlerResult | void;
+      try {
+        result = await serializeByAnchor(
+          message.partitionKey,
+          async () => {
+            if (message.eventType === 'lark.im.message.recalled_v1') {
+              const ev = (message.data as any)?.event ?? message.data as any;
+              const chatId = ev?.chat_id ?? ev?.message?.chat_id;
+              const messageId = ev?.message_id ?? ev?.message?.message_id;
+              const deletedAt = Math.trunc(Number(ev?.recall_time)) || Date.now();
+              if (typeof chatId !== 'string' || !chatId
+                  || typeof messageId !== 'string' || !messageId) {
+                throw new Error('durable primary recall is missing chat/message identity');
               }
-              await runtimeOptions.persistPrimaryGroupContextRecall({
-                larkAppId,
-                chatId,
-                messageId,
-                deletedAt,
-              });
-              ingestGroupContextRecall(larkAppId, { chatId, messageId, recallTime: deletedAt });
+              if (isGroupContextEnabled(larkAppId, chatId)) {
+                if (!runtimeOptions.persistPrimaryGroupContextRecall) {
+                  throw new Error('durable primary recall persistence is not configured');
+                }
+                await runtimeOptions.persistPrimaryGroupContextRecall({
+                  larkAppId,
+                  chatId,
+                  messageId,
+                  deletedAt,
+                });
+                ingestGroupContextRecall(larkAppId, { chatId, messageId, recallTime: deletedAt });
+              }
+              return {
+                kind: 'ignored' as const,
+                reason: 'durable primary group-context recall committed',
+              };
             }
-            return {
-              kind: 'ignored' as const,
-              reason: 'durable primary group-context recall committed',
-            };
-          }
-          // The legacy path captures synchronously before SDK ACK. Primary has
-          // already persisted this exact event before ACK, so capture belongs
-          // inside the claimed partition lane. InputCaptureRuntime is
-          // message-id idempotent; a claim retry after an uncertain process
-          // outcome therefore cannot duplicate the accepted answer.
-          if (message.eventType === 'lark.im.message.receive_v1') {
-            try {
-              if (handlers.captureHumanInput?.(message.data)) {
+            // The legacy path captures synchronously before SDK ACK. Primary has
+            // already persisted this exact event before ACK, so capture belongs
+            // inside the claimed partition lane. InputCaptureRuntime is
+            // message-id idempotent; a claim retry after an uncertain process
+            // outcome therefore cannot duplicate the accepted answer.
+            if (message.eventType === 'lark.im.message.receive_v1') {
+              try {
+                if (handlers.captureHumanInput?.(message.data)) {
+                  markMessageTriggered(larkAppId, message.messageId);
+                  return Promise.resolve({
+                    kind: 'ignored' as const,
+                    reason: 'durable primary captured human input',
+                  });
+                }
+              } catch (error) {
+                if (!isInputCaptureTerminalRejection(error)) throw error;
                 markMessageTriggered(larkAppId, message.messageId);
                 return Promise.resolve({
                   kind: 'ignored' as const,
-                  reason: 'durable primary captured human input',
+                  reason: `durable primary input capture rejected: ${error.code}`,
                 });
               }
-            } catch (error) {
-              if (!isInputCaptureTerminalRejection(error)) throw error;
-              markMessageTriggered(larkAppId, message.messageId);
-              return Promise.resolve({
-                kind: 'ignored' as const,
-                reason: `durable primary input capture rejected: ${error.code}`,
-              });
             }
-          }
-          const rawMessage = (message.data as any)?.message ?? (message.data as any)?.event?.message;
-          const chatId = rawMessage?.chat_id;
-          if (rawMessage?.chat_type !== 'p2p'
-              && typeof chatId === 'string'
-              && chatId
-              && isGroupContextEnabled(larkAppId, chatId)
-              && runtimeOptions.readPrimaryGroupContextRecalls) {
-            const recalls = await runtimeOptions.readPrimaryGroupContextRecalls({ larkAppId, chatId });
-            for (const recall of recalls) ingestGroupContextRecall(larkAppId, { chatId, ...recall });
-          }
-          // 代答开关、花名册在 primary 下以共享记录为准，处理前同步到本副本的本地缓存。
-          if (rawMessage?.chat_type !== 'p2p' && typeof chatId === 'string' && chatId) {
-            await hydrateChatSessionlessState(larkAppId, chatId);
-          }
-          return message.eventType === 'lark.im.message.updated_v1'
-            ? processMessageUpdatedEvent(message.data, primary)
-            : processMessageEvent(message.data, undefined, primary);
-        },
-        0,
-      );
+            const rawMessage = (message.data as any)?.message ?? (message.data as any)?.event?.message;
+            const chatId = rawMessage?.chat_id;
+            if (rawMessage?.chat_type !== 'p2p'
+                && typeof chatId === 'string'
+                && chatId
+                && isGroupContextEnabled(larkAppId, chatId)
+                && runtimeOptions.readPrimaryGroupContextRecalls) {
+              const recalls = await runtimeOptions.readPrimaryGroupContextRecalls({ larkAppId, chatId });
+              for (const recall of recalls) ingestGroupContextRecall(larkAppId, { chatId, ...recall });
+            }
+            // 代答开关、花名册在 primary 下以共享记录为准，处理前同步到本副本的本地缓存。
+            if (rawMessage?.chat_type !== 'p2p' && typeof chatId === 'string' && chatId) {
+              await hydrateChatSessionlessState(larkAppId, chatId);
+            }
+            return message.eventType === 'lark.im.message.updated_v1'
+              ? processMessageUpdatedEvent(message.data, primary)
+              : processMessageEvent(message.data, undefined, primary);
+          },
+          0,
+        );
+      } catch (error) {
+        if (!editRetryBudgetSpent) throw error;
+        return giveUpEdit(error instanceof Error ? error.message : String(error));
+      }
+      if (editRetryBudgetSpent && result?.kind === 'retry') return giveUpEdit(result.reason);
       return result ?? { kind: 'ignored', reason: 'message was filtered before canonical admission' };
     },
   };

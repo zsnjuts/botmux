@@ -142,6 +142,7 @@ import {
   listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
+import { DurableActiveTakeoverUnsupportedError } from './services/durable-session-control-errors.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import {
   startDurableRemoteOrphanReconciler,
@@ -23699,6 +23700,7 @@ function retryDurablePrimaryIngress(
   ctx.ingressAdmission ??= { admitted: false };
   ctx.ingressAdmission.retryReason = reason;
   ctx.ingressAdmission.retryWakeKey = waitFor ? durablePrimaryRetryWakeKey(waitFor) : undefined;
+  ctx.ingressAdmission.retryAfterMs = undefined;
   return true;
 }
 
@@ -32166,7 +32168,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ): Promise<{
           session: Session;
           owner: DaemonSession;
-        } | { kind: 'retry'; reason: string } | undefined> => {
+        } | { kind: 'retry'; reason: string; ownedByPeer?: boolean } | undefined> => {
           if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
           try {
             const claimed = await claimDurableLarkActiveSession({
@@ -32181,6 +32183,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 reason: claimed.kind === 'occupied'
                   ? `active Session lease is still owned by ${claimed.ownerId}`
                   : `active Session takeover is not ready: ${claimed.kind}`,
+                ...(claimed.kind === 'occupied' ? { ownedByPeer: true } : {}),
               };
             }
             const local = activeSessions.get(stableKey);
@@ -32195,10 +32198,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               options,
             );
             if (!takeover.ok) {
-              throw new Error(
-                `durable active takeover failed: ${takeover.error}`
-                + (takeover.detail ? ` (${takeover.detail})` : ''),
-              );
+              const message = `durable active takeover failed: ${takeover.error}`
+                + (takeover.detail ? ` (${takeover.detail})` : '');
+              throw takeover.error === 'unsupported_session'
+                ? new DurableActiveTakeoverUnsupportedError(message)
+                : new Error(message);
             }
             return { session: takeover.ds.session, owner: takeover.ds };
           } catch (error) {
@@ -32245,6 +32249,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             readPrimarySession: async stableKey => {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
+            },
+            readPrimaryAdmittedMessageIds: async stableKey => {
+              const current = await durableCoordinationRuntime.store.readSession(stableKey);
+              return current
+                ? parseDurablePrimarySessionRecord(current).admissions.map(entry => entry.messageId)
+                : undefined;
             },
             takeOverPrimarySession: async (stableKey, canonical) => {
               const result = await takeOverPrimarySession(stableKey, canonical);

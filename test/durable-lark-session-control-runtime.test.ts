@@ -20,7 +20,10 @@ import {
 } from '../src/services/durable-lark-session-control.js';
 import { createDurableLarkSessionControlRuntime } from '../src/services/durable-lark-session-control-runtime.js';
 import { DURABLE_REMOTE_ORPHAN_RESCAN_EPOCH_MS } from '../src/services/durable-remote-orphan-reconciler.js';
-import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
+import {
+  DurableActiveTakeoverUnsupportedError,
+  DurableSessionControlOwnerHandoffError,
+} from '../src/services/durable-session-control-errors.js';
 import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
 import { admitDurableLarkSession, parseDurablePrimarySessionRecord } from '../src/services/durable-session-primary.js';
 import { parseDurableLarkOutboxRecord } from '../src/services/durable-lark-outbox.js';
@@ -276,6 +279,81 @@ describe('durable Lark session control runtime', () => {
       closedAt: new Date(20).toISOString(),
     }));
     expect(closeSession).not.toHaveBeenCalled();
+    expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
+      .toMatchObject({
+        session: { status: 'closed' },
+        controls: [{ source: 'trusted-host', action: 'close' }],
+      });
+    await facade.stop();
+  });
+
+  it('settles close when no replica can ever take the remote Session over (Mew #23)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-unsupported-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    // generation 1 without a remote session id: the start was attempted but the
+    // sandbox was full, so nothing resumable was ever published.
+    const canonical = session({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'tae-traex',
+        generation: 1,
+        providerState: { sessionKey: 'bmx1-capacity-full' },
+      },
+    });
+    let persisted: Session | undefined;
+    await admitDurableLarkSession({ facade, message: message(), session: canonical });
+    const materializeClosedSession = vi.fn((value: Session) => {
+      persisted = structuredClone(value);
+      return persisted;
+    });
+    const takeOverActiveSession = vi.fn(async () => {
+      throw new DurableActiveTakeoverUnsupportedError(
+        'durable active takeover failed: unsupported_session '
+        + '(canonical Session has no resumable Remote Runner state)',
+      );
+    });
+    const closeSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: () => persisted,
+      materializeClosedSession,
+      takeOverActiveSession,
+      canOperate: () => false,
+      closeSession,
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: error => error,
+      now: () => 20,
+    });
+    const input = directControl('trusted-host');
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(takeOverActiveSession).toHaveBeenCalledOnce();
+    expect(materializeClosedSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1',
+      status: 'closed',
+      closedAt: new Date(20).toISOString(),
+    }));
     expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
       .toMatchObject({
         session: { status: 'closed' },
