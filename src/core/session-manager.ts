@@ -4965,11 +4965,18 @@ export async function executeScheduledTask(
             // this is the steady-state path for a recurring task (first fire
             // creates the session, every later fire injects into it), so the
             // failure shape would be "worked once, silently identity-less after".
+            // Queue behind any active turn like `/queue` (Mew #39): a scheduled
+            // fire is never a steer of the conversation in flight, and a
+            // back-to-back submit into a serial backend (Remote Runner) is
+            // rejected without a terminal, leaving the run `running` forever.
             if (sendWorkerInput(
               existing,
               input,
               scheduledTurnId,
-              scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
+              {
+                queueAfterActiveTurn: true,
+                ...(scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {}),
+              },
             )) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
               return;
