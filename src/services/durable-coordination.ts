@@ -222,7 +222,12 @@ export interface ReserveAmbiguousOutboxInput {
   minAmbiguousAgeMs: number;
 }
 
-export interface AbandonOutboxReservationInput {
+export interface RequeueAmbiguousOutboxInput {
+  reservation: OutboxReservation;
+  error: string;
+}
+
+export interface AbandonAmbiguousOutboxInput {
   reservation: OutboxReservation;
   receipt: DurableJson;
   error: string;
@@ -406,13 +411,15 @@ export interface DurableOutboxStore {
   /** 只有当前 attempting attempt 可以进入 ambiguous。 */
   markOutboxAmbiguous(input: MarkOutboxAmbiguousInput): Promise<OutboxMutationResult>;
   /**
-   * 重新领取最早的、位于本 Session 队首的 ambiguous 行（Mew #35）。只有调用方能证明目标端
-   * 幂等（同一 provider UUID 仍在去重窗口内，或 PATCH 本身幂等）时才可以再投；否则必须用
-   * abandonOutboxReservation 收尾。可选以兼容旧 provider。
+   * 原地认领最早的、位于本 Session 队首且已过 minAmbiguousAgeMs 的 ambiguous 行（Mew #35）。
+   * 行保持 ambiguous，只写认领字段：认领者在作出决定前崩溃时，行在认领到期后仍是 ambiguous，
+   * 普通 FIFO 不会把它当 pending 盲目重投。可选以兼容旧 provider。
    */
   reserveAmbiguousOutbox?(input: ReserveAmbiguousOutboxInput): Promise<OutboxReservation | undefined>;
-  /** 把一个无法安全再投的 reserved 行以带 abandoned receipt 的 delivered 终态收尾，放行后续行。 */
-  abandonOutboxReservation?(input: AbandonOutboxReservationInput): Promise<OutboxMutationResult>;
+  /** 调用方能证明目标端幂等（同一 provider UUID 仍在去重窗口内，或 PATCH 本身幂等）时，把认领的行放回 pending 再投。 */
+  requeueAmbiguousOutbox?(input: RequeueAmbiguousOutboxInput): Promise<OutboxMutationResult>;
+  /** 无法安全再投时，把认领的行以带 abandoned receipt 的 delivered 终态收尾，放行后续行。 */
+  abandonAmbiguousOutbox?(input: AbandonAmbiguousOutboxInput): Promise<OutboxMutationResult>;
   readOutbox(messageId: string): Promise<DurableOutboxRecord | undefined>;
 }
 
