@@ -4466,7 +4466,9 @@ export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard
 export function resolveReplyFooterPreferences(larkAppId: string): ReplyFooterPreferences {
   const registered = bots.get(larkAppId);
   if (registered) return normalizeReplyFooter(registered.config);
-  const path = loadedConfigPath ?? botsConfigDiskPath();
+  const snapshot = processBotConfigReadSnapshot?.().find(config => config.larkAppId === larkAppId);
+  if (snapshot) return normalizeReplyFooter(snapshot);
+  const path = processBotConfigReadSnapshot ? undefined : loadedConfigPath ?? botsConfigDiskPath();
   if (path) {
     try {
       const entries = JSON.parse(readFileSync(path, 'utf-8'));

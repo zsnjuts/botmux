@@ -1,4 +1,4 @@
-import { type ChildProcess } from 'node:child_process';
+import { execFileSync, type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -817,6 +817,104 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       },
       larkAppId: 'app_liveness',
       larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    await waitFor(
+      () => messages.some(message => message.type === 'ready'),
+      () => `worker did not become ready\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+
+    child.send({ type: 'liveness_ping' } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'liveness_pong'),
+      () => `worker did not answer the liveness ping\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+  });
+
+  it('serves config from the daemon seed while the shared bots.json open hangs', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-config-seed-'));
+    tempDirs.push(root);
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const state = { version: 1, provider: 'liveness-provider', generation: 1, remoteSessionId: 'remote-liveness-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  if (command.type === 'hello') {
+    emit({ type: 'hello', requestId: command.requestId, provider: 'liveness-provider', capabilities: ['start','resume','turn','cancel','detach','reattach','status'] });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  } else if (command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const botConfig = {
+      larkAppId: 'app_liveness',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: { expectedProvider: 'liveness-provider' },
+    };
+    // A FIFO with no writer blocks open(2) the way a hung hard-mounted NFS
+    // open does (Mew #28): a synchronous read here would freeze the worker.
+    const botsPath = join(root, 'bots.json');
+    execFileSync('mkfifo', [botsPath]);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: join(root, 'data'),
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-config-seed',
+        LARK_APP_ID: 'app_liveness',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-config-seed',
+      chatId: 'oc_config_seed',
+      rootMessageId: 'om_config_seed',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'liveness-provider' },
+      prompt: 'stay busy',
+      turnId: 'turn-config-seed',
+      trustedCaller: {
+        requestUserOpenId: 'ou_remote_user',
+        requestLarkAppId: 'app_liveness',
+        senderType: 'user',
+      },
+      larkAppId: 'app_liveness',
+      larkAppSecret: 'secret',
+      loadedBotsConfigPath: botsPath,
+      loadedBotsConfigProvenance: 'loaded',
+      botConfigSnapshot: [botConfig] as never,
+      globalConfigSnapshot: {},
     } satisfies DaemonToWorker);
     await waitFor(
       () => messages.some(message => message.type === 'ready'),

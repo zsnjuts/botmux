@@ -78,6 +78,25 @@ describe('reply footer preference persistence', () => {
     expect(readConfig().replyFooterModel).toBe(false);
   });
 
+  it('reads an installed config snapshot instead of opening bots.json', async () => {
+    // Mew #28: a worker serving config from a snapshot must not touch the
+    // shared bots.json on its main loop; here the file holds the opposite value.
+    writeConfig({ replyFooterEnabled: true });
+    const { registry } = await freshModules();
+    const uninstall = registry.installBotConfigReadSnapshot(() => [{
+      larkAppId: 'app_default',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      replyFooterEnabled: false,
+    } as never]);
+    try {
+      expect(registry.resolveReplyFooterPreferences('app_default')).toMatchObject({ replyFooterEnabled: false });
+      expect(registry.resolveReplyFooterPreferences('app_missing')).toEqual({});
+    } finally {
+      uninstall();
+    }
+  });
+
   it('uses own-bot env only when config is unavailable and ignores other bot identities', async () => {
     const { registry } = await freshModules();
     process.env.BOTMUX_LARK_APP_ID = 'own-app';

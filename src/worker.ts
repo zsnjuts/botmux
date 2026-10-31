@@ -249,6 +249,8 @@ import {
   serializePluginCardActionCapabilitiesSnapshot,
 } from './core/plugins/card-actions/capabilities.js';
 import {
+  adoptBotConfigSnapshotSource,
+  installBotConfigReadSnapshot,
   loadBotConfigs,
   resolveBrandLabel,
   resolveUsageDisplay,
@@ -256,11 +258,14 @@ import {
   type BotConfig,
 } from './bot-registry.js';
 import {
+  globalConfigPath,
+  installGlobalConfigReadSnapshot,
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
   isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
 } from './global-config.js';
+import { DashboardConfigSnapshotStore } from './dashboard/config-snapshot.js';
 import {
   stopSessionScope,
   sessionScopePayloadPid,
@@ -2742,6 +2747,30 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+
+/** Mew #28: a synchronous open of the shared (hard-mounted NFS) config store
+ * once parked this main loop in D state for 74 minutes, silencing the turn.
+ * A Remote Runner worker serves config reads from the daemon's seed and
+ * refreshes it with bounded async reads, keeping the last good copy. */
+let workerConfigSnapshots: DashboardConfigSnapshotStore | undefined;
+
+function installWorkerConfigSnapshots(init: Extract<DaemonToWorker, { type: 'init' }>): void {
+  if (workerConfigSnapshots || !init.botConfigSnapshot) return;
+  const botsPath = init.loadedBotsConfigProvenance === 'loaded' ? init.loadedBotsConfigPath : undefined;
+  const store = new DashboardConfigSnapshotStore({
+    botsPath: botsPath ?? '',
+    globalPath: globalConfigPath(),
+    initialBots: init.botConfigSnapshot,
+    ...(init.globalConfigSnapshot ? { initialGlobal: init.globalConfigSnapshot } : {}),
+    botsFileEnabled: !!botsPath,
+    ...(botsPath ? { onBotsSnapshotReady: adoptBotConfigSnapshotSource } : {}),
+    log: { warn: (message: string) => log(message) },
+  });
+  installBotConfigReadSnapshot(store.readBots);
+  installGlobalConfigReadSnapshot({ read: store.readGlobal, refresh: () => { void store.refreshGlobal(); } });
+  store.start();
+  workerConfigSnapshots = store;
+}
 
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
  *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
@@ -26748,6 +26777,7 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      installWorkerConfigSnapshots(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
         // Per-bot liveness window override (#1162). The value is normalized at
         // the registry layer, so retimeout's positive-finite guard is purely

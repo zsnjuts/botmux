@@ -15009,6 +15009,15 @@ export function forkWorker(
     // not guess this from the filesystem — existence and provenance are
     // independent facts (see core/config-dir.ts BotsConfigProvenance).
     loadedBotsConfigProvenance: getLoadedConfigProvenance(),
+    // A Remote Runner worker serves config reads from this seed and refreshes
+    // it off its main loop, so a hung shared-storage open cannot freeze the
+    // turn it is driving (Mew #28).
+    ...(isRemoteBackendType(resolvedBackendType)
+      ? {
+        botConfigSnapshot: getAllBots().map(bot => bot.config),
+        globalConfigSnapshot: readGlobalConfig(),
+      }
+      : {}),
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
