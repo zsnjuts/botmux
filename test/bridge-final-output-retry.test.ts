@@ -844,6 +844,28 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       ]);
     });
 
+    it('does not answer a worker that exited before delivery settled', async () => {
+      // 孤儿核查用的 worker 交出结论后马上退出；Bun 对已退出子进程的 send 会异步
+      // 触发 'error'，被 fork 错误处理当成启动失败发卡片。
+      initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { setDurableBridgeFinalOutputHandler } = await import('../src/core/worker-pool.js');
+      let settle!: (value: { kind: 'delivered'; messageId: string }) => void;
+      setDurableBridgeFinalOutputHandler(vi.fn(() => new Promise<{ kind: 'delivered'; messageId: string }>(resolve => { settle = resolve; })));
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      (ds.worker as any).emit('message', {
+        type: 'final_output', sessionId: ds.session.sessionId, turnId: 'om_turn_final',
+        content: '排查结论', lastUuid: 'om_turn_final', persistAckRequestId: 'final-persist:3',
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+      await vi.advanceTimersByTimeAsync(10);
+      (ds.worker as any).connected = false;
+      (ds.worker as any).exitCode = 0;
+      settle({ kind: 'delivered', messageId: 'om_durable' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(persisted(ds.worker as any)).toEqual([]);
+    });
+
     it('keeps the provider copy when the final belongs to another session', async () => {
       initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = makeDs();

@@ -20318,6 +20318,12 @@ function finalOutputPersistAck(
   return ok => {
     if (answered) return;
     answered = true;
+    // The worker may be gone by the time delivery settles (e.g. an
+    // orphan-proof worker retired right after handing the final off). Bun
+    // reports a send to an exited child as an asynchronous 'error' event,
+    // which the fork error handler would surface as a startup failure, so
+    // never send then: the provider keeps its copy for the next attach.
+    if (worker.killed || worker.connected === false || typeof worker.exitCode === 'number') return;
     try {
       worker.send({ type: 'final_output_persisted', requestId, ok } as DaemonToWorker);
     } catch { /* the provider keeps its copy for the next attach */ }
