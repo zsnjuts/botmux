@@ -6899,9 +6899,15 @@ export function createLarkEventDispatcherRuntime(
         return { kind: 'ignored', reason: 'edited message retry budget exhausted' };
       };
       let result: DurableLarkCanonicalHandlerResult | void;
+      // Inbox 领取已保证：无排序键的行是整个分区的屏障，同键的行按序领取（Mew #100）。
+      // 进程内只需在同一排序键内串行；按整群串行会让同副本上不同话题的续轮
+      // 依次等前一条的提交回执，排序键在领取上省下的等待又被这里吃掉。
+      const serialKey = message.orderingKey
+        ? `${message.partitionKey}\u0000${message.orderingKey}`
+        : message.partitionKey;
       try {
         result = await serializeByAnchor(
-          message.partitionKey,
+          serialKey,
           async () => {
             if (message.eventType === 'lark.im.message.recalled_v1') {
               const ev = (message.data as any)?.event ?? message.data as any;

@@ -80,7 +80,7 @@ describe('durable inbox ordering key (Mew #100)', () => {
     });
     expect((keyed.payload as Record<string, unknown>).orderingKey).toBe('om_root');
     const claim = { event: keyed, workerId: 'w', claimEpoch: 1, claimUntil: 10, attempts: 1 };
-    expect(parseDurableLarkMessageClaim(claim)).toMatchObject({ messageId: 'om_reply', data });
+    expect(parseDurableLarkMessageClaim(claim)).toMatchObject({ messageId: 'om_reply', data, orderingKey: 'om_root' });
     const keyless = durableLarkMessageEvent({
       larkAppId: 'cli_test',
       eventId: 'im.message.receive_v1:cli_test:om_reply',
@@ -89,5 +89,6 @@ describe('durable inbox ordering key (Mew #100)', () => {
       now: 5,
     });
     expect(keyless.payload).not.toHaveProperty('orderingKey');
+    expect(parseDurableLarkMessageClaim({ ...claim, event: keyless })).not.toHaveProperty('orderingKey');
   });
 });

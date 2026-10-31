@@ -1236,6 +1236,72 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('runs rows of different topics side by side while one waits, and keeps one topic in order (Mew #100)', async () => {
+    // Inbox 领取已按排序键放行不同话题；进程内若仍按整群串行，同副本上的续轮
+    // 还是要依次等前一条的提交回执。
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    let releaseTopicA!: () => void;
+    const topicAGate = new Promise<void>(resolve => { releaseTopicA = resolve; });
+    const started: string[] = [];
+    handlers.handleNewTopic.mockImplementation(async (data: any, ctx: any) => {
+      const messageId = data.message.message_id;
+      started.push(messageId);
+      if (messageId === 'om_topic_a') await topicAGate;
+      ctx.ingressAdmission = { admitted: true };
+    });
+    handlers.resolveDurableSession = vi.fn((ctx: any) => ({
+      sessionId: `session-${ctx.anchor}`, chatId: 'chat-primary', rootMessageId: ctx.anchor,
+      scope: 'thread', title: 'Topic', status: 'active',
+      createdAt: '2026-10-31T00:00:00.000Z', larkAppId: MY_APP_ID,
+    }));
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const process = (messageId: string, orderingKey: string) => {
+      const eventId = `im.message.receive_v1:${MY_APP_ID}:${messageId}`;
+      const partitionKey = `lark-message-routing:${MY_APP_ID}:chat-primary`;
+      return runtime.processDurableMessage({
+        eventType: 'lark.im.message.receive_v1',
+        eventId,
+        partitionKey,
+        larkAppId: MY_APP_ID,
+        messageId,
+        attempts: 1,
+        orderingKey,
+        data: makeUserMessageEvent({
+          senderOpenId: USER_OPEN_ID,
+          content: JSON.stringify({ text: '@BotA hello' }),
+          messageId,
+          chatId: 'chat-primary',
+          chatType: 'group',
+          mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+        }),
+      }, {
+        claim: {
+          event: { eventId, partitionKey, payload: {}, visibleAt: 1, createdAt: 1 },
+          workerId: 'primary-worker', claimEpoch: 1, claimUntil: 60_000, attempts: 1,
+        },
+        signal: new AbortController().signal,
+        queuePostAdmissionOutput: () => undefined,
+        queuePostAdmissionControl: () => undefined,
+      });
+    };
+
+    const topicA = process('om_topic_a', 'om_topic_a');
+    await vi.waitFor(() => expect(started).toEqual(['om_topic_a']));
+    await process('om_topic_b', 'om_topic_b');
+    expect(started).toEqual(['om_topic_a', 'om_topic_b']);
+
+    const sameTopic = process('om_topic_a_again', 'om_topic_a');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(started).toEqual(['om_topic_a', 'om_topic_b']);
+    releaseTopicA();
+    await topicA;
+    await sameTopic;
+    expect(started).toEqual(['om_topic_a', 'om_topic_b', 'om_topic_a_again']);
+    runtime.close();
+  });
+
   it.each([true, false])(
     'does not trust a replica-local solo-group cache for primary routing (ownsSession=%s)',
     async ownsSession => {
