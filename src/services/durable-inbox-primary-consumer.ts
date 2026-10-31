@@ -117,6 +117,13 @@ interface ParkedRetry {
 /** Slack between a parked retry's deadline and its shortened claim lease, so a
  * slightly late hand-back still owns the claim. */
 const PARKED_RETRY_LEASE_SLACK_MS = 2_000;
+/** Rows still claimable after this many claims are completed even when no
+ * process saw `maxAttempts` failures in a row, e.g. after repeated restarts.
+ * Waiting retries never get near it: 1024 claims at the 5 s retry delay is
+ * well over an hour of one turn. */
+const ATTEMPT_CEILING_PER_MAX_ATTEMPT = 64;
+/** Bound for the per-event failure streaks this process remembers. */
+const FAILURE_STREAK_LIMIT = 4_096;
 /** Floor for a dispatch-provided early retry hint, so a hint cannot spin the queue. */
 const MIN_RETRY_HINT_MS = 100;
 /** Margin past the peer's next poll before this consumer claims again. Without
@@ -200,6 +207,12 @@ export function startDurableInboxPrimaryConsumer(
   const canParkRetries = parkedLeaseMs <= leaseDurationMs;
   let stopped = false;
   let claimsYieldUntil = 0;
+  // Consecutive dispatch failures per event on this process. `claim.attempts`
+  // also counts every explicit retry (busy Session, peer owner, pending
+  // receipt), so a message that waited behind a long turn reached the limit
+  // and one transient error then dropped it (Mew #68). Only failures in a row
+  // spend the budget; any explicit result resets it.
+  const failureStreaks = new Map<string, number>();
   let timer: NodeJS.Timeout | undefined;
   let stopPromise: Promise<DurableInboxPrimaryStopResult> | undefined;
   const reportError = (error: unknown): void => {
@@ -248,6 +261,7 @@ export function startDurableInboxPrimaryConsumer(
       clearInterval(renewalTimer);
       if (renewing) await renewing;
       if (ownershipLost || controller.signal.aborted) return;
+      failureStreaks.delete(claim.event.eventId);
       if (result.kind !== 'committed' && result.kind !== 'ignored' && result.kind !== 'retry') {
         throw new Error('durable inbox primary dispatch returned an invalid receipt');
       }
@@ -321,7 +335,16 @@ export function startDurableInboxPrimaryConsumer(
       if (renewing) await renewing;
       if (ownershipLost || controller.signal.aborted) return;
       reportError(error);
-      if (claim.attempts >= maxAttempts) {
+      const eventId = claim.event.eventId;
+      const failures = (failureStreaks.get(eventId) ?? 0) + 1;
+      failureStreaks.delete(eventId);
+      failureStreaks.set(eventId, failures);
+      if (failureStreaks.size > FAILURE_STREAK_LIMIT) {
+        failureStreaks.delete(failureStreaks.keys().next().value!);
+      }
+      if (failures >= maxAttempts
+          || claim.attempts >= maxAttempts * ATTEMPT_CEILING_PER_MAX_ATTEMPT) {
+        failureStreaks.delete(eventId);
         const completed = await options.store.completeInboxClaim(claim);
         if (completed.kind === 'stale') {
           reportError(new Error(`durable inbox primary retry limit lost claim ${claim.event.eventId}`));

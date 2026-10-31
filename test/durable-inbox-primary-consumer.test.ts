@@ -401,12 +401,104 @@ describe('durable inbox primary consumer', () => {
     await store.close();
   });
 
+  it('does not let explicit retries spend the failure budget', async () => {
+    // Mew #68：排在长轮次后面等了很久（每 5 秒一次显式重试），领取次数早已超过
+    // 上限；之后一次瞬时错误不能直接把它当成「重试用尽」丢掉。
+    const completed: InboxClaim[] = [];
+    const dropped: string[] = [];
+    let call = 0;
+    const store = inboxStore({
+      claims: [
+        { ...claim('om_waited'), attempts: 40 },
+        { ...claim('om_waited'), attempts: 41 },
+        { ...claim('om_waited'), attempts: 42 },
+      ],
+      completed,
+      retried: [],
+    });
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      dispatch: async message => {
+        call += 1;
+        if (call === 1) return { kind: 'retry', reason: 'session has an unfinished turn' };
+        if (call === 2) throw new Error('PostgreSQL coordination request failed');
+        return committed(message);
+      },
+      onExhausted: ({ message }) => { dropped.push(message.messageId); },
+    });
+    await consumer.ready;
+
+    expect(dropped).toEqual([]);
+    expect(completed.map(item => item.attempts)).toEqual([42]);
+    await consumer.stop();
+  });
+
+  it('restarts the failure streak after an explicit retry', async () => {
+    const dropped: string[] = [];
+    const outcomes = ['fail', 'fail', 'retry', 'fail', 'fail', 'commit'];
+    const store = inboxStore({
+      claims: outcomes.map((_, index) => ({ ...claim('om_flaky'), attempts: index + 1 })),
+      completed: [],
+      retried: [],
+    });
+    let call = 0;
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      dispatch: async message => {
+        const outcome = outcomes[call++];
+        if (outcome === 'fail') throw new Error('provider unavailable');
+        if (outcome === 'retry') return { kind: 'retry', reason: 'session has an unfinished turn' };
+        return committed(message);
+      },
+      onExhausted: ({ message }) => { dropped.push(message.messageId); },
+    });
+    await consumer.ready;
+
+    expect(dropped).toEqual([]);
+    expect(call).toBe(outcomes.length);
+    await consumer.stop();
+  });
+
+  it('settles a failing row that crossed the absolute claim ceiling', async () => {
+    const dropped: Array<[string, number]> = [];
+    const store = inboxStore({
+      claims: [{ ...claim('om_ceiling'), attempts: 3 * 64 }],
+      completed: [],
+      retried: [],
+    });
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      dispatch: async () => { throw new Error('provider unavailable'); },
+      onExhausted: ({ message, attempts }) => { dropped.push([message.messageId, attempts]); },
+    });
+    await consumer.ready;
+
+    expect(dropped).toEqual([['om_ceiling', 192]]);
+    await consumer.stop();
+  });
+
   it('settles an exhausted failure and continues with the next row', async () => {
     const completed: InboxClaim[] = [];
     const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
-    const exhausted = { ...claim('om_exhausted'), attempts: 3 };
     const store = inboxStore({
-      claims: [exhausted, claim('om_after_exhausted')],
+      claims: [
+        { ...claim('om_exhausted'), attempts: 1 },
+        { ...claim('om_exhausted'), attempts: 2 },
+        { ...claim('om_exhausted'), attempts: 3 },
+        claim('om_after_exhausted'),
+      ],
       completed,
       retried,
     });
@@ -434,7 +526,7 @@ describe('durable inbox primary consumer', () => {
       'im.message.receive_v1:cli_test:om_exhausted',
       'im.message.receive_v1:cli_test:om_after_exhausted',
     ]);
-    expect(retried).toHaveLength(0);
+    expect(retried).toHaveLength(2);
     expect(commits[0]).toEqual({
       kind: 'ignored',
       reason: 'durable primary retry limit reached',

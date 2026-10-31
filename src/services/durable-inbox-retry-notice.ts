@@ -36,15 +36,24 @@ export function durableInboxRetryNotice(
 export const MESSAGE_DROPPED_NOTICE_ZH =
   '⚠️ 这条消息多次处理失败，已停止重试，没有被执行。请稍后重新发送。';
 
-/** The notice for a message row that was completed at the retry limit. */
+export const MESSAGE_DELIVERY_UNCONFIRMED_NOTICE_ZH =
+  '⚠️ 这条消息已经交给 Agent 执行，但之后的确认多次失败，已停止重试，结论可能没有发到话题里。'
+  + '请勿重复发送；可以打开 Web 终端查看本轮输出，或稍后在话题里追问结论。';
+
+/** The notice for a message row that was completed at the retry limit. A row
+ * whose input already reached the worker was executed: telling the user it
+ * was not would invite a duplicate run (Mew #68). */
 export function durableInboxExhaustedNotice(
   message: DurableLarkMessageClaim,
+  opts: { inputReachedWorker?: boolean } = {},
 ): DurableInboxRetryNotice | undefined {
   if (message.eventType !== 'lark.im.message.receive_v1') return undefined;
   const digest = createHash('sha256').update(message.eventId).digest('hex');
   return {
     anchor: message.messageId,
-    content: MESSAGE_DROPPED_NOTICE_ZH,
+    content: opts.inputReachedWorker
+      ? MESSAGE_DELIVERY_UNCONFIRMED_NOTICE_ZH
+      : MESSAGE_DROPPED_NOTICE_ZH,
     providerUuid: `drop_${digest.slice(0, 40)}`,
   };
 }
@@ -66,11 +75,14 @@ export async function enqueueDurableInboxExhaustedNotice(input: {
   store: DurableCoordinationStore;
   message: DurableLarkMessageClaim;
   ownerId: string;
+  inputReachedWorker?: boolean;
   now?: number;
 }): Promise<'ignored' | 'busy' | 'accepted'> {
   return enqueueDurableInboxNotice({
     ...input,
-    notice: durableInboxExhaustedNotice(input.message),
+    notice: durableInboxExhaustedNotice(input.message, {
+      inputReachedWorker: input.inputReachedWorker,
+    }),
   });
 }
 
