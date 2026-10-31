@@ -224,6 +224,66 @@ describe('durable inbox primary consumer', () => {
     }
   });
 
+  it('stops claiming after a peer-owned retry until the peer has polled once', async () => {
+    // Mew #93：两个副本都按固定周期轮询，非 owner 放回后若立刻接着领，
+    // 常常又是它先看到同一条，续轮在两个副本之间空转。
+    let now = 9_000;
+    const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+    const store = inboxStore({ claims: [claim('om_peer_owned'), claim('om_other')], retried });
+    const dispatched: string[] = [];
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 500,
+      retryDelayMs: 5_000,
+      now: () => now,
+      dispatch: async message => {
+        dispatched.push(message.messageId);
+        return message.messageId === 'om_peer_owned'
+          ? { kind: 'retry', reason: 'active Session lease is still owned by replica-a', retryAfterMs: 300 }
+          : committed(message);
+      },
+    });
+    await consumer.ready;
+    expect(retried).toHaveLength(1);
+    expect(retried[0].visibleAt).toBe(9_300);
+    expect(dispatched).toEqual(['om_peer_owned']);
+
+    // Visible again at 9 300; the owner polls within one interval after that.
+    now = 9_999;
+    consumer.wake();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(dispatched).toEqual(['om_peer_owned']);
+
+    now = 10_000;
+    consumer.wake();
+    await vi.waitFor(() => expect(dispatched).toEqual(['om_peer_owned', 'om_other']));
+    await consumer.stop();
+  });
+
+  it('keeps claiming after an ordinary retry without a peer hint', async () => {
+    const store = inboxStore({ claims: [claim('om_busy_turn'), claim('om_next')], retried: [] });
+    const dispatched: string[] = [];
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      retryDelayMs: 5_000,
+      now: () => 9_000,
+      dispatch: async message => {
+        dispatched.push(message.messageId);
+        return message.messageId === 'om_busy_turn'
+          ? { kind: 'retry', reason: 'session has an unfinished turn' }
+          : committed(message);
+      },
+    });
+    await consumer.ready;
+    expect(dispatched).toEqual(['om_busy_turn', 'om_next']);
+    await consumer.stop();
+  });
+
   it('requeues an explicit busy result without reporting a dispatch error', async () => {
     const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
     // Explicit retry is a wait-state, not a failing attempt. Even an already

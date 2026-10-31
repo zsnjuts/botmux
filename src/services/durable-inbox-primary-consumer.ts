@@ -22,7 +22,9 @@ export type DurableInboxPrimaryDispatchResult =
    * than the ordinary retry delay.
    * `retryAfterMs`: an earlier, bounded redelivery hint for retries that some
    * other live replica is expected to resolve by claiming the event itself
-   * (for example the Session owner). Never later than the ordinary delay. */
+   * (for example the Session owner). Never later than the ordinary delay.
+   * This consumer then stops claiming until that replica has polled at least
+   * once after the event became visible again (Mew #93). */
   | { kind: 'retry'; reason: string; wakeKey?: string; retryAfterMs?: number };
 
 export interface DurableInboxPrimaryDispatchContext {
@@ -117,6 +119,10 @@ interface ParkedRetry {
 const PARKED_RETRY_LEASE_SLACK_MS = 2_000;
 /** Floor for a dispatch-provided early retry hint, so a hint cannot spin the queue. */
 const MIN_RETRY_HINT_MS = 100;
+/** Margin past the peer's next poll before this consumer claims again. Without
+ * the pause both replicas poll on a fixed grid, and whichever polls first after
+ * the hand-back keeps winning the same event (Mew #93: up to 6 claims in a row). */
+const PEER_CLAIM_YIELD_SLACK_MS = 200;
 
 function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
@@ -193,6 +199,7 @@ export function startDurableInboxPrimaryConsumer(
   const parkedLeaseMs = retryDelayMs + PARKED_RETRY_LEASE_SLACK_MS;
   const canParkRetries = parkedLeaseMs <= leaseDurationMs;
   let stopped = false;
+  let claimsYieldUntil = 0;
   let timer: NodeJS.Timeout | undefined;
   let stopPromise: Promise<DurableInboxPrimaryStopResult> | undefined;
   const reportError = (error: unknown): void => {
@@ -273,6 +280,12 @@ export function startDurableInboxPrimaryConsumer(
         if (retried.kind === 'stale') {
           loseOwnership(new Error(`durable inbox primary retry lost claim ${claim.event.eventId}`));
           return;
+        }
+        if (result.retryAfterMs !== undefined) {
+          claimsYieldUntil = Math.max(
+            claimsYieldUntil,
+            now() + retryAfterMs + intervalMs + PEER_CLAIM_YIELD_SLACK_MS,
+          );
         }
         try {
           await options.onRetried?.({ message, result });
@@ -423,6 +436,7 @@ export function startDurableInboxPrimaryConsumer(
   const drainSlot = async (slot: Slot): Promise<void> => {
     const slotWorkerId = `${workerId}:${slot.index}`;
     for (let index = 0; index < batchSize && !stopped; index++) {
+      if (now() < claimsYieldUntil) return;
       let claim: InboxClaim | undefined;
       try {
         claim = await options.store.claimNextInbox({
