@@ -83,6 +83,9 @@ export interface DaemonSession {
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
   workerReady?: boolean;
+  /** Oldest liveness ping the current worker has not answered yet (Mew #28).
+   * Any IPC message from that worker clears it. */
+  workerLiveness?: { worker: import('node:child_process').ChildProcess; pendingSince?: number };
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
    *  `claude_exit` / worker retirement. Deliberately NOT cleared by the

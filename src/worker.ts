@@ -26669,6 +26669,12 @@ process.on('message', async (raw: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'liveness_ping': {
+      // Answered only while this main loop runs: a thread stuck in a
+      // synchronous syscall (NFS openat in D state) stays silent (Mew #28).
+      send({ type: 'liveness_pong' });
+      break;
+    }
     case 'link_ref_register_result': {
       const pending = pendingLinkRefRegistrations.get(msg.requestId);
       if (!pending) break;

@@ -468,6 +468,8 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
   setDurableBridgeFinalOutputHandler,
   setRestoredRemoteTurnReattachHandler,
+  checkWorkerLiveness,
+  WORKER_LIVENESS_PING_INTERVAL_MS,
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
 } from './core/worker-pool.js';
@@ -33121,6 +33123,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     void closeIdleGroupSessions().catch(error => logger.warn(`[group-idle-close] sweep failed: ${String(error)}`));
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
+  // A Remote Runner worker stuck in a blocking syscall is killed and its turn
+  // re-attached (Mew #28).
+  const workerLivenessTimer = setInterval(() => checkWorkerLiveness(), WORKER_LIVENESS_PING_INTERVAL_MS);
+  workerLivenessTimer.unref?.();
 
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
@@ -33821,6 +33827,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(workerLivenessTimer);
     clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
@@ -34106,6 +34113,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setCrossPrincipalInterruptionDisableHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(workerLivenessTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
