@@ -163,6 +163,11 @@ import {
 } from './utils/pending-input-queue.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
+import {
+  RemoteFinalLinkLedger,
+  dedupeRemoteFinalLinks,
+  outboundLinksReachedRequester,
+} from './services/remote-final-link-dedupe.js';
 import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
 import {
   bridgeRemoteWebTerminal,
@@ -509,6 +514,7 @@ import {
   DEVICE_CREDENTIAL_FILE,
 } from './platform/device-paths.js';
 import type {
+  ActiveTurnInterruptResult,
   BackendType,
   SessionBackend,
   SessionDestroyResult,
@@ -6934,6 +6940,11 @@ function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number |
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
 }
 
+// Links a remote turn already delivered to the requester via an @-mentioning
+// (`--mention-back`) progress/auxiliary send, so its final answer does not post
+// the same authorization / confirmation link a second time (Mew #80).
+const remoteFinalLinkLedger = new RemoteFinalLinkLedger();
+
 function deliverRemoteTurnFinal(
   text: string,
   exactTurnId?: string,
@@ -6990,7 +7001,15 @@ function deliverRemoteTurnFinal(
   }
   // Strip a trailing sentinel line: "prose + sentinel" with no send is the
   // "did the work, forgot to send" shape — post the prose, never the token.
-  const postContent = bridgePostText(text, adoptMode);
+  const postContent = dedupeRemoteFinalLinks(
+    bridgePostText(text, adoptMode),
+    remoteFinalLinkLedger.deliveredUrls(turnId, dispatchAttempt),
+    {
+      bare: t('worker.remote_final.link_sent_above'),
+      labeled: label => t('worker.remote_final.link_sent_above_labeled', { label }),
+    },
+  );
+  remoteFinalLinkLedger.clear(turnId, dispatchAttempt);
   if (!postContent.trim()) {
     onPersisted?.(true);
     return;
@@ -7059,15 +7078,18 @@ async function deliverRemoteRunnerOutboundMessage(
   if (pinnedConfig) env.BOTS_CONFIG = pinnedConfig;
   else delete env.BOTS_CONFIG;
 
-  return sendRemoteRunnerOutboundMessage(message, {
+  const dispatchAttempt = currentBotmuxDispatchAttempt;
+  const result = await sendRemoteRunnerOutboundMessage(message, {
     sessionId,
     turnId: message.turnId,
-    ...(currentBotmuxDispatchAttempt !== undefined
-      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
-      : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(linkRefMode ? { linkRefMode } : {}),
     env,
   });
+  if (outboundLinksReachedRequester(message, result)) {
+    remoteFinalLinkLedger.record(message.turnId, dispatchAttempt, message.content);
+  }
+  return result;
 }
 
 async function deliverRemoteRunnerSessionTool(
@@ -12235,14 +12257,52 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
   return false;
 }
 
+/** How long a card Ctrl-C keeps asking a Remote Runner provider whose turn is
+ * still starting before reporting `not_ready` (/stop brings its own deadline). */
+const REMOTE_RUNNER_STOP_DEADLINE_MS = 10_000;
+
+/** Ctrl-C the Remote Runner turn this worker is running, with the provider's
+ * receipt (null when the backend has no receipted interrupt). */
+function stopRemoteRunnerTurn(
+  target: SessionBackend,
+  deadline: number,
+  issuedAt?: number,
+): Promise<ActiveTurnInterruptResult> | null {
+  if (!target.interruptActiveTurn) return null;
+  const expectedTurnId = currentBotmuxTurnId;
+  return target.interruptActiveTurn(deadline, {
+    ...(expectedTurnId ? { expectedTurnId } : {}),
+    ...(issuedAt !== undefined ? { issuedAtMs: issuedAt } : {}),
+  });
+}
+
 async function handleTermAction(key: TermActionKey): Promise<void> {
   // Remote Runner may explicitly negotiate a structured terminal_input channel
   // for Ctrl-C. Other remote backends treat writes as model follow-ups, so keep
   // rejecting every terminal action there.
   if (isRemoteBackendType(effectiveBackendType)) {
     if (effectiveBackendType === 'remote-runner' && key === 'ctrlc' && backend) {
-      const delivered = backend.write('\x03') !== false;
-      log(`Remote Runner Ctrl-C ${delivered ? 'submitted' : 'rejected'}`);
+      const target = backend;
+      const turnId = currentBotmuxTurnId;
+      const dispatchAttempt = currentBotmuxDispatchAttempt;
+      const stopping = stopRemoteRunnerTurn(target, Date.now() + REMOTE_RUNNER_STOP_DEADLINE_MS);
+      if (!stopping) {
+        const delivered = target.write('\x03') !== false;
+        log(`Remote Runner Ctrl-C ${delivered ? 'submitted' : 'rejected'}`);
+        return;
+      }
+      const result = await stopping;
+      log(`Remote Runner Ctrl-C ${result.outcome}${result.turnId ? ` turn=${result.turnId.substring(0, 12)}` : ''}`);
+      // The card already shows the stop as requested; say so when it was not
+      // delivered instead of letting the turn quietly keep running.
+      if (backend === target && (result.outcome === 'not_ready' || result.outcome === 'unknown')) {
+        send({
+          type: 'user_notify',
+          turnId,
+          dispatchAttempt,
+          message: t(result.outcome === 'not_ready' ? 'cmd.stop.not_ready' : 'cmd.stop.unknown'),
+        });
+      }
       return;
     }
     log(`term_action '${key}' ignored — ${effectiveBackendType} backend has no local terminal to drive`);
@@ -12338,6 +12398,26 @@ async function handleTermAction(key: TermActionKey): Promise<void> {
   }
   log(`Term action: ${key}`);
   scheduleOneShotAfterAction();
+}
+
+/** `/stop` for Remote Runner: interrupt the running turn and answer with the
+ * provider's receipt so the daemon can wait for that turn's terminal. */
+async function handleStopActiveTurn(requestId: string, deadline: number, issuedAt?: number): Promise<void> {
+  const stopping = effectiveBackendType === 'remote-runner' && backend
+    ? stopRemoteRunnerTurn(backend, deadline, issuedAt)
+    : null;
+  if (!stopping) {
+    send({ type: 'stop_active_turn_result', requestId, outcome: 'unknown' });
+    return;
+  }
+  const result = await stopping;
+  log(`Remote Runner stop ${result.outcome}${result.turnId ? ` turn=${result.turnId.substring(0, 12)}` : ''}`);
+  send({
+    type: 'stop_active_turn_result',
+    requestId,
+    outcome: result.outcome,
+    ...(result.turnId ? { turnId: result.turnId } : {}),
+  });
 }
 
 /** Deliver Ctrl+C only when the daemon's requested turn is still the worker's
@@ -28201,6 +28281,11 @@ process.on('message', async (raw: unknown) => {
 
     case 'interrupt_turn': {
       await handleExactTurnInterrupt(msg.requestId, msg.turnId);
+      break;
+    }
+
+    case 'stop_active_turn': {
+      await handleStopActiveTurn(msg.requestId, msg.deadline, msg.issuedAt);
       break;
     }
 

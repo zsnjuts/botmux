@@ -144,11 +144,17 @@ function inlineLiteralRanges(text: string, fenced: readonly LiteralRange[]): Lit
   return ranges;
 }
 
+/** Fenced code blocks and inline code spans (half-open `[start, end)`), sorted
+ * by start — the regions whose text Markdown renders literally. */
+export function markdownCodeLiteralRanges(text: string): Array<{ start: number; end: number }> {
+  const fenced = fencedLiteralRanges(text);
+  return [...fenced, ...inlineLiteralRanges(text, fenced)]
+    .sort((left, right) => left.start - right.start);
+}
+
 function tokenize(text: string): RefSpan[] {
   const spans: RefSpan[] = [];
-  const fenced = fencedLiteralRanges(text);
-  const literals = [...fenced, ...inlineLiteralRanges(text, fenced)]
-    .sort((left, right) => left.start - right.start);
+  const literals = markdownCodeLiteralRanges(text);
   let literalIndex = 0;
   LINK_REF_PATTERN.lastIndex = 0;
   for (let match = LINK_REF_PATTERN.exec(text); match; match = LINK_REF_PATTERN.exec(text)) {

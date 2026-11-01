@@ -415,6 +415,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
   updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
   sendWorkerSessionInput: vi.fn(() => true),
+  stopActiveWorkerTurn: vi.fn(async () => ({ outcome: 'stopped', turnId: 'turn-remote' })),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
   // invokes the fallback so the existing card-shape assertions (on sessionReply)
@@ -678,7 +679,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, stopActiveWorkerTurn, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -4529,28 +4530,84 @@ describe('handleCommand', () => {
       );
     });
 
-    it('uses the negotiated Remote Runner terminal input channel for /stop', async () => {
-      const worker = { killed: false, send: vi.fn() } as any;
-      const ds = makeDaemonSession({
+    function remoteRunnerSession(
+      options: { worker?: boolean; controls?: { steer: boolean; interrupt: boolean } } = {},
+    ) {
+      const worker = options.worker === false ? undefined : { killed: false, send: vi.fn() } as any;
+      return makeDaemonSession({
         worker,
         session: makeSession({
           cliId: 'remote-runner' as any,
           backendType: 'remote-runner',
         }),
         initConfig: { type: 'init', backendType: 'remote-runner', backendConfig: {} } as any,
-        activeTurnControls: { worker, steer: true, interrupt: true },
+        ...(options.controls ? { activeTurnControls: { worker, ...options.controls } } : {}),
       });
+    }
+
+    it.each([
+      ['stopped', 'cmd.stop.stopped'],
+      ['finished', 'cmd.stop.finished'],
+      ['not_ready', 'cmd.stop.not_ready'],
+      ['no_active_turn', 'cmd.stop.no_active_turn'],
+      ['unknown', 'cmd.stop.unknown'],
+    ] as const)('answers a Remote Runner /stop by its %s outcome instead of only reporting a sent key', async (outcome, key) => {
+      const ds = remoteRunnerSession({ controls: { steer: true, interrupt: true } });
+      vi.mocked(stopActiveWorkerTurn).mockResolvedValueOnce(
+        outcome === 'stopped' || outcome === 'finished'
+          ? { outcome, turnId: 'turn-remote' }
+          : { outcome },
+      );
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/stop', ROOT_ID, makeLarkMessage('/stop', { createTime: '1700000000000' }), deps, LARK_APP_ID,
+      );
+
+      // The stop names when it was issued so a redelivered /stop cannot hit a later turn.
+      expect(stopActiveWorkerTurn).toHaveBeenCalledWith(ds, expect.any(Number), 1_700_000_000_000);
+      expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        t(key, undefined, 'zh'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('says how long it waited when the stopped Remote Runner turn never confirmed its end', async () => {
+      const ds = remoteRunnerSession({ controls: { steer: true, interrupt: true } });
+      vi.mocked(stopActiveWorkerTurn).mockResolvedValueOnce({ outcome: 'unconfirmed', turnId: 'turn-remote' });
       const deps = makeDeps(ds);
 
       await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
 
-      expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, {
-        type: 'term_action',
-        key: 'ctrlc',
-      });
+      const budgetMs = vi.mocked(stopActiveWorkerTurn).mock.calls[0][1]!;
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
-        expect.stringContaining('已发送停止信号'),
+        t('cmd.stop.unconfirmed', { seconds: budgetMs / 1000 }, 'zh'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it.each([
+      ['the provider is still starting', { controls: undefined }, 'cmd.stop.not_ready'],
+      ['no worker is running', { worker: false }, 'cmd.stop.no_active_turn'],
+    ] as const)('answers a Remote Runner /stop without asking the worker when %s', async (_label, options, key) => {
+      const ds = remoteRunnerSession(options);
+      const deps = makeDeps(ds);
+
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+
+      expect(stopActiveWorkerTurn).not.toHaveBeenCalled();
+      expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        t(key, undefined, 'zh'),
         undefined,
         LARK_APP_ID,
         'msg_001',

@@ -159,6 +159,29 @@ export interface BackendTurnFailure {
   retryable: boolean;
 }
 
+/** Receipt of a Remote Runner active-turn stop request. `sent` only proves the
+ * provider delivered Ctrl-C to a natively started turn; the turn's own terminal
+ * still decides whether it actually stopped. */
+export type ActiveTurnInterruptOutcome = 'sent' | 'not_ready' | 'no_active_turn' | 'unknown';
+
+export interface ActiveTurnInterruptResult {
+  outcome: ActiveTurnInterruptOutcome;
+  /** The turn the request targeted, when there was one. */
+  turnId?: string;
+}
+
+/** Which active turn a stop request may hit. A turn that does not match is
+ * reported as `no_active_turn` and never receives Ctrl-C. */
+export interface ActiveTurnInterruptTarget {
+  /** Only this exact turn. */
+  expectedTurnId?: string;
+  /** Epoch ms at which the user issued the stop (Lark message create_time).
+   * A turn this host submitted clearly after that instant is a successor the
+   * user never saw — e.g. a durable redelivery of an old /stop — and is left
+   * alone. */
+  issuedAtMs?: number;
+}
+
 /**
  * Durable identity of the backing resource owned by one Botmux session.
  *
@@ -274,6 +297,9 @@ export interface SessionBackend {
   activeTurnSteerReadiness?(): 'ready' | 'pending' | 'none';
   /** Remote Runner: the active turn was acknowledged by the provider. */
   onActiveTurnAccepted?(cb: () => void): void;
+  /** Remote Runner: send Ctrl-C to the active turn and report what the
+   * provider proved before `deadlineMs` (epoch ms). */
+  interruptActiveTurn?(deadlineMs: number, target?: ActiveTurnInterruptTarget): Promise<ActiveTurnInterruptResult>;
   /**
    * Begin one logical adapter submission and return its recovery fence.
    * Backends with a persistent ambiguity journal may arm it here so all
