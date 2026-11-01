@@ -231,6 +231,7 @@ import {
   setActiveSessionsRegistry,
   suspendWorker,
   __testOnly_setSuspendBackingVerifier,
+  memoryPressureBlockedNotice,
 } from '../src/core/worker-pool.js';
 import { MissingWorkingDirError } from '../src/core/working-dir-recovery.js';
 import {
@@ -603,7 +604,7 @@ describe('host memory pressure worker admission', () => {
     expect(admissions).toEqual(['rejected']);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringMatching(/memory pressure.*retry/i),
+      memoryPressureBlockedNotice(0),
       'text',
       'app_test',
       'om_retry',
@@ -638,11 +639,25 @@ describe('host memory pressure worker admission', () => {
     })).toBe(true);
 
     expect(blocked).toHaveBeenCalledWith({
-      content: expect.stringMatching(/memory pressure.*retry/i),
+      content: memoryPressureBlockedNotice(0),
       turnId: 'om_durable_retry',
     });
+    // The operator-facing reason (MemAvailable / reserve / PSI) stays in the log.
+    expect(blocked.mock.calls[0][0].content).not.toContain('GiB');
     expect(sessionReply).not.toHaveBeenCalled();
     expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('words the memory-pressure rejection for chat users in each locale', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const plain = memoryPressureBlockedNotice(0, locale);
+      const reclaimed = memoryPressureBlockedNotice(3, locale);
+      expect(reclaimed).toContain('3');
+      expect(plain).not.toBe(reclaimed);
+      for (const text of [plain, reclaimed]) expect(text).not.toMatch(/PSI|reserve|GiB/);
+    }
+    expect(memoryPressureBlockedNotice(0, 'zh')).toMatch(/[\u4e00-\u9fff]/);
+    expect(memoryPressureBlockedNotice(0, 'en')).not.toMatch(/[\u4e00-\u9fff]/);
   });
 
   it('reports accepted after a worker receives its init message', () => {
@@ -1051,7 +1066,7 @@ describe('host memory pressure worker admission', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringMatching(/memory pressure.*retry/i),
+      memoryPressureBlockedNotice(0),
       'text',
       'app_test',
       'om_blocked_turn',
@@ -1143,7 +1158,7 @@ describe('host memory pressure worker admission', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringMatching(/memory pressure.*retry/i),
+      memoryPressureBlockedNotice(0),
       'text',
       'app_test',
       'om_doc_blocked',

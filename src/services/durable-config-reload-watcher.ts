@@ -22,6 +22,9 @@ export interface DurableConfigReloadWatcherOptions {
   apply(inspection: DurableConfigInspection): Promise<void>;
   initialApplied?: DurableConfigInspection;
   intervalMs?: number;
+  /** A single check (inspect + apply) running longer than this is published as
+   *  `durable_config_reload_stalled` until it settles. */
+  stallAfterMs?: number;
   /** Automatic retry cadence while the CAS is blocked or the provider fails.
    *  Explicit `checkNow()` calls bypass this delay. */
   blockedRetryMs?: number;
@@ -71,6 +74,7 @@ export function startDurableConfigReloadWatcher(
 ): DurableConfigReloadWatcher {
   const intervalMs = interval(options.intervalMs);
   const blockedRetryMs = blockedRetryInterval(options.blockedRetryMs, intervalMs);
+  const stallAfterMs = options.stallAfterMs ?? 60_000;
   const now = options.now ?? Date.now;
   const initial = appliedIdentity(options.initialApplied);
   let appliedRecordRevision = initial.revision;
@@ -122,8 +126,13 @@ export function startDurableConfigReloadWatcher(
       return;
     }
     nextAutomaticCheckAt = 0;
-    if (inspection.recordRevision === appliedRecordRevision
-        && inspection.fileSha256 === appliedFileSha256) {
+    if (inspection.fileSha256 === appliedFileSha256) {
+      // Same bytes, possibly under a later revision: a CAS commit that changed
+      // nothing (path rebind, reconcile, or a write of identical content).
+      // There is nothing to reload.  Re-running apply would repeat its side
+      // effects (allowedUsers contact lookups) and, if one of them hangs, leave
+      // the applied revision behind the committed one (Mew #30).
+      appliedRecordRevision = inspection.recordRevision;
       publish({
         state: 'in_sync',
         inspection,
@@ -160,7 +169,24 @@ export function startDurableConfigReloadWatcher(
 
   const checkNow = (): Promise<void> => {
     if (running) return running;
-    running = check().finally(() => { running = undefined; });
+    // A hung inspect/apply would otherwise keep publishing its last in_sync
+    // status forever, which health reads as a generation mismatch.
+    const stall = setTimeout(() => {
+      publish({
+        state: 'error',
+        ...(current.inspection ? { inspection: current.inspection } : {}),
+        ...(appliedRecordRevision === undefined ? {} : { appliedRecordRevision }),
+        ...(appliedFileSha256 === undefined ? {} : { appliedFileSha256 }),
+        ...(current.appliedAt === undefined ? {} : { appliedAt: current.appliedAt }),
+        error: 'durable_config_reload_stalled',
+      });
+      report(new Error(`durable config reload check has not settled after ${stallAfterMs}ms`));
+    }, stallAfterMs);
+    stall.unref?.();
+    running = check().finally(() => {
+      clearTimeout(stall);
+      running = undefined;
+    });
     return running;
   };
   const ready = checkNow();

@@ -92,6 +92,62 @@ describe('durable config reload watcher', () => {
     },
   );
 
+  it('advances the applied revision without reloading when a later commit keeps the same bytes', async () => {
+    // No-op CAS commits (rebind, reconcile, identical writes) moved default's
+    // committed revision 99 → 111 while every Pod stayed at 99 (Mew #30).
+    const applied = inspection(99, 'a'.repeat(64));
+    const later = inspection(111, 'a'.repeat(64));
+    let current = applied;
+    const apply = vi.fn(async () => undefined);
+    const watcher = startDurableConfigReloadWatcher({
+      inspect: async () => current,
+      apply,
+      initialApplied: applied,
+      intervalMs: 60_000,
+    });
+    await watcher.ready;
+    current = later;
+    await watcher.checkNow();
+    expect(apply).not.toHaveBeenCalled();
+    expect(watcher.status()).toMatchObject({
+      state: 'in_sync',
+      appliedRecordRevision: 111,
+      appliedFileSha256: 'a'.repeat(64),
+    });
+    await watcher.stop();
+  });
+
+  it('reports a check that has not settled as stalled until it finishes', async () => {
+    vi.useFakeTimers();
+    try {
+      const next = inspection(2, 'b'.repeat(64));
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const errors: unknown[] = [];
+      const watcher = startDurableConfigReloadWatcher({
+        inspect: async () => next,
+        apply: async () => gate,
+        initialApplied: inspection(1, 'a'.repeat(64)),
+        intervalMs: 60_000,
+        stallAfterMs: 5_000,
+        onError: error => errors.push(error),
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(watcher.status()).toMatchObject({
+        state: 'error',
+        error: 'durable_config_reload_stalled',
+        appliedRecordRevision: 1,
+      });
+      expect(errors).toHaveLength(1);
+      release();
+      await watcher.ready;
+      expect(watcher.status()).toMatchObject({ state: 'in_sync', appliedRecordRevision: 2 });
+      await watcher.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('retries the same generation after a local reload failure', async () => {
     const next = inspection(3, 'c'.repeat(64));
     const apply = vi.fn()
