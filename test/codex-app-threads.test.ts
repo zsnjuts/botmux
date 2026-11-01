@@ -187,8 +187,16 @@ describe('generateCodexAppThreadTitle', () => {
       let ready = false;
       while (performance.now() < readyDeadline) {
         if (existsSync(logPath)) {
+          // The fake app-server is still appending: the last line may be torn.
+          // A partial line means "not yet", not a failure of the poll.
           ready = readFileSync(logPath, 'utf8').trim().split('\n')
-            .some(line => JSON.parse(line).id === 9001);
+            .some(line => {
+              try {
+                return JSON.parse(line).id === 9001;
+              } catch {
+                return false;
+              }
+            });
           if (ready) break;
         }
         await new Promise<void>(resolve => setImmediate(resolve));
