@@ -10961,6 +10961,26 @@ describe('im.message.receive_v1 — /introduce command', () => {
     expect(ack).not.toContain('张三');
   });
 
+  // Mew #26：通讯录范围外的真人查通讯录也拿不到 user，靠群真人成员列表剔除。
+  it('drops humans outside the contact range when the chat member list has them', async () => {
+    mockListChatMemberOpenIds.mockResolvedValueOnce([USER_OPEN_ID, 'ou_outside']);
+    const event = makeIntroduceEvent({
+      mentions: [
+        { key: '@_a', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } },
+        { key: '@_h', name: '范围外真人', id: { open_id: 'ou_outside' } },
+      ],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockListChatMemberOpenIds).toHaveBeenCalledWith(MY_APP_ID, 'chat-intro-001');
+    const [, , , botsArg] = mockRecordObservedBots.mock.calls[0];
+    expect((botsArg as Array<{ openId: string }>).map(b => b.openId).sort())
+      .toEqual([MY_OPEN_ID, OTHER_BOT_OPEN_ID].sort());
+  });
+
   it('sends ack reply when /introduce is consumed', async () => {
     const event = makeIntroduceEvent({
       mentions: [

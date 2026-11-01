@@ -10,7 +10,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { startLarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, updateMessage } from './client.js';
+import { classifyChatMembers } from './chat-member-kind.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
@@ -1633,13 +1634,14 @@ export async function tryHandleIntroduceCommand(
   }
 
   const chatId = message.chat_id as string;
-  // 查通讯录剔除真人：花名册只收 bot——真人混进去会污染 <available_bots> 误导模型，
+  // 剔除真人：花名册只收 bot——真人混进去会污染 <available_bots> 误导模型，
   // 且不必再「靠人自觉」只 @ bot。self 始终保留（它是本 app open_id 的权威自记录）。
-  // 缺 contact 读权限时 isHumanOpenId 一律返回 false → 退回「全部登记」旧行为（见其注释）。
-  const humanFlags = await Promise.all(
-    all.map(m => (m.openId === selfOpenId ? Promise.resolve(false) : isHumanOpenId(larkAppId, m.openId).catch(() => false))),
-  );
-  const bots = all.filter((_, i) => !humanFlags[i]);
+  // 通讯录查不到范围外的真人，再看群真人成员列表（Mew #26）。两边都确认不了的
+  // 目标仍按 /introduce 的本意登记：这是用户点名要登记的 bot。
+  const others = all.filter(m => m.openId !== selfOpenId);
+  const kinds = await classifyChatMembers(larkAppId, chatId, others.map(m => m.openId));
+  const humans = new Set(others.filter((_, i) => kinds[i] === 'human').map(m => m.openId));
+  const bots = all.filter(m => !humans.has(m.openId));
   try {
     // Persist to the observer-scoped store: these open_ids are scoped to the
     // receiving app (larkAppId), so they're correct for THIS daemon to use

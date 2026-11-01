@@ -18,6 +18,8 @@ const deleteMock = vi.fn(async () => true);  // deleteMessage now returns boolea
 const getMessageDetailMock = vi.fn(async () => ({ items: [{ thread_id: 'omt_thread' }] }));
 // 默认所有 open_id 判为「非真人」（bot）→ 全部登记花名册；需要模拟真人用 mockImplementation。
 const isHumanMock = vi.fn(async () => false);
+// 群真人成员列表（Mew #26）：默认空 = 通讯录查不到的目标都判为 bot。
+const chatMembersMock = vi.fn(async (_app: string, _chat: string): Promise<string[]> => []);
 // 转投私聊的申请卡处置后，回告原会话申请人走 sendMessage（fire-and-forget）。
 const sendMock = vi.fn(async () => 'om_sent');
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
@@ -28,6 +30,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
     deleteMessage: (...a: any[]) => deleteMock(...a),
     getMessageDetail: (...a: any[]) => getMessageDetailMock(...a),
     isHumanOpenId: (...a: any[]) => isHumanMock(...a),
+    listChatMemberOpenIds: (...a: any[]) => chatMembersMock(...(a as [string, string])),
     sendMessage: (...a: any[]) => sendMock(...a),
   };
 });
@@ -70,6 +73,7 @@ beforeEach(() => {
   getMessageDetailMock.mockClear(); getMessageDetailMock.mockImplementation(async () => ({ items: [{ thread_id: 'omt_thread' }] }));
   recordObservedMock.mockClear();
   isHumanMock.mockClear(); isHumanMock.mockImplementation(async () => false);
+  chatMembersMock.mockReset(); chatMembersMock.mockImplementation(async () => []);
   sendMock.mockClear();
   const dir = mkdtempSync(join(tmpdir(), 'botmux-cardgrant-'));
   configPath = join(dir, 'bots.json');
@@ -362,6 +366,39 @@ describe('card-handler grant actions', () => {
     expect(patched).toContain('<at id=ou_human></at>');  // 真人 → @
     expect(patched).not.toContain('<at id=ou_bot2');      // bot → 纯文本
     expect(patched).toContain('Codex');
+  });
+
+  // Mew #26：应用通讯录范围外的真人查通讯录也是 41050，和 bot 一样拿不到 user；
+  // 他在群真人成员列表里，所以不登记花名册，终态卡照常 @ 他。
+  it('grant 成功 → 通讯录查不到但在群真人成员里的目标按真人处理（不登记、照常 @）', async () => {
+    const { pending, handler } = await fresh();
+    chatMembersMock.mockImplementation(async (_app, chat) => (chat === 'oc_1' ? ['ou_owner', 'ou_outside'] : []));
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_outside', 'ou_bot2']);
+    const data: any = {
+      operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_card' },
+      action: { value: { action: 'grant_chat', target_open_ids: ['ou_outside', 'ou_bot2'], target_names: ['范围外真人', 'Codex'], chat_id: 'oc_1', nonce } },
+    };
+    const res = await handler.handleCardAction(data, deps, 'h1');
+    expect(chatMembersMock).toHaveBeenCalledWith('h1', 'oc_1');
+    const [, , , entries] = recordObservedMock.mock.calls.at(-1)!;
+    expect(entries).toEqual([{ openId: 'ou_bot2', name: 'Codex' }]);
+    const patched = JSON.stringify(res);
+    expect(patched).toContain('<at id=ou_outside></at>');
+    expect(patched).not.toContain('<at id=ou_bot2');
+  });
+
+  it('grant 成功 → 通讯录和群成员都确认不了时不登记花名册（授权照常落库）', async () => {
+    const { registry, pending, handler } = await fresh();
+    chatMembersMock.mockImplementation(async () => { throw new Error('99991672 no permission'); });
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_unknown']);
+    const data: any = {
+      operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_card' },
+      action: { value: { action: 'grant_chat', target_open_ids: ['ou_unknown'], target_names: ['某人'], chat_id: 'oc_1', nonce } },
+    };
+    const res = await handler.handleCardAction(data, deps, 'h1');
+    expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_unknown'] });
+    expect(recordObservedMock).not.toHaveBeenCalled();
+    expect(JSON.stringify(res)).not.toContain('<at id=ou_unknown');  // 不确定时不 @，免得唤醒 bot
   });
 
   it('grant 成功 → 查通讯录确认是真人的目标不登记花名册（避免污染 bot 列表）', async () => {

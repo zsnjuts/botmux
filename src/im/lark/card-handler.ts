@@ -16,7 +16,8 @@ import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
-import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
+import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
+import { classifyChatMembers } from './chat-member-kind.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
 import type { GrantCardDelivery } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
@@ -481,10 +482,10 @@ function notifyGrantRequesterInOrigin(
   loc?: Locale,
 ): void {
   void (async () => {
-    const humanFlags = delivery === 'dm_group'
-      ? await Promise.all(targets.map(id => isHumanOpenId(larkAppId, id).catch(() => false)))
-      : targets.map(() => true);
-    const entries = targets.map((id, i) => ({ openId: id, name: names[i] || undefined, isBot: !humanFlags[i] }));
+    const kinds = delivery === 'dm_group'
+      ? await classifyChatMembers(larkAppId, chatId, targets)
+      : targets.map(() => 'human' as const);
+    const entries = targets.map((id, i) => ({ openId: id, name: names[i] || undefined, isBot: kinds[i] !== 'human' }));
     await sendMessage(larkAppId, chatId, buildGrantRequesterNoticeCard(outcome, delivery, entries, loc), 'interactive');
   })().catch(err => logger.warn(`grant requester notice (${outcome}) failed: ${err}`));
 }
@@ -1599,23 +1600,25 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // 留着的话 isThrottled 会挡住失败 target 后续的自助申请直到 pending 过期（已落盘，重启也清不掉）。
     // 失败 target 可重新走 /grant 或自助申请；失败清单下面在原线程明确告知 owner，
     // 不做「撤卡 + 静默失败 + pending 永久卡住」。
-    // 一次查通讯录判定哪些 grantee 是真人（vs bot），结果同时供下面两处复用：
-    //   1. observed 花名册自动登记（只收 bot，剔真人）；
-    //   2. 通知卡 @ 渲染（只 @ 真人，bot 用纯文本名字 —— 见下方注释）。
-    // 缺 contact 读权限/查询瞬时失败 → 一律按 bot 处理（false）：登记侧沿用历史「全部登记」回退，
-    // 通知侧则把对方当 bot 不 @（宁可少 @ 一次真人，也不误唤醒 bot 拉空会话）。
-    const humanFlags = await Promise.all(granted.map(id => isHumanOpenId(larkAppId, id).catch(() => false)));
+    // 一次判定哪些 grantee 是真人（vs bot），结果同时供下面两处复用：
+    //   1. observed 花名册自动登记（只收确认的 bot）；
+    //   2. 通知卡 @ 渲染（只 @ 确认的真人，其余用纯文本名字 —— 见下方注释）。
+    // 通讯录范围外的真人和 bot 查通讯录都是 41050，所以再看群真人成员列表（Mew #26）。
+    // 两边都确认不了 → unknown：不登记（宁可少登记 bot，也不把真人写进花名册），
+    // 通知侧当 bot 不 @（宁可少 @ 一次真人，也不误唤醒 bot 拉空会话）。
+    const kinds = await classifyChatMembers(larkAppId, grantChatId, granted);
     // /grant @bot 成功后顺带把「bot」目标登记进 observed 花名册（等价内部跑一次 /introduce），
     // 授权 + 可点名一步到位。写的是 observed-bots-store（让本 daemon 能 @ 回对方），不影响
     // isKnownPeerBot 接收闸（那查的是 cross-ref，两套独立存储），零额外路由权。best-effort。
     // 真人**不**登记：查通讯录确认是真人就剔除，避免污染 <available_bots> 误导模型。
     try {
       const botEntries = granted
-        .map((id, i) => ({ id, human: humanFlags[i] }))
-        .filter(x => !x.human)
-        .map(x => ({ openId: x.id, name: idToName.get(x.id) ?? '' }));
-      const skipped = granted.length - botEntries.length;
-      if (skipped > 0) logger.debug(`grant auto-introduce: skipped ${skipped} confirmed human target(s)`);
+        .filter((_, i) => kinds[i] === 'bot')
+        .map(id => ({ openId: id, name: idToName.get(id) ?? '' }));
+      const humans = kinds.filter(k => k === 'human').length;
+      const unknown = kinds.filter(k => k === 'unknown').length;
+      if (humans > 0) logger.debug(`grant auto-introduce: skipped ${humans} confirmed human target(s)`);
+      if (unknown > 0) logger.info(`grant auto-introduce: skipped ${unknown} target(s) not confirmed as bot`);
       if (botEntries.length > 0) {
         await recordObservedBotsShared(config.session.dataDir, larkAppId, grantChatId, botEntries, 'introduce');
       }
@@ -1623,7 +1626,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       logger.warn(`grant auto-introduce (observed) failed (grant still applied): ${err}`);
     }
     // 通知卡的 grantee 渲染参数：bot 只用纯文本名字（不 <at>，否则唤醒对方 bot 误拉空会话），真人 @ 点名。
-    const notifyTargets = granted.map((id, i) => ({ openId: id, name: idToName.get(id) || undefined, isBot: !humanFlags[i] }));
+    const notifyTargets = granted.map((id, i) => ({ openId: id, name: idToName.get(id) || undefined, isBot: kinds[i] !== 'human' }));
     // 授权成功后：**就地 patch 原卡**为终态（正文直接 @ 被授权人 + 额度/有效期），这一张卡既是
     // 「已授权」结果态、又 ping 到被授权人——无需再单独发通知卡、也无需撤回原卡（申晗 2026-07-31
     // 反馈：直接在原卡更新即可）。同步返回该 body 即完成 in-place patch，避免 deleteMessage 与

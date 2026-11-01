@@ -16,6 +16,7 @@ const replyMock = vi.fn(async () => 'om_reply');
 const deleteMock = vi.fn(async () => true);
 const getMessageDetailMock = vi.fn(async () => ({ items: [{ thread_id: 'omt_thread' }] }));
 const isHumanMock = vi.fn(async () => false);
+const chatMembersMock = vi.fn(async (): Promise<string[]> => []);
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return {
@@ -24,6 +25,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
     deleteMessage: (...a: any[]) => deleteMock(...a),
     getMessageDetail: (...a: any[]) => getMessageDetailMock(...a),
     isHumanOpenId: (...a: any[]) => isHumanMock(...a),
+    listChatMemberOpenIds: () => chatMembersMock(),
   };
 });
 

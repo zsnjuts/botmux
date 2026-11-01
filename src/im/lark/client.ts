@@ -758,14 +758,9 @@ export async function getUserProfile(
  * - 查不到 / 报错 → false。这一类同时覆盖两种情况：①bot（应用不在通讯录，必然查不到）；
  *   ②本 app 缺 `contact:user.base:readonly` 读权限（这时真人也会查不到）。
  *
- * 用途：花名册（observed-bots-store）只应收 bot，不收真人——真人混进去会污染
- * `<available_bots>` 误导模型。调用方语义统一为「只在 NOT-confirmed-human 时登记」：
- *   - 有 contact 读权限（常态）→ 真人被准确剔除，登记得干净；
- *   - 缺权限 / 查询瞬时失败（降级）→ 一律按非真人放行登记。对 /introduce 这本就「全部登记」，
- *     无回退损失；但对 /grant 自动登记这条**新增**路径，降级时真人会被误登记——这是个新增
- *     的（窄）污染面，靠 `contact:user.base:readonly` 已是 critical scope、启动自检缺失即 DM
- *     管理员来收敛，不是「与现状等价」。若要彻底消除需区分 permission/network 与 user-not-found
- *     错误码（user-not-found 才判 bot），属后续增强。
+ * 只有 true 是确定的。通讯录范围外的真人和 bot 一样返回 41050 no user authority
+ * （Mew #26 实测），false 不能当成「是 bot」：判断群里谁是 bot 用
+ * `chat-member-kind.ts` 的 `classifyChatMembers`，它再看群真人成员列表。
  */
 export async function isHumanOpenId(larkAppId: string, openId: string): Promise<boolean> {
   const c = getBotClient(larkAppId);
