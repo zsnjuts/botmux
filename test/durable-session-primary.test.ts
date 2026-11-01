@@ -14,6 +14,7 @@ import {
   admitDurableLarkSession,
   claimDurableLarkActiveSession,
   commitDurableLarkBackgroundClose,
+  commitDurableLarkRemoteSnapshot,
   commitDurableLarkSessionControl,
   durablePrimarySessionProjection,
   listValidDurablePrimarySessions,
@@ -456,6 +457,56 @@ describe('durable primary Session admission', () => {
         facade, session: closedLocally(), reason: 'group idle close',
       })).resolves.toMatchObject({ kind: 'occupied', ownerId: 'resumed-elsewhere' });
       expect(store.writeSession).not.toHaveBeenCalled();
+      await facade.stop();
+    });
+  });
+
+  // Mew #43: an idle remote Session retired at release time without a handoff
+  // must leave its latest lineage in the canonical record for the next owner.
+  describe('remote lineage commit before releasing the lease', () => {
+    const lineage = (generation: number, remoteSessionId = `tae-${generation}`) => ({
+      version: 1 as const, provider: 'tae-traex', generation, remoteSessionId,
+    });
+
+    it('replaces a lagging canonical lineage and keeps admission and control history', async () => {
+      const { store, records } = fakeStore();
+      const facade = createDurableSessionFacade({ store, ownerId: 'owner-boot' });
+      await admitDurableLarkSession({
+        facade, message: message('om_root'), session: session({ remoteBackendState: lineage(1) }),
+      });
+
+      await expect(commitDurableLarkRemoteSnapshot({
+        facade, session: session({ title: 'local title drift', remoteBackendState: lineage(3) }),
+      })).resolves.toMatchObject({ kind: 'committed' });
+
+      const parsed = parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!);
+      expect(parsed.session).toMatchObject({
+        status: 'active', remoteBackendState: { generation: 3, remoteSessionId: 'tae-3' },
+      });
+      // Only the lineage moves; every other canonical field stays as committed.
+      expect(parsed.session.title).toBe('Primary Session');
+      expect(parsed.admission.messageId).toBe('om_root');
+      await facade.stop();
+    });
+
+    it('never moves the canonical lineage backwards and leaves closed or replaced Sessions alone', async () => {
+      const { store, records } = fakeStore();
+      const facade = createDurableSessionFacade({ store, ownerId: 'owner-boot' });
+      await admitDurableLarkSession({
+        facade, message: message('om_root'), session: session({ remoteBackendState: lineage(4) }),
+      });
+      const before = records.get('om_root::cli_test')!.revision;
+
+      await expect(commitDurableLarkRemoteSnapshot({
+        facade, session: session({ remoteBackendState: lineage(2) }),
+      })).resolves.toEqual({ kind: 'not_applicable', reason: 'local remote lineage is behind the canonical record' });
+      await expect(commitDurableLarkRemoteSnapshot({
+        facade, session: session({ sessionId: 'session-other', remoteBackendState: lineage(5) }),
+      })).resolves.toEqual({ kind: 'not_applicable', reason: 'canonical Session was replaced' });
+      await expect(commitDurableLarkRemoteSnapshot({
+        facade, session: session({ status: 'closed', remoteBackendState: lineage(5) }),
+      })).resolves.toEqual({ kind: 'not_applicable', reason: 'local Session is not active' });
+      expect(records.get('om_root::cli_test')!.revision).toBe(before);
       await facade.stop();
     });
   });

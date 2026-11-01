@@ -150,6 +150,23 @@ function hasUnsettledIdleSuspendState(ds: DaemonSession): boolean {
     || ds.remoteShutdownState !== undefined;
 }
 
+/**
+ * Rolling release in durable primary handoff mode: a remote session nobody has
+ * talked to for `idleMs` should not be handed to the successor, which would
+ * relaunch its worker and runner only for them to sit idle (Mew #43: every
+ * default release relaunched ~130 such sessions). Activity is the persisted
+ * `session.lastMessageAt` only: the in-memory `ds.lastMessageAt` restarts at
+ * every restore or takeover, so a worker relaunched by the previous release
+ * would look fresh. The runner still refuses to detach a busy session, so this
+ * only has to be conservative about Host-side state.
+ */
+export function isIdleForReleaseDetach(ds: DaemonSession, nowMs: number, idleMs: number): boolean {
+  if (idleMs <= 0 || hasUnsettledIdleSuspendState(ds)) return false;
+  if (ds.activeInteractiveTurn || ds.preparingInteractiveTurn) return false;
+  const lastActivity = Date.parse(ds.session.lastMessageAt ?? '');
+  return Number.isFinite(lastActivity) && nowMs - lastActivity >= idleMs;
+}
+
 function expectedReleasedProcessTypes(ds: DaemonSession, backendType: string): string[] {
   const cliId = ds.session.cliId ?? ds.initConfig?.cliId ?? 'cli';
   const processTypes = ['botmux __worker', `${backendType} session`, cliId];
