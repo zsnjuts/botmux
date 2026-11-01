@@ -484,6 +484,75 @@ export async function commitDurableLarkBackgroundClose(input: {
   return written;
 }
 
+class DurableRemoteSnapshotNotApplicable extends Error {}
+
+export type DurableLarkRemoteSnapshotResult =
+  | { kind: 'committed'; record: DurableSessionRecord }
+  | { kind: 'unchanged'; record: DurableSessionRecord }
+  | { kind: 'not_applicable'; reason: string }
+  | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
+
+/**
+ * Commit this owner's remote backend lineage (`remoteBackendState`, plus the
+ * `remoteRunnerUsage` reported for it) to the canonical record before the
+ * route lease is let go without a handoff (Mew #43). Worker lineage reports
+ * only reach the Pod-local store; turn admissions and lifecycle controls are
+ * the only canonical writers, so whoever takes the Session over next would
+ * otherwise resume from a lagging generation. Every other canonical field is
+ * left as it is, and the lineage never moves backwards.
+ */
+export async function commitDurableLarkRemoteSnapshot(input: {
+  facade: DurableSessionFacade;
+  session: Session;
+}): Promise<DurableLarkRemoteSnapshotResult> {
+  if (input.session.status !== 'active') {
+    return { kind: 'not_applicable', reason: 'local Session is not active' };
+  }
+  const identity = primarySessionIdentity(input.session);
+  const local = cloneSession(input.session) as unknown as Session;
+  let written: DurableSessionFacadeWriteResult;
+  try {
+    written = await input.facade.writeExactFromCurrent(identity.sessionKey, current => {
+      if (!current) throw new DurableRemoteSnapshotNotApplicable('canonical Session is missing');
+      const parsed = parseDurablePrimarySessionRecord(current);
+      if (parsed.session.sessionId !== input.session.sessionId) {
+        throw new DurableRemoteSnapshotNotApplicable('canonical Session was replaced');
+      }
+      if (parsed.session.status !== 'active') {
+        throw new DurableRemoteSnapshotNotApplicable('canonical Session is not active');
+      }
+      const prior = parsed.session.remoteBackendState?.generation;
+      const next = local.remoteBackendState?.generation;
+      if (typeof prior === 'number' && (typeof next !== 'number' || next < prior)) {
+        throw new DurableRemoteSnapshotNotApplicable('local remote lineage is behind the canonical record');
+      }
+      const session: Session = { ...parsed.session };
+      if (local.remoteBackendState) session.remoteBackendState = local.remoteBackendState;
+      if (local.remoteRunnerUsage) session.remoteRunnerUsage = local.remoteRunnerUsage;
+      else delete session.remoteRunnerUsage;
+      const projection: DurablePrimarySessionProjection = {
+        version: DURABLE_PRIMARY_SESSION_VERSION,
+        type: 'botmux.session.primary',
+        session: session as unknown as DurableJson,
+        admission: parsed.admission,
+        admissions: parsed.admissions,
+        ...(parsed.controls.length > 0
+          ? { control: parsed.controls[parsed.controls.length - 1], controls: parsed.controls }
+          : {}),
+      };
+      return projection as unknown as DurableJson;
+    });
+  } catch (error) {
+    if (error instanceof DurableRemoteSnapshotNotApplicable) {
+      return { kind: 'not_applicable', reason: error.message };
+    }
+    throw error;
+  }
+  if (written.kind === 'written') return { kind: 'committed', record: written.record };
+  if (written.kind === 'unchanged') return { kind: 'unchanged', record: written.record };
+  return written;
+}
+
 /**
  * Persist one exact canonical Session snapshot and mint the only committed
  * result accepted by the primary inbox consumer.

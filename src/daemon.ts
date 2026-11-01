@@ -143,6 +143,7 @@ import { resolveDurablePrimaryOutputClaim } from './services/durable-primary-out
 import {
   claimDurableLarkActiveSession,
   commitDurableLarkBackgroundClose,
+  commitDurableLarkRemoteSnapshot,
   listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
@@ -691,7 +692,7 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
-import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS, isIdleForReleaseDetach } from './core/idle-worker-sweeper.js';
 import {
   DEFAULT_SESSION_OWNER_REMINDER,
   SessionOwnerReminderController,
@@ -908,6 +909,7 @@ import {
   canAbortVerifiedExitedRemotePreparation,
   collectUniqueDaemonShutdownSessions,
   commitPreparedRemoteShutdown,
+  detachRemoteWorkerForShutdown,
   isPreparedRemoteSessionCurrent,
   persistPreparedRemoteShutdownFleet,
   prepareRemoteFleetForShutdown,
@@ -919,6 +921,7 @@ import {
   DAEMON_COT_SETTLE_MS,
   DAEMON_SHUTDOWN_MAX_MS,
   DAEMON_WORKER_EXIT_GRACE_MS,
+  REMOTE_HANDOFF_IDLE_DETACH_MS,
   REMOTE_SHUTDOWN_MODE,
 } from './core/shutdown-budgets.js';
 import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
@@ -33624,6 +33627,75 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // bug fixed in v2.9.2) loses the signal and survives as a ppid=1 orphan
   // forever (we'd accumulated 841 such orphans across daemon restarts,
   // consuming ~65 GB of RAM until manually SIGKILL'd).
+  /** Release-time retirement of idle remote sessions (Mew #43). Each session
+   * is detached through the runner's transactional detach (lineage persisted,
+   * then committed to the canonical record) and only then loses its route
+   * lease, so whoever takes it over on the next message resumes the latest
+   * lineage. A session that cannot be retired that way is left for handoff. */
+  const detachIdleRemoteSessionsForRelease = async (
+    candidates: readonly DaemonSession[],
+    deadlineMs: number,
+  ): Promise<{ sessions: Set<DaemonSession>; workers: ChildProcess[] }> => {
+    const sessions = new Set<DaemonSession>();
+    const workers: ChildProcess[] = [];
+    const nowMs = Date.now();
+    const idle = candidates.filter(ds => isIdleForReleaseDetach(ds, nowMs, REMOTE_HANDOFF_IDLE_DETACH_MS));
+    if (idle.length === 0) return { sessions, workers };
+    // Leave the second half of the budget to the handoff of the active rest.
+    const detachDeadlineMs = nowMs + Math.max(0, (deadlineMs - nowMs) / 2);
+    let next = 0;
+    const retireOne = async (ds: DaemonSession): Promise<void> => {
+      const tag = ds.session.sessionId.slice(0, 8);
+      const runtime = durablePrimaryRuntimeByApp.get(ds.larkAppId);
+      const remaining = detachDeadlineMs - Date.now();
+      if (!runtime || remaining < 2_000) return;
+      const worker = ds.worker && !ds.worker.killed ? ds.worker : null;
+      let retiredWorker: ChildProcess | undefined;
+      if (worker) {
+        const detached = await detachRemoteWorkerForShutdown(ds, {
+          drainTimeoutMs: Math.min(10_000, remaining),
+          abortTimeoutMs: Math.min(5_000, remaining),
+        });
+        if (!detached.ok) {
+          logger.info(`[${tag}] Idle remote session kept for handoff: detach refused (${detached.error})`);
+          return;
+        }
+        retiredWorker = detached.worker ?? worker;
+      }
+      const snapshot = await commitDurableLarkRemoteSnapshot({ facade: runtime.session, session: ds.session })
+        .catch((error: unknown) => ({ kind: 'error' as const, reason: String(error) }));
+      if (snapshot.kind !== 'committed' && snapshot.kind !== 'unchanged') {
+        if (!worker) {
+          // Nothing local to fall back on: hand it off as before.
+          logger.warn(`[${tag}] Idle remote snapshot not committed (${snapshot.kind}); handing off`);
+          return;
+        }
+        // The worker is already retired. The runner state on shared storage
+        // still carries the full lineage and a successor accepts a lagging
+        // Host record (Mew #101), so retirement stands.
+        logger.warn(`[${tag}] Idle remote snapshot not committed to canonical (${snapshot.kind}${
+          'reason' in snapshot ? `: ${snapshot.reason}` : ''})`);
+      }
+      const canonicalKey = sessionKey(storedSessionAnchorId(ds.session), ds.larkAppId);
+      const released = await runtime.session.releaseLease(canonicalKey);
+      sessions.add(ds);
+      if (retiredWorker) workers.push(retiredWorker);
+      logger.info(`[${tag}] Idle remote session retired at shutdown without handoff (lease released=${released})`);
+    };
+    // Bounded fan-out: each detach is one control round trip with the runner.
+    await Promise.all(Array.from({ length: Math.min(8, idle.length) }, async () => {
+      while (next < idle.length) {
+        const ds = idle[next++]!;
+        try { await retireOne(ds); }
+        catch (error) {
+          logger.warn(`[${ds.session.sessionId.slice(0, 8)}] Idle remote retirement failed; handing off: ${error}`);
+        }
+      }
+    }));
+    logger.info(`[durable-primary] shutdown: ${sessions.size}/${idle.length} idle remote session(s) retired without handoff`);
+    return { sessions, workers };
+  };
+
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
@@ -33674,7 +33746,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!coordinationStore) {
         throw new Error('Remote shutdown handoff has no durable coordination store');
       }
-      const handoffPlans = remoteCandidates.map(ds => {
+      // Idle sessions are not handed over: the successor would relaunch a
+      // worker and runner that just sit there until the next release does it
+      // again (Mew #43). Retire them with their lineage committed and let the
+      // next message take them over, as after a Pod crash. Anything that does
+      // not detach cleanly is handed off as before.
+      const idleDetached = await detachIdleRemoteSessionsForRelease(
+        remoteCandidates,
+        shutdownDeadlineMs,
+      );
+      remoteRetiredWorkers.push(...idleDetached.workers);
+      const handoffPlans = remoteCandidates.filter(ds => !idleDetached.sessions.has(ds)).map(ds => {
         const runtime = durablePrimaryRuntimeByApp.get(ds.larkAppId);
         if (!runtime) {
           throw new Error(`Remote shutdown handoff has no primary runtime for ${ds.larkAppId}`);
