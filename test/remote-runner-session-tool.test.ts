@@ -9,6 +9,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES } from '../src/adapters/backend/remote-runner-protocol.js';
 import {
   remoteRunnerSessionToolArgs,
   runRemoteRunnerSessionTool,
@@ -199,6 +200,64 @@ process.stdout.write(JSON.stringify({
     expect(JSON.parse(result.outcome === 'completed' ? result.stdout : '')).toMatchObject({
       attachments: [{ path: 'botmux-session-tool://attachment/0' }],
     });
+  });
+
+  it('keeps the quoted text and the fitting attachments when one exceeds the transfer limit', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-session-tool-oversized-test-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const attachmentDir = join(dataDir, 'attachments', 'cli_test', 'om_test');
+    mkdirSync(attachmentDir, { recursive: true });
+    const photo = join(attachmentDir, 'photo.jpg');
+    const oversizedBytes = MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES + 1;
+    writeFileSync(photo, Buffer.alloc(oversizedBytes, 1));
+    const chart = join(attachmentDir, 'chart.png');
+    writeFileSync(chart, 'image-bytes');
+    const fixture = join(root, 'fixture.mjs');
+    writeFileSync(fixture, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  messageId: 'om_test',
+  text: 'please look at both',
+  attachments: [
+    { type: 'image', name: 'photo.jpg', path: ${JSON.stringify(photo)}, mimeType: 'image/jpeg' },
+    { type: 'image', name: 'chart.png', path: ${JSON.stringify(chart)}, mimeType: 'image/png' },
+  ],
+}) + '\\n');
+`);
+    chmodSync(fixture, 0o755);
+
+    const result = await runRemoteRunnerSessionTool({
+      tool: 'quoted',
+      messageId: 'om_test',
+    }, {
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      chatId: 'oc_current',
+      cliPath: fixture,
+      env: { PATH: process.env.PATH, SESSION_DATA_DIR: dataDir },
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      exitCode: 0,
+      attachments: [{
+        placeholder: 'botmux-session-tool://attachment/0',
+        name: 'chart.png',
+        dataBase64: Buffer.from('image-bytes').toString('base64'),
+      }],
+    });
+    const stdout = result.outcome === 'completed' ? result.stdout : '';
+    expect(stdout).not.toContain(attachmentDir);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.text).toBe('please look at both');
+    expect(parsed.attachments[0]).toMatchObject({
+      name: 'photo.jpg',
+      unavailable: 'exceeds_remote_transfer_limit',
+      sizeBytes: oversizedBytes,
+    });
+    expect(parsed.attachments[0].path).toBeUndefined();
+    expect(parsed.attachments[0].transferLimitBytes).toBeLessThan(oversizedBytes);
+    expect(parsed.attachments[1]).toMatchObject({ path: 'botmux-session-tool://attachment/0' });
   });
 
   it('rejects quoted attachment paths outside the BotMux attachment root', async () => {
