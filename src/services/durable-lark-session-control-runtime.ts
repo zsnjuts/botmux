@@ -18,7 +18,6 @@ import type {
 import { createDurableSessionControlDispatch } from './durable-session-control-dispatch.js';
 import {
   DurableActiveTakeoverUnsupportedError,
-  DurableSessionControlDeferredError,
   DurableSessionControlOwnerHandoffError,
 } from './durable-session-control-errors.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
@@ -56,6 +55,15 @@ const TERMINAL_RESUME_REFUSALS = new Set([
   'resume_cancelled',
 ]);
 const TRUSTED_HANDOFF_HORIZON_MS = 5 * 60_000;
+
+/**
+ * A control can briefly precede its canonical Session: the stream card goes
+ * out while admission is still committing. A canonical Session still missing
+ * this long after the control was written was never admitted or has been
+ * removed, so the control can never apply; retrying it forever only floods the
+ * log and holds its FIFO partition (Mew #109).
+ */
+const CANONICAL_SESSION_ADMISSION_HORIZON_MS = 5 * 60_000;
 
 /**
  * A display toggle that keeps failing to reach its target mode (for example on
@@ -335,7 +343,31 @@ export function createDurableLarkSessionControlRuntime(
       ? parseDurablePrimarySessionRecord(canonical).session
       : undefined;
     if (!canonicalSession || canonicalSession.larkAppId !== options.larkAppId) {
-      throw new Error('durable lifecycle control canonical Session is unavailable');
+      if (now() - context.claim.event.createdAt < CANONICAL_SESSION_ADMISSION_HORIZON_MS) {
+        throw new Error('durable lifecycle control canonical Session is unavailable');
+      }
+      const reason = 'canonical Session does not exist';
+      return {
+        kind: 'ignored',
+        reason,
+        settleExistingOperation: {
+          result: {
+            version: 1,
+            type: 'botmux.lark.session-control-result',
+            action: control.action,
+            status: 'missing',
+            applied: false,
+            ignored: true,
+            reason,
+          } as unknown as DurableJson,
+          evidence: {
+            source: 'canonical-session',
+            action: control.action,
+            status: 'missing',
+            reason,
+          } as unknown as DurableJson,
+        },
+      };
     }
     const terminalIgnore = (reason: string) => ({
       kind: 'ignored' as const,
@@ -474,9 +506,11 @@ export function createDurableLarkSessionControlRuntime(
         persisted = options.getPersistedSession(control.sessionId);
       }
       if (live) {
-        throw new DurableSessionControlDeferredError(
-          'canonical Session still has a local runtime owner',
-        );
+        // A live owner on this replica is serving the Session, so it is not
+        // an orphan. Deferring would wait for an owner that may never retire
+        // while every scan epoch queues another control behind this one (Mew
+        // #111). Once the owner does retire, the next scan proves it afresh.
+        return terminalIgnore('orphan control found a live local runtime owner');
       }
     }
     if (control.action === 'toggle_display' && !live) {
