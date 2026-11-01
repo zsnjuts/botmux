@@ -44,6 +44,7 @@ export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
   'session_tool',
   'session_tool_schedule',
   'session_tool_schedule_actor',
+  'session_tool_attachment_files',
 ] as const;
 
 /** Optional recovery of a provider-owned turn that survived the host process. */
@@ -91,6 +92,7 @@ export const REMOTE_RUNNER_HOST_OPTIONAL_CAPABILITIES = [
   'orphan_reconciliation_turn_inflight',
   'startup_progress',
   'final_ack',
+  'session_tool_attachment_files',
 ] as const;
 
 export interface RemoteRunnerPendingFinal {
@@ -363,12 +365,38 @@ export interface RemoteRunnerSessionToolOperation {
   controllerOpenId?: string;
 }
 
-export interface RemoteRunnerSessionToolAttachment {
+interface RemoteRunnerSessionToolAttachmentBase {
   placeholder: string;
   name: string;
   type: 'image' | 'file';
   mimeType?: string;
+}
+
+/** Inline transfer: bytes travel inside the session_tool_result line. */
+export interface RemoteRunnerSessionToolInlineAttachment extends RemoteRunnerSessionToolAttachmentBase {
   dataBase64: string;
+}
+
+/** `session_tool_attachment_files`: the Runner runs on the same host, so the
+ * daemon hands over only a description of a file below its attachment root.
+ * The Runner re-validates the path, size and digest, then uploads the file
+ * into the sandbox itself (large files never enter the protocol line). */
+export interface RemoteRunnerSessionToolHostFileAttachment extends RemoteRunnerSessionToolAttachmentBase {
+  hostFile: {
+    /** Relative to `<SESSION_DATA_DIR>/attachments`, `/`-separated. */
+    path: string;
+    sizeBytes: number;
+    sha256: string;
+  };
+}
+
+export type RemoteRunnerSessionToolAttachment =
+  | RemoteRunnerSessionToolInlineAttachment
+  | RemoteRunnerSessionToolHostFileAttachment;
+
+/** How the host may return quoted attachments to the current provider. */
+export interface RemoteRunnerSessionToolHostCapabilities {
+  attachmentTransfer: 'inline' | 'host_file';
 }
 
 export type RemoteRunnerSessionToolResult =
@@ -583,6 +611,8 @@ export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGES = 4;
 export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES = 2 * 1024 * 1024;
 export const MAX_REMOTE_RUNNER_SESSION_TOOL_TEXT_BYTES = 512 * 1024;
 export const MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES = 512 * 1024;
+export const MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+export const MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENTS_TOTAL_BYTES = 100 * 1024 * 1024;
 const SENSITIVE_STATE_KEY_PARTS = [
   'token',
   'secret',

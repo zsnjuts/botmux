@@ -32,6 +32,7 @@ import {
   type RemoteRunnerOrphanVerdict,
   type RemoteRunnerPendingFinal,
   type RemoteRunnerRecoveredTurn,
+  type RemoteRunnerSessionToolHostCapabilities,
   type RemoteRunnerSessionToolOperation,
   type RemoteRunnerSessionToolResult,
   type RemoteRunnerUsageReport,
@@ -183,7 +184,10 @@ export class RemoteRunnerBackend implements SessionBackend {
     message: RemoteRunnerOutboundMessage,
     hostContext: RemoteRunnerTurnHostContext,
   ) => Promise<RemoteRunnerOutboundMessageResult>) | null = null;
-  private sessionToolCb: ((operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>) | null = null;
+  private sessionToolCb: ((
+    operation: RemoteRunnerSessionToolOperation,
+    host: RemoteRunnerSessionToolHostCapabilities,
+  ) => Promise<RemoteRunnerSessionToolResult>) | null = null;
   private readyCb: (() => void) | null = null;
   private stateCb: ((state: RemoteRunnerBackendState) => void) | null = null;
   private usageCb: ((usage: RemoteRunnerUsageReport) => void) | null = null;
@@ -605,7 +609,10 @@ export class RemoteRunnerBackend implements SessionBackend {
     ) => Promise<RemoteRunnerOutboundMessageResult>,
   ): void { this.outboundMessageCb = cb; }
   onSessionTool(
-    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+    cb: (
+      operation: RemoteRunnerSessionToolOperation,
+      host: RemoteRunnerSessionToolHostCapabilities,
+    ) => Promise<RemoteRunnerSessionToolResult>,
   ): void { this.sessionToolCb = cb; }
   onReady(cb: () => void): void {
     this.readyCb = cb;
@@ -1320,7 +1327,11 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.sessionToolOperationCount++;
       const callback = this.sessionToolCb;
       result = callback
-        ? Promise.resolve().then(() => callback(operation)).catch((error): RemoteRunnerSessionToolResult => ({
+        ? Promise.resolve().then(() => callback(operation, {
+            attachmentTransfer: this.providerCapabilities.has('session_tool_attachment_files')
+              ? 'host_file'
+              : 'inline',
+          })).catch((error): RemoteRunnerSessionToolResult => ({
             outcome: 'unknown',
             code: 'session_tool_execution_unknown',
             message: (error instanceof Error ? error.message : String(error)).slice(0, 4096)
