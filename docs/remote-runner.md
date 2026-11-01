@@ -205,7 +205,7 @@ Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Act
 当前 allowlist：
 
 - `history`：`limit` 限制为 `1..100`，`scope` 只允许 `session|thread|chat|ambient`，可选 `withCardJson`。
-- `quoted`：只接受合法 `om_` message id 和可选 `raw`；下载的附件经宿主 attachments 根校验后，以最多 8 个、合计最多 512 KiB 的有界 payload 回传。
+- `quoted`：只接受合法 `om_` message id 和可选 `raw`；下载的附件经宿主 attachments 根校验后，以最多 8 个、合计最多 512 KiB 的有界 payload 回传（协商 `session_tool_attachment_files` 后改为只传 Host 文件描述，见下文「可选 Host 文件附件」）。
 - `bots.list`：固定为当前群 `chat` scope，不开放跨团队发现或邀请。
 - `skill.list|show|read|resources`：沿用当前 Session 的 skill manifest 和内置技能；resource path 必须是无 `.` / `..` 的安全相对路径。
 - `schedule.list`：宿主强制附带当前 Session 的 Chat 过滤，不允许枚举其他群的任务。
@@ -248,6 +248,31 @@ Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Act
 ```
 
 `completed` 保留 CLI 的确定性 `exitCode/stdout/stderr`；宿主执行器启动失败、超时或无法证明结果时返回 `unknown`，安全门禁拒绝则返回 `rejected`。同一 turn 最多执行 30 个不同 operation；同 operation id 同 payload 复用首次结果，不同 payload 被拒绝。`turnId`、`generation` 和成功 `final` 的结算顺序与 `outbound_message` 使用同一套 fencing。
+
+#### 可选 Host 文件附件
+
+`quoted` 的附件缺省以 `dataBase64` 内联在 `session_tool_result` 里，stdout 中对应附件的 `path` 是占位符 `botmux-session-tool://attachment/N`；超过合计 512 KiB 的附件去掉 `path`，标 `unavailable: "exceeds_remote_transfer_limit"`、`sizeBytes` 和 `transferLimitBytes`，正文照常返回。
+
+与 BotMux 跑在同一台主机上的 provider 可以改为自己读文件：BotMux 在 hello 的 `optionalCapabilities` 里列出 `session_tool_attachment_files`，provider hello 也声明它之后，附件改为只给描述：
+
+```json
+{
+  "placeholder": "botmux-session-tool://attachment/0",
+  "name": "photo.jpg",
+  "type": "image",
+  "mimeType": "image/jpeg",
+  "hostFile": {
+    "path": "cli_app/om_message/photo.jpg",
+    "sizeBytes": 4194304,
+    "sha256": "<64 位小写十六进制>"
+  }
+}
+```
+
+- `hostFile.path` 相对 `<SESSION_DATA_DIR>/attachments`，以 `/` 分隔，不含绝对路径或 `..`。provider 必须自己复核：从该根目录逐级不跟随软链打开、确认是普通文件、大小和 sha256 与描述一致，再把文件交给 agent，并把 stdout 里的占位符换成 agent 可读的路径。
+- 单个附件最多 50 MiB、每次合计最多 100 MiB；超限沿用上面的 `unavailable` 标注，`transferLimitBytes` 写实际超过的那个上限。一次结果里的附件全部是同一种形态，不混用内联和 Host 文件。
+- provider 复核或转交失败时，应只把该附件标为不可用、正文照常交给 agent，不要让整次调用失败。
+- 双方任一方不声明时都走内联路径，行为与之前一致。
 
 ### 可选运行用量
 

@@ -198,7 +198,9 @@ function quotedAttachments(
       delete item.path;
       item.unavailable = 'exceeds_remote_transfer_limit';
       item.sizeBytes = info.size;
-      item.transferLimitBytes = Math.min(perAttachmentLimit, totalLimit);
+      // Name the limit that was actually exceeded: with host files a 40 MiB
+      // attachment fits the per-file limit but can still overflow the total.
+      item.transferLimitBytes = info.size > perAttachmentLimit ? perAttachmentLimit : totalLimit;
       continue;
     }
     totalBytes += info.size;
