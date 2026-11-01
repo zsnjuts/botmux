@@ -50,6 +50,16 @@ let authorityUnavailable: string | null = null;
  * every replica claims each due run there before executing it. */
 let durableAuthority: DurableScheduleAuthority | null = null;
 let durableTickInFlight = false;
+/** Durable primary mode: where the Session a due run continues is live from
+ * this replica's point of view. `none` means the run has no existing Session
+ * to continue (a fresh topic, or no anchor yet). */
+export type DurableSessionAffinity = 'local' | 'not_local' | 'none';
+let durableSessionAffinity: ((task: ScheduledTask) => DurableSessionAffinity) | null = null;
+/** How long a replica without the target Session's live worker leaves a due
+ * run to the replica that has it. More than one tick, so that replica gets at
+ * least one chance; well under MIN_GRACE_SECONDS, so no replica fast-forwards
+ * the occurrence meanwhile. */
+const DURABLE_SESSION_AFFINITY_MS = 45_000;
 
 /** Installed only in daemon processes. CLI processes keep using the JSON
  * projection for display, but all daemon execution/mutation uses SQLite. */
@@ -68,6 +78,14 @@ export function setScheduleAuthorityUnavailable(error: unknown): void {
 export function setDurableScheduleAuthority(authority: DurableScheduleAuthority | null): void {
   durableAuthority = authority;
   durableTickInFlight = false;
+}
+
+/** Durable primary mode only: lets the scheduler prefer the replica that
+ * already runs the target Session (Mew #38). */
+export function setDurableSessionAffinity(
+  affinity: ((task: ScheduledTask) => DurableSessionAffinity) | null,
+): void {
+  durableSessionAffinity = affinity;
 }
 
 export function isDurableScheduleAuthorityActive(): boolean {
@@ -853,6 +871,17 @@ async function runTick(durable?: DurableTickContext): Promise<void> {
 
     const nextMs = new Date(nextRunAt).getTime();
     if (nextMs > now) continue;
+
+    // Any replica can win the durable claim, but a run that continues an
+    // existing Session should land where that Session's worker lives: from any
+    // other replica it would have to take the Session over first. Leave the
+    // run to that replica for one more tick before claiming it here.
+    if (durable && !task.manualRunRequested && now - nextMs < DURABLE_SESSION_AFFINITY_MS) {
+      let affinity: DurableSessionAffinity = 'none';
+      try { affinity = durableSessionAffinity?.(task) ?? 'none'; }
+      catch (error) { logger.warn(`[scheduler] Session affinity of task ${task.id} unavailable: ${String(error)}`); }
+      if (affinity === 'not_local') continue;
+    }
 
     // Fast-forward stale automatic occurrences. A durable manual request must
     // reach claimRun, which consumes it, instead of leaking into a future tick.

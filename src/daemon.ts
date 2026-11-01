@@ -558,6 +558,7 @@ import {
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
+  resolveScheduledTaskExecutionPosition,
   persistStreamCardState,
   rememberLastCliInput,
   ensureTerminalWorkerPort,
@@ -30814,6 +30815,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     scheduleStore.replaceAuthoritativeProjection(authoritativeTasks, cfg.larkAppId);
     scheduler.setScheduleAuthorityStore(scheduleAuthorityStore);
     scheduler.setDurableScheduleAuthority(durableScheduleAuthority ?? null);
+    scheduler.setDurableSessionAffinity(durableScheduleAuthority
+      ? task => {
+          // Mirrors executeScheduledTask's anchor: a topic / dedicated-topic
+          // task continues its root, a silent top-level task the chat Session;
+          // other positions open a fresh topic on every fire.
+          const position = resolveScheduledTaskExecutionPosition(task);
+          const anchor = position === 'topic'
+            ? task.rootMessageId
+            : position === 'top-level' && task.silent === true ? task.chatId : undefined;
+          if (!anchor) return 'none';
+          const ds = activeSessions.get(sessionKey(anchor, task.larkAppId ?? cfg.larkAppId));
+          return ds?.worker && !ds.worker.killed ? 'local' : 'not_local';
+        }
+      : null);
     setScheduledSelfCleanupReceiptHandler(request => {
       if (!scheduleAuthorityStore) return false;
       const receipt: ScheduleSelfCleanupReceipt = {
@@ -30858,6 +30873,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     void durableScheduleAuthority?.stop(0).catch(() => undefined);
     durableScheduleAuthority = undefined;
     scheduler.setDurableScheduleAuthority(null);
+    scheduler.setDurableSessionAffinity(null);
     try { scheduleAuthorityStore?.close(); } catch { /* no-op */ }
     scheduleAuthorityStore = null;
     setScheduledSelfCleanupReceiptHandler(null);
