@@ -54,6 +54,23 @@ export interface DurableOutboxPumpOptions {
   onDelivered?: (record: DurableOutboxRecord) => void;
   onRetry?: (record: DurableOutboxRecord) => void;
   onAmbiguous?: (record: DurableOutboxRecord) => void;
+  /**
+   * Mew #35: an ambiguous row is otherwise terminal and fences every later row
+   * of its Session forever. Once it has been the Session head for
+   * `minAmbiguousAgeMs`, the call site decides: `retry` requeues it for the
+   * normal FIFO (only when the target is provably idempotent, e.g. the same
+   * provider UUID is still in its dedupe window), `abandon` settles it with an
+   * abandoned receipt so later rows can flow. Without this callback ambiguous
+   * rows are left untouched.
+   */
+  reconcileAmbiguous?: (
+    record: DurableOutboxRecord,
+    now: number,
+  ) => { kind: 'retry' } | { kind: 'abandon'; reason: string };
+  ambiguousIntervalMs?: number;
+  minAmbiguousAgeMs?: number;
+  onRequeued?: (record: DurableOutboxRecord) => void;
+  onAbandoned?: (record: DurableOutboxRecord) => void;
   onLateResult?: (attempt: OutboxAttempt, result: DurableOutboxDeliveryResult | Error) => void;
   onError?: (error: unknown) => void;
 }
@@ -128,12 +145,26 @@ export function startDurableOutboxPump(options: DurableOutboxPumpOptions): Durab
   const concurrency = boundedInteger(options.concurrency ?? 4, 'concurrency', 1, 32);
   const batchSize = boundedInteger(options.batchSize ?? 32, 'batchSize', 1, 1_000);
   const shutdownMs = boundedInteger(options.shutdownMs ?? 5_000, 'shutdownMs', 0, 300_000);
+  const ambiguousIntervalMs = boundedInteger(
+    options.ambiguousIntervalMs ?? 30_000,
+    'ambiguousIntervalMs',
+    10,
+    3_600_000,
+  );
+  const minAmbiguousAgeMs = boundedInteger(
+    options.minAmbiguousAgeMs ?? 120_000,
+    'minAmbiguousAgeMs',
+    0,
+    86_400_000,
+  );
   const now = options.now ?? Date.now;
   const slots: Slot[] = Array.from({ length: concurrency }, (_, index) => ({ index }));
   const controllers = new Set<AbortController>();
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
   let stopPromise: Promise<DurableOutboxPumpStopResult> | undefined;
+  let ambiguousRunning: Promise<void> | undefined;
+  let nextAmbiguousScanAt = 0;
 
   const reportError = (error: unknown): void => {
     try { options.onError?.(error); } catch { /* observers cannot alter attempt state */ }
@@ -285,6 +316,85 @@ export function startDurableOutboxPump(options: DurableOutboxPumpOptions): Durab
     }
   };
 
+  const reconcileAmbiguousRows = async (): Promise<void> => {
+    const reconcile = options.reconcileAmbiguous;
+    const reserve = options.store.reserveAmbiguousOutbox?.bind(options.store);
+    const requeue = options.store.requeueAmbiguousOutbox?.bind(options.store);
+    const abandon = options.store.abandonAmbiguousOutbox?.bind(options.store);
+    if (!reconcile || !reserve || !requeue || !abandon) return;
+    const ambiguousWorkerId = `${workerId}:ambiguous`;
+    for (let index = 0; index < batchSize && !stopped; index++) {
+      let reservation;
+      try {
+        reservation = await reserve({
+          workerId: ambiguousWorkerId,
+          leaseDurationMs: reservationLeaseMs,
+          minAmbiguousAgeMs,
+        });
+      } catch (error) {
+        reportError(error);
+        return;
+      }
+      if (!reservation) return;
+      if (reservation.workerId !== ambiguousWorkerId) {
+        reportError(new Error(
+          `durable outbox provider returned an ambiguous reservation owned by ${reservation.workerId}`,
+        ));
+        return;
+      }
+      let decision: ReturnType<NonNullable<typeof options.reconcileAmbiguous>>;
+      try {
+        decision = reconcile(reservation.record, now());
+      } catch (error) {
+        decision = {
+          kind: 'abandon',
+          reason: `ambiguous reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      // A failed settle leaves the row ambiguous; it is reclaimed after the
+      // claim expires, never resent by the normal FIFO without a decision.
+      try {
+        if (decision.kind === 'retry') {
+          const mutation = await requeue({
+            reservation,
+            error: 'ambiguous delivery requeued within the target idempotency window',
+          });
+          if (mutation.kind === 'stale') {
+            reportError(new Error(`durable outbox requeue lost reservation ${reservation.record.messageId}`));
+          } else {
+            observe(options.onRequeued, mutation.record, 'requeue');
+          }
+          continue;
+        }
+        const mutation = await abandon({
+          reservation,
+          error: boundedText(decision.reason, 'abandon reason'),
+          receipt: {
+            kind: 'abandoned',
+            reason: decision.reason,
+            attempts: reservation.record.attempts,
+            ...(reservation.record.lastError ? { lastError: reservation.record.lastError } : {}),
+          },
+        });
+        if (mutation.kind === 'stale') {
+          reportError(new Error(`durable outbox abandon lost reservation ${reservation.record.messageId}`));
+        } else {
+          observe(options.onAbandoned, mutation.record, 'abandon');
+        }
+      } catch (error) {
+        reportError(error);
+      }
+    }
+  };
+
+  const startAmbiguousReconciliation = (): void => {
+    if (ambiguousRunning || stopped || now() < nextAmbiguousScanAt) return;
+    nextAmbiguousScanAt = now() + ambiguousIntervalMs;
+    ambiguousRunning = reconcileAmbiguousRows()
+      .catch(reportError)
+      .finally(() => { ambiguousRunning = undefined; });
+  };
+
   const startSlot = (slot: Slot): Promise<void> => {
     if (slot.running) return slot.running;
     slot.running = drainSlot(slot).finally(() => { slot.running = undefined; });
@@ -293,6 +403,9 @@ export function startDurableOutboxPump(options: DurableOutboxPumpOptions): Durab
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
+    // Runs beside the slots: a re-attempt may take a full attempt timeout and
+    // must not hold back ordinary deliveries.
+    startAmbiguousReconciliation();
     await Promise.all(slots.map(startSlot));
   };
 
@@ -324,7 +437,10 @@ export function startDurableOutboxPump(options: DurableOutboxPumpOptions): Durab
       timer = undefined;
       const budget = boundedInteger(timeoutMs, 'timeoutMs', 0, 300_000);
       stopPromise = (async () => {
-        const running = slots.flatMap(slot => slot.running ? [slot.running] : []);
+        const running = [
+          ...slots.flatMap(slot => slot.running ? [slot.running] : []),
+          ...(ambiguousRunning ? [ambiguousRunning] : []),
+        ];
         if (running.length === 0) return { kind: 'stopped', inFlight: 0 };
         if (budget === 0) {
           for (const controller of controllers) {

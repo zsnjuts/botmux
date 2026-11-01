@@ -8,6 +8,7 @@ import {
   durableLarkOutboxMessage,
   LARK_OUTBOX_IDEMPOTENCY_TTL_MS,
   parseDurableLarkOutboxRecord,
+  reconcileAmbiguousLarkOutbox,
 } from '../src/services/durable-lark-outbox.js';
 import { startDurableOutboxPump } from '../src/services/durable-outbox-pump.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
@@ -73,6 +74,36 @@ function deps() {
 }
 
 describe('durable Lark outbox adapter', () => {
+  it('re-attempts an ambiguous send only while Lark still dedupes its provider UUID', () => {
+    // Mew #35: a stuck ambiguous row must either be safely re-sent or released.
+    const sent = row({ createdAt: 1_000 });
+    expect(reconcileAmbiguousLarkOutbox(sent, 1_000 + LARK_OUTBOX_IDEMPOTENCY_TTL_MS / 2)).toEqual({ kind: 'retry' });
+    expect(reconcileAmbiguousLarkOutbox(sent, 1_000 + LARK_OUTBOX_IDEMPOTENCY_TTL_MS)).toMatchObject({
+      kind: 'abandon',
+      reason: expect.stringContaining('dedupe window'),
+    });
+    const reply = row({ target: { kind: 'reply', messageId: 'om_parent', replyInThread: true } });
+    expect(reconcileAmbiguousLarkOutbox(reply, 1_000 + LARK_OUTBOX_IDEMPOTENCY_TTL_MS)).toMatchObject({ kind: 'abandon' });
+  });
+
+  it('always re-applies an idempotent card patch and abandons an unparseable row', () => {
+    const update = row({ target: { kind: 'update', messageId: 'om_card' } });
+    expect(reconcileAmbiguousLarkOutbox(update, 1_000 + 10 * LARK_OUTBOX_IDEMPOTENCY_TTL_MS)).toEqual({ kind: 'retry' });
+    // A terminal update may fall back to a fresh reply, which is UUID-deduped too.
+    const withFallback = row({
+      target: { kind: 'update', messageId: 'om_card' },
+      terminalUpdateFallback: {
+        target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+        providerUuid: 'fallback_0123456789abcdef0123456789abcdef',
+      },
+    });
+    expect(reconcileAmbiguousLarkOutbox(withFallback, 1_000 + LARK_OUTBOX_IDEMPOTENCY_TTL_MS)).toMatchObject({ kind: 'abandon' });
+    expect(reconcileAmbiguousLarkOutbox({ ...row(), payload: { broken: true } }, 2_000)).toMatchObject({
+      kind: 'abandon',
+      reason: expect.stringContaining('invalid durable Lark payload'),
+    });
+  });
+
   it('builds and revalidates a frozen provider identity', () => {
     const record = row({
       target: { kind: 'reply', messageId: 'om_parent', replyInThread: true },

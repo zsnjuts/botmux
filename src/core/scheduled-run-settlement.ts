@@ -202,6 +202,12 @@ export function revokeScheduledRunSettlements(
   return revoked;
 }
 
+/** Upper bound for one scheduled run, including time queued behind an active
+ * turn. A run that never produces terminal evidence (Mew #39: a turn the worker
+ * dropped without a terminal) would otherwise stay `running` until the next
+ * daemon restart, and the scheduler refuses every later fire while it does. */
+export const SCHEDULED_RUN_SETTLEMENT_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+
 /** Register before dispatch, then keep the scheduler callback pending until the
  * exact turn produces its required terminal evidence. */
 export async function executeScheduledRunAwaitingSettlement(
@@ -211,10 +217,19 @@ export async function executeScheduledRunAwaitingSettlement(
     larkAppId?: string;
     requireFinalDelivery: boolean;
     authorityIsCurrent?: () => boolean;
+    settlementTimeoutMs?: number;
   },
   dispatch: () => void | Promise<void>,
 ): Promise<{ messageId?: string }> {
   const settlement = beginScheduledRunSettlement(input);
+  const timeoutMs = input.settlementTimeoutMs ?? SCHEDULED_RUN_SETTLEMENT_TIMEOUT_MS;
+  const timer = setTimeout(() => {
+    abortScheduledRunSettlement(input.turnId, settlementError(
+      input.turnId,
+      `no terminal evidence within ${Math.round(timeoutMs / 60_000)} minutes`,
+    ));
+  }, timeoutMs);
+  timer.unref?.();
   try {
     await dispatch();
     return await settlement.settled;
@@ -227,6 +242,8 @@ export async function executeScheduledRunAwaitingSettlement(
     // consumer or Node can surface an unhandled rejection in the daemon.
     await settlement.settled.catch(() => undefined);
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

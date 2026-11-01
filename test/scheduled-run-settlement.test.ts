@@ -111,6 +111,62 @@ describe('scheduled run settlement', () => {
     await expect(execution).resolves.toEqual({ messageId: 'om_receipt' });
   });
 
+  it('errors a run that never produces terminal evidence instead of leaving it running', async () => {
+    // Mew #39: a turn the worker dropped without a terminal kept the task
+    // `running` until the next restart, and every later fire was refused.
+    vi.useFakeTimers();
+    try {
+      const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000009';
+      let settled = false;
+      let failure: unknown;
+      // Capture the outcome with plain handlers: `expect(...).rejects` waits on
+      // the (faked) timer queue under bun test and never returns.
+      const execution = executeScheduledRunAwaitingSettlement({
+        turnId,
+        taskId: 'deadbeef',
+        requireFinalDelivery: true,
+        settlementTimeoutMs: 60_000,
+      }, async () => undefined).then(
+        () => { settled = true; },
+        error => { failure = error; settled = true; },
+      );
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await execution;
+      expect(String(failure)).toMatch(/no terminal evidence/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not time out a run that settles first', async () => {
+    vi.useFakeTimers();
+    try {
+      const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-00000000000b';
+      const execution = executeScheduledRunAwaitingSettlement({
+        turnId,
+        taskId: 'deadbeef',
+        requireFinalDelivery: true,
+        settlementTimeoutMs: 60_000,
+      }, async () => undefined);
+      await vi.advanceTimersByTimeAsync(1_000);
+      observeScheduledRunProviderReadbackDelivery(turnId, 'om_before_timeout');
+      expect(await execution).toEqual({ messageId: 'om_before_timeout' });
+      // Passing the deadline afterwards must not surface a late failure.
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        await vi.advanceTimersByTimeAsync(60_000);
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('consumes a terminal rejection when dispatch terminalizes before throwing', async () => {
     const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000006';
     const unhandled = vi.fn();

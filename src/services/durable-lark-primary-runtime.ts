@@ -1,4 +1,4 @@
-import type { DurableCoordinationStore, OutboxAttempt } from './durable-coordination.js';
+import type { DurableCoordinationStore, DurableOutboxRecord, OutboxAttempt } from './durable-coordination.js';
 import {
   createDurableLarkCanonicalDispatch,
   type DurableLarkCanonicalDispatchOptions,
@@ -25,6 +25,7 @@ import {
   type DurableOutboxPumpOptions,
   type DurableOutboxPumpStopResult,
 } from './durable-outbox-pump.js';
+import { reconcileAmbiguousLarkOutbox } from './durable-lark-outbox.js';
 import {
   createDurableSessionFacade,
   type DurableSessionFacade,
@@ -52,6 +53,10 @@ export interface DurableLarkPrimaryRuntimeOptions {
   onSessionLeaseLost?: (sessionKey: string, error: Error) => void;
   onInboxRetried?: (retry: DurableInboxPrimaryRetry) => void | Promise<void>;
   onInboxExhausted?: (exhausted: DurableInboxPrimaryExhausted) => void | Promise<void>;
+  /** An ambiguous outbox row was requeued inside its idempotency window (Mew #35). */
+  onOutboxRequeued?: (record: DurableOutboxRecord) => void;
+  /** An ambiguous outbox row could not be re-attempted and was abandoned (Mew #35). */
+  onOutboxAbandoned?: (record: DurableOutboxRecord) => void;
   onError?: (error: unknown) => void;
   ingressOwnerId?: string;
   inboxWorkerId?: string;
@@ -159,6 +164,9 @@ export function startDurableLarkPrimaryRuntime(
       ? {}
       : { attemptTimeoutMs: options.outboxAttemptTimeoutMs }),
     shutdownMs,
+    reconcileAmbiguous: reconcileAmbiguousLarkOutbox,
+    ...(options.onOutboxRequeued ? { onRequeued: options.onOutboxRequeued } : {}),
+    ...(options.onOutboxAbandoned ? { onAbandoned: options.onOutboxAbandoned } : {}),
     onError: reportError,
     onLateResult: (attempt: OutboxAttempt, result: DurableOutboxDeliveryResult | Error) => {
       // Timeout already committed ambiguous. Only an exact delivered receipt
