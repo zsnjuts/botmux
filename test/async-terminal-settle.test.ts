@@ -227,7 +227,30 @@ describe('stopActiveWorkerTurn', () => {
     await expect(pending).resolves.toEqual({ outcome: 'unconfirmed', turnId: 'turn-a' });
   });
 
-  it.each(['not_ready', 'no_active_turn', 'unknown'] as const)(
+  it('keeps waiting after an unknown receipt and reports the late Ctrl-C as stopped', async () => {
+    // Cold start: the runner answered the retried Ctrl-C after the worker
+    // deadline, and the turn was cancelled a few seconds later.
+    const ds = makeDs();
+    const pending = stopActiveWorkerTurn(ds, 5_000);
+    const sent = request(ds);
+    (ds.worker as any).emit('message', {
+      type: 'stop_active_turn_result', requestId: sent.requestId, outcome: 'unknown', turnId: 'turn-a',
+    });
+    (ds.worker as any).emit('message', terminal('turn-a', 'cancelled'));
+    await expect(pending).resolves.toEqual({ outcome: 'stopped', turnId: 'turn-a' });
+  });
+
+  it('stays unknown when an unknown receipt is followed by no terminal within the budget', async () => {
+    const ds = makeDs();
+    const pending = stopActiveWorkerTurn(ds, 50);
+    const sent = request(ds);
+    (ds.worker as any).emit('message', {
+      type: 'stop_active_turn_result', requestId: sent.requestId, outcome: 'unknown', turnId: 'turn-a',
+    });
+    await expect(pending).resolves.toEqual({ outcome: 'unknown', turnId: 'turn-a' });
+  });
+
+  it.each(['not_ready', 'no_active_turn'] as const)(
     'passes a %s receipt through without waiting',
     async outcome => {
       const ds = makeDs();

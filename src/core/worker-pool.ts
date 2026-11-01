@@ -11330,6 +11330,7 @@ export function stopActiveWorkerTurn(
   return new Promise(resolve => {
     let settled = false;
     let stoppingTurnId: string | undefined;
+    let receiptUnknown = false;
     const terminals = new Map<string, Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status']>();
     let lastTerminalTurnId: string | undefined;
     const finish = (result: ActiveTurnStopResult): void => {
@@ -11364,13 +11365,22 @@ export function stopActiveWorkerTurn(
         stoppingTurnId = msg.turnId;
         return;
       }
+      // An unknown receipt can still have pressed Ctrl-C: a cold start keeps
+      // the runner busy past the worker deadline and the late retry lands
+      // after it (taebuddy4 11-01: cancelled 3 s after the deadline). Keep
+      // waiting for that turn's terminal within the remaining budget.
+      if (msg.outcome === 'unknown' && msg.turnId) {
+        stoppingTurnId = msg.turnId;
+        receiptUnknown = true;
+        return;
+      }
       finish({
         outcome: msg.outcome === 'sent' ? 'unknown' : msg.outcome,
         ...(msg.turnId ? { turnId: msg.turnId } : {}),
       });
     };
     const unresolved = (): ActiveTurnStopResult => stoppingTurnId !== undefined
-      ? { outcome: 'unconfirmed', turnId: stoppingTurnId }
+      ? { outcome: receiptUnknown ? 'unknown' : 'unconfirmed', turnId: stoppingTurnId }
       : { outcome: 'unknown' };
     const onExit = (): void => finish(unresolved());
     const timer = setTimeout(() => finish(unresolved()), budgetMs);
