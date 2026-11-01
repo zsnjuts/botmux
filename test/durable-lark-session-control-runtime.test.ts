@@ -2752,6 +2752,70 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
+  it('settles a control whose canonical Session never appeared (Mew #109)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-missing-session-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'peer-owner' });
+    let clock = 2 + 60_000;
+    const takeOverActiveSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      takeOverActiveSession,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'not_local' }),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+      now: () => clock,
+    });
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    for (const input of [directControl('trusted-host', 'handoff'), control('close')]) {
+      clock = 2 + 60_000;
+      // Admission may still be committing: keep retrying for a while.
+      await expect(dispatch(input.control, {
+        claim: input.claim,
+        signal: new AbortController().signal,
+      })).rejects.toThrow('canonical Session is unavailable');
+
+      clock = 2 + 5 * 60_000;
+      await expect(runtime.resolve(input.control, {
+        claim: input.claim,
+        signal: new AbortController().signal,
+      })).resolves.toMatchObject({
+        kind: 'ignored',
+        reason: 'canonical Session does not exist',
+        settleExistingOperation: {
+          result: { action: input.control.action, status: 'missing', applied: false, ignored: true },
+        },
+      });
+      await expect(dispatch(input.control, {
+        claim: input.claim,
+        signal: new AbortController().signal,
+      })).resolves.toEqual({ kind: 'ignored', reason: 'canonical Session does not exist' });
+      expect(await store.readControlOperation(input.control.operationId)).toBeUndefined();
+    }
+    expect(takeOverActiveSession).not.toHaveBeenCalled();
+    await facade.stop();
+    await store.close();
+  });
+
   it('terminally ignores a control for a Session replaced at the same root', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-replaced-session-'));
     tempDirs.push(dir);
