@@ -928,14 +928,52 @@ export interface BackgroundWaitCardLabel {
 /** Remote Runner 已接到本轮、但 prompt 还没提交（provider 未回 busy）时所处的
  *  启动阶段，取值见 REMOTE_RUNNER_STARTUP_STAGES。starting 与 working 都可能带它：
  *  worker 把输入交给 Runner 就会报 working，而 Runner 可能还在建沙箱、启动 CLI，
- *  此时卡头显示「启动中 · 正在创建沙箱」，等 busy 后才显示「工作中」。 */
+ *  此时卡头显示「启动中 · 正在创建沙箱 · 12 秒」，等 busy 后才显示「工作中」。
+ *  `elapsedMs` 是当前阶段已持续的时长（不足 1 秒不显示）；`previous` 是同一轮里
+ *  上一个阶段及其耗时，只在它是 {@link REMOTE_RUNNER_STARTUP_STEPS} 之一时显示。 */
 export interface StartupStageCardLabel {
   startupStage: string;
+  elapsedMs?: number;
+  previous?: { stage: string; ms: number };
 }
 
-/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}、{@link BackgroundWaitCardLabel}
- *  或 {@link StartupStageCardLabel}。 */
-export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | StartupStageCardLabel;
+/** Remote Runner 本轮已被 provider 接受（busy）后已运行的时长；只在 working 时
+ *  生效，卡头显示「工作中 · 已运行 3 分 20 秒」（不足 1 秒仍是「工作中」）。 */
+export interface WorkingElapsedCardLabel {
+  workingElapsedMs: number;
+}
+
+/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}、{@link BackgroundWaitCardLabel}、
+ *  {@link StartupStageCardLabel} 或 {@link WorkingElapsedCardLabel}。 */
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | StartupStageCardLabel | WorkingElapsedCardLabel;
+
+/** 能以「上一步 X N 秒」出现的启动步骤：协议阶段，加上 worker 在提交 prompt 时
+ *  先报的占位阶段 `submitting`（它本身没有进行时文案，卡头显示通用「启动中」）。 */
+const REMOTE_RUNNER_STARTUP_STEPS: readonly string[] = [...REMOTE_RUNNER_STARTUP_STAGES, 'submitting'];
+
+/** 卡头计时文案：`12 秒` / `3 分 20 秒` / `12 分`（满 10 分钟不再显示秒）/
+ *  `1 小时 5 分`；英文 `12s` / `3m 20s` / `12m` / `1h 5m`。不足 1 秒为「不到 1 秒」。
+ *  计时心跳用它判断这一跳文案是否变化，没变就不 PATCH。 */
+export function formatElapsed(ms: number, locale?: Locale): string {
+  if (!Number.isFinite(ms) || ms < 1000) return t('card.elapsed.under_second', undefined, locale);
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 60) return t('card.elapsed.seconds', { s: totalSeconds }, locale);
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 10) {
+    return t('card.elapsed.minutes_seconds', { m: totalMinutes, s: totalSeconds % 60 }, locale);
+  }
+  if (totalMinutes < 60) return t('card.elapsed.minutes', { m: totalMinutes }, locale);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes === 0
+    ? t('card.elapsed.hours', { h: hours }, locale)
+    : t('card.elapsed.hours_minutes', { h: hours, m: minutes }, locale);
+}
+
+/** 当前阶段 / 本轮运行的计时是否值得显示：不足 1 秒（刚切阶段、刚接受）不显示。 */
+function visibleElapsed(ms: number | undefined, locale?: Locale): string | undefined {
+  return ms !== undefined && Number.isFinite(ms) && ms >= 1000 ? formatElapsed(ms, locale) : undefined;
+}
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
@@ -952,10 +990,40 @@ function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLa
 }
 
 /** Remote Runner 启动阶段；仅当标签是 {@link StartupStageCardLabel} 且状态为 starting/working 时有值。 */
-function startupStageOf(status: StreamStatus, label: boolean | StreamCardLabel | undefined): string | undefined {
+function startupStageOf(status: StreamStatus, label: boolean | StreamCardLabel | undefined): StartupStageCardLabel | undefined {
   if (status !== 'starting' && status !== 'working') return undefined;
   if (!label || typeof label !== 'object' || !('startupStage' in label)) return undefined;
-  return label.startupStage;
+  return label;
+}
+
+/** Remote Runner 本轮已运行时长；仅当标签是 {@link WorkingElapsedCardLabel} 且状态为 working 时有值。 */
+function workingElapsedOf(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
+  if (status !== 'working') return undefined;
+  if (!label || typeof label !== 'object' || !('workingElapsedMs' in label)) return undefined;
+  return label.workingElapsedMs;
+}
+
+/** 「启动中 · 正在初始化沙箱 · 12 秒」，切阶段时附「（上一步 创建沙箱 8 秒）」。
+ *  新版 provider 可能报出本版不认识的阶段，按通用「启动中」显示。 */
+function startupStatusLabel(label: StartupStageCardLabel, locale?: Locale): string {
+  const stage = (REMOTE_RUNNER_STARTUP_STAGES as readonly string[]).includes(label.startupStage)
+    ? t(`card.startup_stage.${label.startupStage}`, undefined, locale)
+    : undefined;
+  const elapsed = visibleElapsed(label.elapsedMs, locale);
+  const head = stage !== undefined
+    ? (elapsed !== undefined
+      ? t('card.status.starting_stage_elapsed', { stage, elapsed }, locale)
+      : t('card.status.starting_stage', { stage }, locale))
+    : (elapsed !== undefined
+      ? t('card.status.starting_elapsed', { elapsed }, locale)
+      : t('card.status.starting', undefined, locale));
+  const previous = label.previous;
+  if (!previous || !REMOTE_RUNNER_STARTUP_STEPS.includes(previous.stage)
+      || !Number.isFinite(previous.ms) || previous.ms < 0) return head;
+  return head + t('card.status.previous_step', {
+    step: t(`card.startup_step.${previous.stage}`, undefined, locale),
+    elapsed: formatElapsed(previous.ms, locale),
+  }, locale);
 }
 
 /** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
@@ -969,16 +1037,16 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
   const backgroundTasks = backgroundWaitCount(status, idleLabel);
   if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
-  const startupStage = startupStageOf(status, idleLabel);
-  if (startupStage !== undefined) {
-    // 新版 provider 可能报出本版不认识的阶段，按通用「启动中…」显示。
-    return (REMOTE_RUNNER_STARTUP_STAGES as readonly string[]).includes(startupStage)
-      ? t('card.status.starting_stage', { stage: t(`card.startup_stage.${startupStage}`, undefined, locale) }, locale)
-      : t('card.status.starting', undefined, locale);
-  }
+  const startup = startupStageOf(status, idleLabel);
+  if (startup !== undefined) return startupStatusLabel(startup, locale);
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
-    case 'working': return t('card.status.working', undefined, locale);
+    case 'working': {
+      const elapsed = visibleElapsed(workingElapsedOf(status, idleLabel), locale);
+      return elapsed !== undefined
+        ? t('card.status.working_elapsed', { elapsed }, locale)
+        : t('card.status.working', undefined, locale);
+    }
     // idleLabel 'silent': the turn completed as DELIBERATE silence (bare
     // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
     // from a hung session; say "handled, judged no reply needed" instead.

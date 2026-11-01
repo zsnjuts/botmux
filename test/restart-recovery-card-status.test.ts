@@ -117,7 +117,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
-import { staleWorkingCardIds } from '../src/core/restored-card-status.js';
+import { staleWorkingCardIds, streamingCardTitleClaimsWork } from '../src/core/restored-card-status.js';
 import {
   initWorkerPool,
   reconcileRestoredStreamingCardStatus,
@@ -309,6 +309,24 @@ describe('reconcileRestoredStreamingCardStatus', () => {
     expect(working.streamCardId).toBe('om_a');
   });
 
+  it.each([
+    '🖥️ Remote Runner · t — 工作中 · 已运行 3 分 20 秒',
+    '🖥️ Remote Runner · t — 启动中 · 正在初始化沙箱 · 12 秒',
+    '🖥️ Remote Runner · t — 启动中 · 正在启动远端 CLI（上一步 初始化沙箱 12 秒）',
+    '🖥️ Remote Runner · t — Working · running for 3m 20s',
+  ])('a timed Remote Runner header still claims work and is re-attached: %s', async (title) => {
+    const reattach = vi.fn(async (_ds: DaemonSession) => {});
+    setRestoredRemoteTurnReattachHandler(reattach);
+    const ds = makeDs({ streamCardId: 'om_card' }, { backendType: 'remote-runner' });
+    activate(ds);
+    getMessageDetailMock.mockResolvedValue(cardDetail(title));
+
+    await reconcileRestoredStreamingCardStatus('app_test');
+
+    expect(reattach).toHaveBeenCalledWith(ds);
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
   it('leaves a worker-less Remote Runner card alone without a re-attach handler', async () => {
     const ds = makeDs({ streamCardId: 'om_card' }, { backendType: 'remote-runner' });
     activate(ds);
@@ -367,6 +385,33 @@ function listedCard(id: string, title: string, overrides: Record<string, unknown
     ...overrides,
   };
 }
+
+describe('streamingCardTitleClaimsWork', () => {
+  it.each([
+    '🖥️ Claude · t — 工作中',
+    '🖥️ Claude · t — 启动中…',
+    '🖥️ Remote Runner · t — 启动中 · 正在创建沙箱',
+    '🖥️ Remote Runner · t — 启动中 · 正在初始化沙箱 · 12 秒',
+    '🖥️ Remote Runner · t — 启动中 · 7 秒',
+    '🖥️ Remote Runner · t — 启动中 · 正在启动远端 CLI · 3 秒（上一步 初始化沙箱 12 秒）',
+    '🖥️ Remote Runner · t — 工作中 · 已运行 1 小时 5 分',
+    '🖥️ Remote Runner · t — Starting · creating the sandbox · 12s',
+    '🖥️ Remote Runner · t — Working · running for 3m 20s',
+  ])('claims work: %s', (title) => {
+    expect(streamingCardTitleClaimsWork(title)).toBe(true);
+  });
+
+  it.each([
+    '🖥️ Claude · t — 等待输入',
+    '🖥️ Claude · t — ✓ 本轮已结束 · 等待输入',
+    '🖥️ Claude · t — 执行失败',
+    '🖥️ Claude · t — ⏳ 主回合已结束 · 后台子任务运行中（2）',
+    '🖥️ Claude · t — 工作中断',
+    '🛑 会话已关闭',
+  ])('does not claim work: %s', (title) => {
+    expect(streamingCardTitleClaimsWork(title)).toBe(false);
+  });
+});
 
 describe('staleWorkingCardIds', () => {
   const opts = { larkAppId: 'app_test', liveCardIds: new Set(['om_live']), postedBefore: 5_000 };

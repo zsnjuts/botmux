@@ -28,8 +28,10 @@ import {
   buildSlashListCard,
   getCliDisplayName,
   frozenIdleLabel,
+  formatElapsed,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
+import { REMOTE_RUNNER_STARTUP_STAGES } from '../src/adapters/backend/remote-runner-protocol.js';
 import type { AdoptableSession } from '../src/core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../src/core/zellij-adopt-discovery.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -1261,6 +1263,88 @@ describe('buildStreamingCard', () => {
         expect(idle.header.title.content).not.toContain('启动中');
         expect(idle.header.template).toBe('green');
       });
+
+      // Mew #103：启动期显示本阶段已持续多久，切阶段时附上一步耗时。
+      it('counts the current stage and names the previous step', () => {
+        const label = { startupStage: 'cli_start', elapsedMs: 3_400, previous: { stage: 'sandbox_init', ms: 12_900 } };
+        const card = build('working', label);
+        expect(card.header.title.content).toMatch(/— 启动中 · 正在启动远端 CLI · 3 秒（上一步 初始化沙箱 12 秒）$/);
+        expect(card.header.template).toBe('yellow');
+        expect(build('working', label, 'en').header.title.content)
+          .toMatch(/— Starting · starting the remote CLI · 3s \(previous step: sandbox initialization 12s\)$/);
+        // Right after the change the new stage has no count of its own yet.
+        expect(build('working', { ...label, elapsedMs: 0 }).header.title.content)
+          .toMatch(/— 启动中 · 正在启动远端 CLI（上一步 初始化沙箱 12 秒）$/);
+      });
+
+      it('names the submit placeholder as a previous step, but never an unknown one', () => {
+        expect(build('working', { startupStage: 'sandbox_check', elapsedMs: 0, previous: { stage: 'submitting', ms: 400 } })
+          .header.title.content).toMatch(/— 启动中 · 正在检查沙箱（上一步 提交任务 不到 1 秒）$/);
+        const unknown = build('working', { startupStage: 'cli_start', elapsedMs: 6_000, previous: { stage: 'provider_future_stage', ms: 9_000 } });
+        expect(unknown.header.title.content).toMatch(/— 启动中 · 正在启动远端 CLI · 6 秒$/);
+      });
+
+      it('has a stage and a previous-step wording for every protocol stage, in both locales', () => {
+        for (const locale of [undefined, 'en'] as const) {
+          for (const stage of REMOTE_RUNNER_STARTUP_STAGES) {
+            const title = build('working', { startupStage: stage, elapsedMs: 2_000, previous: { stage, ms: 3_000 } }, locale)
+              .header.title.content;
+            expect(title).not.toContain('card.');
+          }
+        }
+      });
+
+      it('counts an unknown or placeholder stage on the generic label', () => {
+        expect(build('working', { startupStage: 'provider_future_stage', elapsedMs: 7_000 }).header.title.content)
+          .toMatch(/— 启动中 · 7 秒$/);
+        expect(build('starting', { startupStage: 'submitting', elapsedMs: 500 }).header.title.content)
+          .toMatch(/— 启动中…$/);
+      });
+    });
+
+    // Mew #103：provider 回 busy 后显示本轮已运行多久。
+    describe('remote run-time label', () => {
+      const build = (status: 'working' | 'idle' | 'stalled', label: unknown, locale?: 'en') => parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', status, 'claude-code', 'hidden',
+        undefined, undefined, false, false, locale, undefined, undefined, false,
+        undefined, undefined, undefined, label as any,
+      ));
+
+      it('appends the run time to 工作中 and keeps the working colour', () => {
+        const card = build('working', { workingElapsedMs: 200_000 });
+        expect(card.header.title.content).toMatch(/— 工作中 · 已运行 3 分 20 秒$/);
+        expect(card.header.template).toBe('blue');
+        expect(build('working', { workingElapsedMs: 200_000 }, 'en').header.title.content)
+          .toMatch(/— Working · running for 3m 20s$/);
+        // Just accepted: plain 工作中 until there is a second to show.
+        expect(build('working', { workingElapsedMs: 300 }).header.title.content).toMatch(/— 工作中$/);
+      });
+
+      it('is inert outside working', () => {
+        expect(build('idle', { workingElapsedMs: 200_000 }).header.title.content).toMatch(/— 等待输入$/);
+        expect(build('stalled', { workingElapsedMs: 200_000 }).header.title.content).not.toContain('已运行');
+      });
+    });
+
+    it('formatElapsed: seconds, then minutes with seconds, minutes only past 10 minutes, then hours', () => {
+      const cases: Array<[number, string, string]> = [
+        [0, '不到 1 秒', '<1s'],
+        [999, '不到 1 秒', '<1s'],
+        [12_000, '12 秒', '12s'],
+        [59_999, '59 秒', '59s'],
+        [60_000, '1 分 0 秒', '1m 0s'],
+        [200_000, '3 分 20 秒', '3m 20s'],
+        [599_999, '9 分 59 秒', '9m 59s'],
+        [600_000, '10 分', '10m'],
+        [3_599_999, '59 分', '59m'],
+        [3_600_000, '1 小时', '1h'],
+        [3_900_000, '1 小时 5 分', '1h 5m'],
+      ];
+      for (const [ms, zh, en] of cases) {
+        expect(formatElapsed(ms, 'zh')).toBe(zh);
+        expect(formatElapsed(ms, 'en')).toBe(en);
+      }
+      expect(formatElapsed(Number.NaN, 'zh')).toBe('不到 1 秒');
     });
 
     // 冻结卡回读：新字段 idleLabel 优先；旧盘只有 silentIdle:true 仍按 silent 渲染。

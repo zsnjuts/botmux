@@ -103,6 +103,7 @@ BotMux 在 hello 的 `optionalCapabilities` 里列出 `startup_progress`。provi
 - `stage` 是协议枚举，文案由 BotMux 负责：`sandbox_check`、`sandbox_resume`、`sandbox_create`、`sandbox_init`、`tools_prepare`、`cli_start`。较新 provider 的未知阶段（小写字母、数字、下划线，最长 48 个字符）照常解析，卡片显示通用的「启动中…」；任意文本不会进入卡片。
 - 只在两个时间窗里生效：start / resume 请求还在等 `ready`，或带 `turnId` 的 turn 还没收到 `status: busy`。窗口外、turnId 不匹配或 provider 未声明该能力的事件直接丢弃，不判协议错误。
 - 它不是就绪或准入信号。worker 把输入交给 provider 后就报「工作中」，而 provider 可能还在建沙箱、启动 CLI；有启动阶段时卡头显示「启动中 · 正在创建沙箱」等，provider 回 busy 后恢复「工作中」。
+- 卡头计时由 Host 自己算，协议不变：BotMux 以 daemon 收到每个阶段（以及该 turn 的 `status: busy`）的时间为准，启动期显示当前阶段已持续多久（「启动中 · 正在初始化沙箱 · 12 秒」），切阶段时立即重绘并附上一步耗时（「（上一步 创建沙箱 8 秒）」）；busy 之后显示本轮已运行多久（「工作中 · 已运行 3 分 20 秒」）。启动期约每 5 秒、运行期约每 30 秒重绘一次，文案没变就不发；本轮结束、失败或 worker 退出即停。计时只在 daemon 内存里，daemon 重启后卡头回到不带计时的「工作中」。provider 不需要也不应该为此发送时间戳或更密的事件。
 - provider 不声明该能力、或旧 BotMux 不请求时，双方都不发也不处理，行为与之前一致。
 
 ### 可选远端终端

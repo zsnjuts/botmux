@@ -418,9 +418,25 @@ export interface DaemonSession {
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
   /** Remote Runner 正在准备本轮时报的启动阶段（建沙箱、启动 CLI 等），provider 回
-   *  busy 后清掉。卡头据此显示「启动中 · 正在创建沙箱」而不是「工作中」。只在
-   *  starting / working 时生效；每个新轮次入口和离开 working 时清理。内存态。 */
-  remoteStartupStage?: { stage: string; turnId?: string };
+   *  busy 后清掉。卡头据此显示「启动中 · 正在创建沙箱 · 12 秒」而不是「工作中」。只在
+   *  starting / working 时生效；每个新轮次入口、离开 working、worker 退出时清理。
+   *  `since` 是 daemon 收到该阶段 IPC 的时间，`previous` 是同一轮里被它替换的上一
+   *  阶段及其耗时。内存态——计时心跳的 PATCH 不进 outbox，绝不能写进 `ds.session`。 */
+  remoteStartupStage?: {
+    stage: string;
+    turnId?: string;
+    dispatchAttempt?: number;
+    workerGeneration?: number;
+    since: number;
+    previous?: { stage: string; ms: number };
+  };
+  /** Remote Runner 本轮被 provider 接受（busy，即 stage null 的
+   *  `remote_startup_progress`）的 daemon 收到时间；卡头据此显示「工作中 · 已运行
+   *  3 分 20 秒」。清理时机同 `remoteStartupStage`（离开 working 改为回到 idle）。内存态。 */
+  remoteWorkingSince?: { turnId?: string; dispatchAttempt?: number; workerGeneration?: number; since: number };
+  /** 上一次因启动阶段 / 运行计时重绘活卡的时间，计时心跳据此限频（启动 5 秒、
+   *  工作中 30 秒）。内存态。 */
+  remoteElapsedPatchedAt?: number;
   /** Set on sessions restored after a daemon restart: suppresses the automatic
    *  card post/patch from the recovery re-fork so a restart stays silent in the
    *  group (the owner gets a private DM summary instead). Cleared on the first

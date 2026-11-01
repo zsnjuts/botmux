@@ -477,6 +477,9 @@ import {
   setDurableBridgeFinalOutputHandler,
   setRestoredRemoteTurnReattachHandler,
   checkWorkerLiveness,
+  refreshRemoteElapsedCards,
+  REMOTE_ELAPSED_SWEEP_MS,
+  clearRemoteTurnTiming,
   broadcastWorkerConfigSnapshot,
   WORKER_LIVENESS_PING_INTERVAL_MS,
   buildStreamingCardJson,
@@ -6084,7 +6087,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // baked into the frozen card above; live cards return to normal labels.
   ds.messageListenerCompletedTurnId = undefined;
   ds.silentIdleTurnId = undefined;
-  ds.remoteStartupStage = undefined;
+  clearRemoteTurnTiming(ds);
   ds.completedIdleTurnId = undefined;
   ds.failedIdleTurnId = undefined;
   // Lineage anchor for the deliberate-silence label: a turn_terminal that lands
@@ -28366,7 +28369,7 @@ async function handleThreadReplyAdmitted(
     // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
     ds.messageListenerCompletedTurnId = undefined;
     ds.silentIdleTurnId = undefined;
-    ds.remoteStartupStage = undefined;
+    clearRemoteTurnTiming(ds);
     ds.completedIdleTurnId = undefined;
     ds.failedIdleTurnId = undefined;
     ds.currentTurnId = parsed.messageId;
@@ -29862,7 +29865,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       // see the Lark-message re-fork branch above.
       ds.messageListenerCompletedTurnId = undefined;
       ds.silentIdleTurnId = undefined;
-      ds.remoteStartupStage = undefined;
+      clearRemoteTurnTiming(ds);
       ds.completedIdleTurnId = undefined;
       ds.failedIdleTurnId = undefined;
       ds.currentTurnId = turnId;
@@ -33209,6 +33212,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // re-attached (Mew #28).
   const workerLivenessTimer = setInterval(() => checkWorkerLiveness(), WORKER_LIVENESS_PING_INTERVAL_MS);
   workerLivenessTimer.unref?.();
+  // Remote Runner cards count startup / run time in their header (Mew #103).
+  const remoteElapsedTimer = setInterval(() => refreshRemoteElapsedCards(), REMOTE_ELAPSED_SWEEP_MS);
+  remoteElapsedTimer.unref?.();
 
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
@@ -33910,6 +33916,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(workerLivenessTimer);
+    clearInterval(remoteElapsedTimer);
     clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
@@ -34197,6 +34204,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(workerLivenessTimer);
+    clearInterval(remoteElapsedTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
