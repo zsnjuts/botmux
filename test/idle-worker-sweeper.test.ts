@@ -31,7 +31,9 @@ import {
   reclaimIdleWorkersForAdmissionAsync,
   reclaimIdleWorkersForAdmissionAfterTurnDrain,
   DEFAULT_MAX_LIVE_WORKERS,
+  isIdleForReleaseDetach,
 } from '../src/core/idle-worker-sweeper.js';
+import { parseRemoteHandoffIdleDetachMs } from '../src/core/shutdown-budgets.js';
 import {
   __testOnly_resetBotTurnMutationGates,
   withBotTurnAdmission,
@@ -963,5 +965,41 @@ describe('reclaimIdleWorkersForAdmission (marginal-admission rescue)', () => {
     expect(blocked.get('b').worker).not.toBe(null);
     release();
     await foreign;
+  });
+});
+
+// Mew #43: at a rolling release, idle remote sessions are retired instead of
+// handed to the successor (which relaunched ~130 idle workers per release).
+describe('release-time idle detach of remote sessions', () => {
+  const THIRTY_MIN = 30 * 60_000;
+
+  it('treats a session relaunched by the previous release as idle when nobody wrote to it', () => {
+    // Relaunch resets the in-memory clocks; only the persisted last input counts.
+    const relaunched = ds('relaunched', 'remote-runner', now - 3 * 24 * 60 * 60_000);
+    relaunched.lastMessageAt = now - 60_000;
+    relaunched.spawnedAt = now - 60_000;
+    expect(isIdleForReleaseDetach(relaunched, now, THIRTY_MIN)).toBe(true);
+  });
+
+  it('hands off sessions with recent input, a turn in flight, queued input, or no recorded input', () => {
+    expect(isIdleForReleaseDetach(ds('recent', 'remote-runner', now - 5 * 60_000), now, THIRTY_MIN)).toBe(false);
+    const busy = ds('busy', 'remote-runner', now - 2 * THIRTY_MIN);
+    busy.activeInteractiveTurn = { turnId: 't1' };
+    expect(isIdleForReleaseDetach(busy, now, THIRTY_MIN)).toBe(false);
+    const queued = ds('queued', 'remote-runner', now - 2 * THIRTY_MIN);
+    queued.pendingFollowUps = [{ content: 'later' }];
+    expect(isIdleForReleaseDetach(queued, now, THIRTY_MIN)).toBe(false);
+    const unknown = ds('unknown', 'remote-runner', now - 2 * THIRTY_MIN);
+    unknown.session.lastMessageAt = undefined;
+    expect(isIdleForReleaseDetach(unknown, now, THIRTY_MIN)).toBe(false);
+  });
+
+  it('is disabled by a zero threshold', () => {
+    expect(isIdleForReleaseDetach(ds('old', 'remote-runner', now - 10 * THIRTY_MIN), now, 0)).toBe(false);
+    expect(parseRemoteHandoffIdleDetachMs('0')).toBe(0);
+    expect(parseRemoteHandoffIdleDetachMs(undefined)).toBe(THIRTY_MIN);
+    expect(parseRemoteHandoffIdleDetachMs('45')).toBe(45 * 60_000);
+    expect(() => parseRemoteHandoffIdleDetachMs('-1')).toThrow();
+    expect(() => parseRemoteHandoffIdleDetachMs('1.5')).toThrow();
   });
 });

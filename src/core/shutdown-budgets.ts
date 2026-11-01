@@ -25,6 +25,25 @@ export const REMOTE_SHUTDOWN_MODE = parseRemoteShutdownMode(
   process.env[REMOTE_SHUTDOWN_MODE_ENV],
 );
 
+/** Handoff mode: a remote session nobody talked to for this many minutes is
+ * retired with its lineage committed and its lease released instead of being
+ * handed to the successor, which would relaunch an idle worker and runner
+ * (Mew #43). 0 hands off every session, as before. */
+export const REMOTE_HANDOFF_IDLE_DETACH_ENV = 'BOTMUX_REMOTE_HANDOFF_IDLE_DETACH_MINUTES';
+export const DEFAULT_REMOTE_HANDOFF_IDLE_DETACH_MINUTES = 30;
+
+export function parseRemoteHandoffIdleDetachMs(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_REMOTE_HANDOFF_IDLE_DETACH_MINUTES * 60_000;
+  if (!/^(0|[1-9]\d*)$/.test(value) || Number(value) > 7 * 24 * 60) {
+    throw new Error(`${REMOTE_HANDOFF_IDLE_DETACH_ENV} must be an integer between 0 and 10080`);
+  }
+  return Number(value) * 60_000;
+}
+
+export const REMOTE_HANDOFF_IDLE_DETACH_MS = parseRemoteHandoffIdleDetachMs(
+  process.env[REMOTE_HANDOFF_IDLE_DETACH_ENV],
+);
+
 export const REMOTE_SHUTDOWN_DRAIN_TIMEOUT_ENV = 'BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS';
 export const DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS = 12_000;
 export const MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS = 12_000;
