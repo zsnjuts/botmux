@@ -1,22 +1,23 @@
 name: CI
 
 on:
+  # Kept only so the six required checks of the `distributed` ruleset report on
+  # every PR; every job below is skipped for this event (see the note).
   pull_request:
-  push:
-    branches:
-      - master
-  # Manual full run on any branch, including PRs into `distributed` whose
-  # automatic run is skipped below.
+  # Manual full run on any branch: `gh workflow run ci.yml --ref <branch>`.
   workflow_dispatch:
 
-# PRs into `distributed` (the managed TCE fork line) skip every job here: that
-# line is gated by the maintainers' local full suite (tsc + unit + bun-test,
-# failure set compared against the latest `distributed/v*` baseline) plus a
-# test-cluster run before squash-merge. A job skipped by `if:` reports as a
-# successful required check, so the ruleset's contexts (build, test, bun-test,
-# bun-binary, bun-binary-musl, bun-binary-darwin) no longer wait on runners.
-# Pushes to master, PRs into any other branch and workflow_dispatch still run
-# the full matrix.
+# This fork no longer runs its CI automatically. Every merge is gated by the
+# maintainers' local full suite instead (tsc + unit + bun-test via
+# tools/ops/pre-merge-check.py, failure set compared against the latest
+# `distributed/v*` baseline) plus a test-cluster run before squash-merge.
+#
+# The ruleset still requires the contexts build, test, bun-test, bun-binary,
+# bun-binary-musl and bun-binary-darwin. A job skipped by `if:` reports as a
+# successful check, so each job keeps its name and runs only on
+# workflow_dispatch; on a PR it is skipped and the PR stays mergeable. There
+# is no push trigger. Run the full matrix by hand when a change touches
+# packaging, build scripts or the workflows themselves.
 
 permissions:
   contents: read
@@ -36,7 +37,7 @@ jobs:
   # repo-settings change, not a workflow step. Until an admin does that, a
   # red shard does not block merge.
   build:
-    if: github.event_name != 'pull_request' || github.base_ref != 'distributed'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -64,7 +65,7 @@ jobs:
   # spawn `dist/cli.js`, so each shard rebuilds (~45s) and starts immediately.
   # fail-fast is off so a red shard still lets the others report their wall.
   test:
-    if: github.event_name != 'pull_request' || github.base_ref != 'distributed'
+    if: github.event_name == 'workflow_dispatch'
     name: test (${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -122,7 +123,7 @@ jobs:
   test-ok:
     name: test
     needs: test
-    if: always() && (github.event_name != 'pull_request' || github.base_ref != 'distributed')
+    if: always() && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Require every shard
@@ -175,7 +176,7 @@ jobs:
   # process and cross-file interference cascades (measured: 933 failures batched
   # vs ~2% one-per-process). Startup cost therefore dominates the wall clock.
   bun-test:
-    if: github.event_name != 'pull_request' || github.base_ref != 'distributed'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -247,7 +248,7 @@ jobs:
   # Kept a separate job (not steps appended to `build`) so a Bun-only failure is
   # legible at a glance and does not mask unit-test results.
   bun-binary:
-    if: github.event_name != 'pull_request' || github.base_ref != 'distributed'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -291,7 +292,7 @@ jobs:
   # and it is used here too so both workflows stay on ONE shape: if this leg ever
   # gains an arch, it will not re-learn the same lesson.
   bun-binary-musl:
-    if: github.event_name != 'pull_request' || github.base_ref != 'distributed'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -433,7 +434,7 @@ jobs:
   # which every macos-14 job fails at once. Like macos-14 it is arm64, so darwin-x64
   # stays the cross-built cell. Keep it equal to release.yml's darwin runner.
   bun-binary-darwin:
-    if: github.event_name != 'pull_request' || github.base_ref != 'distributed'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 30
 
