@@ -118,17 +118,23 @@ describe('scheduled run settlement', () => {
     try {
       const turnId = 'schedule:deadbeef:00000000-0000-4000-8000-000000000009';
       let settled = false;
+      let failure: unknown;
+      // Capture the outcome with plain handlers: `expect(...).rejects` waits on
+      // the (faked) timer queue under bun test and never returns.
       const execution = executeScheduledRunAwaitingSettlement({
         turnId,
         taskId: 'deadbeef',
         requireFinalDelivery: true,
         settlementTimeoutMs: 60_000,
-      }, async () => undefined).finally(() => { settled = true; });
-      const outcome = expect(execution).rejects.toThrow(/no terminal evidence/);
+      }, async () => undefined).then(
+        () => { settled = true; },
+        error => { failure = error; settled = true; },
+      );
       await vi.advanceTimersByTimeAsync(59_999);
       expect(settled).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
-      await outcome;
+      await execution;
+      expect(String(failure)).toMatch(/no terminal evidence/);
     } finally {
       vi.useRealTimers();
     }
@@ -146,8 +152,16 @@ describe('scheduled run settlement', () => {
       }, async () => undefined);
       await vi.advanceTimersByTimeAsync(1_000);
       observeScheduledRunProviderReadbackDelivery(turnId, 'om_before_timeout');
-      await expect(execution).resolves.toEqual({ messageId: 'om_before_timeout' });
-      expect(vi.getTimerCount()).toBe(0);
+      expect(await execution).toEqual({ messageId: 'om_before_timeout' });
+      // Passing the deadline afterwards must not surface a late failure.
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        await vi.advanceTimersByTimeAsync(60_000);
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+      expect(unhandled).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
