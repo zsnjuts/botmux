@@ -158,11 +158,18 @@ function quotedAttachments(
         || (resolved !== attachmentRoot && !resolved.startsWith(attachmentPrefix))) {
       throw new Error('quoted attachment escaped the BotMux attachment root');
     }
-    totalBytes += info.size;
-    if (totalBytes > MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES) {
-      throw new Error('quoted attachments exceed the Remote Runner transfer limit');
+    if (totalBytes + info.size > MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES) {
+      // Keep the quoted text and the attachments that fit. Failing the whole
+      // call would hide the message body too, and the model would keep asking
+      // the user to resend; say exactly which attachment did not arrive.
+      delete item.path;
+      item.unavailable = 'exceeds_remote_transfer_limit';
+      item.sizeBytes = info.size;
+      item.transferLimitBytes = MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES;
+      continue;
     }
-    const placeholder = `botmux-session-tool://attachment/${index}`;
+    totalBytes += info.size;
+    const placeholder = `botmux-session-tool://attachment/${transferred.length}`;
     item.path = placeholder;
     transferred.push({
       placeholder,
@@ -177,7 +184,7 @@ function quotedAttachments(
 
   return {
     stdout: `${JSON.stringify(root, null, 2)}\n`,
-    attachments: transferred,
+    ...(transferred.length > 0 ? { attachments: transferred } : {}),
   };
 }
 
