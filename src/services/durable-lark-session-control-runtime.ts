@@ -18,7 +18,6 @@ import type {
 import { createDurableSessionControlDispatch } from './durable-session-control-dispatch.js';
 import {
   DurableActiveTakeoverUnsupportedError,
-  DurableSessionControlDeferredError,
   DurableSessionControlOwnerHandoffError,
 } from './durable-session-control-errors.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
@@ -507,9 +506,11 @@ export function createDurableLarkSessionControlRuntime(
         persisted = options.getPersistedSession(control.sessionId);
       }
       if (live) {
-        throw new DurableSessionControlDeferredError(
-          'canonical Session still has a local runtime owner',
-        );
+        // A live owner on this replica is serving the Session, so it is not
+        // an orphan. Deferring would wait for an owner that may never retire
+        // while every scan epoch queues another control behind this one (Mew
+        // #111). Once the owner does retire, the next scan proves it afresh.
+        return terminalIgnore('orphan control found a live local runtime owner');
       }
     }
     if (control.action === 'toggle_display' && !live) {
