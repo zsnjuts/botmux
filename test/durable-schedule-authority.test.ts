@@ -385,6 +385,74 @@ describe('scheduler tick with a durable schedule authority', () => {
     expect(b.local.getRecord(APP, 't1')?.task).toMatchObject({ lastStatus: 'ok', lastRunId: context.runId });
   });
 
+  it('leaves a run that continues a Session to the replica holding it, then takes it over after the affinity window', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    vi.setSystemTime(NOW);
+    const { replica } = cluster();
+    const a = replica('a');
+    await a.authority.hydrate(APP, () => []);
+    a.local.createDirect(task('t1', {
+      nextRunAt: new Date(NOW - 10_000).toISOString(),
+      executionPosition: 'topic',
+      scope: 'thread',
+      rootMessageId: 'om_topic_root',
+    }));
+    await a.authority.flush();
+    wireScheduler(a);
+    const affinity = vi.fn((_task: ScheduledTask): scheduler.DurableSessionAffinity => 'not_local');
+    scheduler.setDurableSessionAffinity(affinity);
+    cleanups.push(() => scheduler.setDurableSessionAffinity(null));
+
+    const execute = vi.fn(async () => {});
+    scheduler.setExecuteCallback(execute);
+    scheduler.startScheduler();
+    // Due 10 s ago and the Session's worker lives elsewhere: not claimed here.
+    await vi.advanceTimersByTimeAsync(5_000);
+    await settle(a.authority);
+    expect(affinity).toHaveBeenCalled();
+    expect(affinity.mock.calls[0]![0]).toMatchObject({ id: 't1', rootMessageId: 'om_topic_root' });
+    expect(execute).not.toHaveBeenCalled();
+    expect(a.local.getRecord(APP, 't1')?.task.lastStatus).toBeUndefined();
+
+    // Still inside the window on the next tick (due 40 s ago). Stop exactly on
+    // the tick: bun test moves the clock to the end of an advance before the
+    // timer callbacks' async work reads it.
+    await vi.advanceTimersByTimeAsync(25_000);
+    await settle(a.authority);
+    expect(execute).not.toHaveBeenCalled();
+
+    // Nobody took it within the window: this replica claims it on the tick after.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await settle(a.authority);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('claims a due run at once when this replica holds the Session or the run opens a fresh topic', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    vi.setSystemTime(NOW);
+    const { replica } = cluster();
+    const a = replica('a');
+    await a.authority.hydrate(APP, () => []);
+    a.local.createDirect(task('held', {
+      nextRunAt: new Date(NOW - 10_000).toISOString(),
+      executionPosition: 'topic',
+      scope: 'thread',
+      rootMessageId: 'om_held',
+    }));
+    a.local.createDirect(task('fresh', { nextRunAt: new Date(NOW - 10_000).toISOString() }));
+    await a.authority.flush();
+    wireScheduler(a);
+    scheduler.setDurableSessionAffinity(t => (t.id === 'held' ? 'local' : 'none'));
+    cleanups.push(() => scheduler.setDurableSessionAffinity(null));
+
+    const execute = vi.fn(async () => {});
+    scheduler.setExecuteCallback(execute);
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await settle(a.authority);
+    expect(execute.mock.calls.map(call => (call[0] as ScheduledTask).id).sort()).toEqual(['fresh', 'held']);
+  });
+
   it('counts a run once when its settlement is replayed after a write that committed but reported failure', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
     vi.setSystemTime(NOW);
