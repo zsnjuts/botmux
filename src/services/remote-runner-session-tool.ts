@@ -1,18 +1,25 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
+  closeSync,
   lstatSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
 } from 'node:fs';
-import { basename, join, sep } from 'node:path';
+import { basename, join, relative, sep } from 'node:path';
 import {
   botmuxCliInvocation,
   buildRelayHostEnv,
 } from '../adapters/backend/sandbox.js';
 import {
   MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES,
+  MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENT_BYTES,
+  MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENTS_TOTAL_BYTES,
   MAX_REMOTE_RUNNER_SESSION_TOOL_TEXT_BYTES,
   type RemoteRunnerSessionToolAttachment,
+  type RemoteRunnerSessionToolHostCapabilities,
   type RemoteRunnerSessionToolRequest,
   type RemoteRunnerSessionToolResult,
 } from '../adapters/backend/remote-runner-protocol.js';
@@ -30,6 +37,24 @@ export interface RemoteRunnerSessionToolHostContext {
   env?: NodeJS.ProcessEnv;
   cliPath?: string;
   timeoutMs?: number;
+  /** Defaults to `inline` (base64 inside the result line). */
+  attachmentTransfer?: RemoteRunnerSessionToolHostCapabilities['attachmentTransfer'];
+}
+
+function fileSha256(path: string): string {
+  const digest = createHash('sha256');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  const fd = openSync(path, 'r');
+  try {
+    for (;;) {
+      const read = readSync(fd, buffer, 0, buffer.length, null);
+      if (read === 0) break;
+      digest.update(buffer.subarray(0, read));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return digest.digest('hex');
 }
 
 function boundedDiagnostic(value: string, fallback: string): string {
@@ -114,7 +139,15 @@ export function remoteRunnerSessionToolArgs(
 function quotedAttachments(
   stdout: string,
   env: NodeJS.ProcessEnv,
+  transfer: RemoteRunnerSessionToolHostCapabilities['attachmentTransfer'] = 'inline',
 ): { stdout: string; attachments?: RemoteRunnerSessionToolAttachment[] } {
+  const hostFile = transfer === 'host_file';
+  const perAttachmentLimit = hostFile
+    ? MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENT_BYTES
+    : MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES;
+  const totalLimit = hostFile
+    ? MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENTS_TOTAL_BYTES
+    : MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES;
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -158,28 +191,37 @@ function quotedAttachments(
         || (resolved !== attachmentRoot && !resolved.startsWith(attachmentPrefix))) {
       throw new Error('quoted attachment escaped the BotMux attachment root');
     }
-    if (totalBytes + info.size > MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES) {
+    if (info.size > perAttachmentLimit || totalBytes + info.size > totalLimit) {
       // Keep the quoted text and the attachments that fit. Failing the whole
       // call would hide the message body too, and the model would keep asking
       // the user to resend; say exactly which attachment did not arrive.
       delete item.path;
       item.unavailable = 'exceeds_remote_transfer_limit';
       item.sizeBytes = info.size;
-      item.transferLimitBytes = MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES;
+      item.transferLimitBytes = Math.min(perAttachmentLimit, totalLimit);
       continue;
     }
     totalBytes += info.size;
     const placeholder = `botmux-session-tool://attachment/${transferred.length}`;
     item.path = placeholder;
-    transferred.push({
+    const base = {
       placeholder,
       name,
       type,
       ...(typeof item.mimeType === 'string' && item.mimeType.length <= 256
         ? { mimeType: item.mimeType }
         : {}),
-      dataBase64: readFileSync(resolved).toString('base64'),
-    });
+    } as const;
+    transferred.push(hostFile
+      ? {
+          ...base,
+          hostFile: {
+            path: relative(attachmentRoot, resolved).split(sep).join('/'),
+            sizeBytes: info.size,
+            sha256: fileSha256(resolved),
+          },
+        }
+      : { ...base, dataBase64: readFileSync(resolved).toString('base64') });
   }
 
   return {
@@ -293,7 +335,7 @@ export async function runRemoteRunnerSessionTool(
       }
       try {
         const packaged = request.tool === 'quoted'
-          ? quotedAttachments(stdout, env)
+          ? quotedAttachments(stdout, env, context.attachmentTransfer)
           : { stdout };
         finish({
           outcome: 'completed',

@@ -7094,6 +7094,7 @@ async function deliverRemoteRunnerOutboundMessage(
 
 async function deliverRemoteRunnerSessionTool(
   operation: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerSessionToolOperation,
+  host?: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerSessionToolHostCapabilities,
 ): Promise<import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerSessionToolResult> {
   const authority = activeTurnAuthority.identity();
   if (!sessionId || !lastInitConfig
@@ -7140,6 +7141,7 @@ async function deliverRemoteRunnerSessionTool(
     ...(currentBotmuxDispatchAttempt !== undefined
       ? { dispatchAttempt: currentBotmuxDispatchAttempt }
       : {}),
+    ...(host ? { attachmentTransfer: host.attachmentTransfer } : {}),
     env,
   });
 }
@@ -23170,7 +23172,7 @@ async function spawnCli(
     }
     return deliverRemoteRunnerOutboundMessage(message, hostContext?.linkRefMode);
   });
-  backend.onSessionTool?.(async (operation) => {
+  backend.onSessionTool?.(async (operation, host) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) {
       return {
         outcome: 'rejected',
@@ -23178,7 +23180,7 @@ async function spawnCli(
         message: 'The backend generation that requested this session tool is no longer active.',
       };
     }
-    return deliverRemoteRunnerSessionTool(operation);
+    return deliverRemoteRunnerSessionTool(operation, host);
   });
   backend.onTurnRecovered?.(async (turn) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
