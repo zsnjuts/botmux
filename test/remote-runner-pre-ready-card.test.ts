@@ -108,7 +108,9 @@ import {
   initWorkerPool,
   parkPreReadyStartingCard,
   postPreReadyStartingCard,
+  refreshRemoteElapsedCards,
   setActiveSessionsRegistry,
+  streamCardLabel,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
@@ -289,6 +291,29 @@ describe('Remote Runner opening card before worker ready', () => {
     expect(cardPosts(sessionReplyMock)).toHaveLength(1);
     expect(patchesOf('om_card').at(-1)).toMatchObject({ status: 'idle', label: 'failed' });
     expect(ds.streamCardId).toBe('om_card');
+  });
+
+  it('a startup stage counting on the card does not outlive its failure (Mew #103)', async () => {
+    const { ds, worker } = setupOpening('remote-runner');
+    await postPreReadyStartingCard(ds);
+    worker.emit('message', { type: 'remote_startup_progress', stage: 'sandbox_create', turnId: OPEN_TURN });
+    await flush();
+    expect(patchesOf('om_card').at(-1)?.label).toMatchObject({ startupStage: 'sandbox_create' });
+
+    worker.emit('message', {
+      type: 'error', message: 'remote runner did not become ready', turnId: OPEN_TURN,
+    });
+    await flush();
+    worker.emit('exit', 1, null);
+    await flush();
+
+    expect(patchesOf('om_card').at(-1)).toMatchObject({ status: 'idle', label: 'failed' });
+    // Any later rebuild keeps the failure, and the heartbeat has nothing to count.
+    expect(streamCardLabel(ds)).toBe('failed');
+    const patches = updateMessageMock.mock.calls.length;
+    refreshRemoteElapsedCards(Date.now() + 60_000);
+    await flush();
+    expect(updateMessageMock.mock.calls.length).toBe(patches);
   });
 
   it('marks the card failed when the runner fails while the card is still posting', async () => {

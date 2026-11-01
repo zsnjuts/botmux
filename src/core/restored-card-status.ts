@@ -16,13 +16,35 @@ const WORKING_STATUS_KEYS = [
   'card.status.stalled',
 ] as const;
 
-let workingLabels: Set<string> | undefined;
+/** Templated variants of those statuses (Remote Runner startup stage, startup
+ *  and run timers). Only their literal text before the first placeholder is
+ *  stable — e.g. 「启动中 · 」, 「工作中 · 已运行 」. */
+const WORKING_STATUS_TEMPLATE_KEYS = [
+  'card.status.starting_stage',
+  'card.status.starting_stage_elapsed',
+  'card.status.starting_elapsed',
+  'card.status.working_elapsed',
+] as const;
 
-function workingStatusLabels(): Set<string> {
+let workingLabels: { exact: Set<string>; prefixes: string[] } | undefined;
+
+function workingStatusLabels(): { exact: Set<string>; prefixes: string[] } {
   if (!workingLabels) {
-    workingLabels = new Set(
+    const exact = new Set(
       SUPPORTED_LOCALES.flatMap(locale => WORKING_STATUS_KEYS.map(key => t(key, undefined, locale))),
     );
+    const prefixes = new Set<string>();
+    // A status may carry a suffix after ' · ' (「工作中 · 已运行 3 分」).
+    for (const label of exact) prefixes.add(`${label} · `);
+    for (const locale of SUPPORTED_LOCALES) {
+      for (const key of WORKING_STATUS_TEMPLATE_KEYS) {
+        const template = t(key, undefined, locale);
+        const literal = template.slice(0, template.indexOf('{') < 0 ? template.length : template.indexOf('{'));
+        // A template with no literal lead would match any status.
+        if (literal.trim()) prefixes.add(literal);
+      }
+    }
+    workingLabels = { exact, prefixes: [...prefixes] };
   }
   return workingLabels;
 }
@@ -53,12 +75,16 @@ export function cardMessageTitle(detail: unknown): string | undefined {
 }
 
 /** True when `title` is a botmux streaming card whose status label says the
- *  CLI is still running (启动中 / 工作中 / 正在分析 / 长时间无进展, any locale). */
+ *  CLI is still running (启动中 / 工作中 / 正在分析 / 长时间无进展, any locale),
+ *  including their suffixed forms (「启动中 · 正在创建沙箱 · 12 秒」、
+ *  「工作中 · 已运行 3 分 20 秒」). */
 export function streamingCardTitleClaimsWork(title: string | undefined): boolean {
   if (!title || !title.startsWith('🖥️')) return false;
   const sep = title.lastIndexOf(' — ');
   if (sep < 0) return false;
-  return workingStatusLabels().has(title.slice(sep + ' — '.length).trim());
+  const status = title.slice(sep + ' — '.length).trim();
+  const labels = workingStatusLabels();
+  return labels.exact.has(status) || labels.prefixes.some(prefix => status.startsWith(prefix));
 }
 
 /** The message was sent by this bot. Lark labels a bot sender `app` in message

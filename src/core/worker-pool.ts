@@ -60,7 +60,7 @@ import {
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, getMessageDetail, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
+import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, formatElapsed, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
@@ -1536,20 +1536,104 @@ export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
 }
 
 /** 活卡卡头标签（重建活卡的 buildStreamingCard 调用点统一从这里取）：Remote Runner
- *  还在准备本轮时为启动阶段（`remoteStartupStage`）；主回合已结束但仍有后台子任务
- *  在跑时为「后台子任务运行中（N）」，盖过 idle 标签；否则同 {@link idleCardLabel}。
- *  冻结卡不用它——启动阶段和后台计数都只描述当下。 */
-export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
-  const startup = ds.remoteStartupStage;
-  if (startup
-      && (ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'starting' || ds.lastScreenStatus === 'working')
-      && (!startup.turnId || !ds.currentTurnId || startup.turnId === ds.currentTurnId)) {
-    return { startupStage: startup.stage };
+ *  还在准备本轮时为启动阶段（`remoteStartupStage`，带本阶段计时与上一步耗时）；主回合
+ *  已结束但仍有后台子任务在跑时为「后台子任务运行中（N）」，盖过 idle 标签；Remote
+ *  Runner 本轮已被接受且仍在 working 时为已运行时长（`remoteWorkingSince`）；否则同
+ *  {@link idleCardLabel}。冻结卡不用它——启动阶段、计时和后台计数都只描述当下。 */
+export function streamCardLabel(ds: DaemonSession, now: number = Date.now()): StreamCardLabel | undefined {
+  const startup = activeRemoteStartupStage(ds);
+  if (startup) {
+    return {
+      startupStage: startup.stage,
+      elapsedMs: Math.max(0, now - startup.since),
+      ...(startup.previous ? { previous: startup.previous } : {}),
+    };
   }
   if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
     return { backgroundTasks: ds.backgroundTaskCount };
   }
+  const working = activeRemoteWorkingSince(ds);
+  if (working) return { workingElapsedMs: Math.max(0, now - working.since) };
   return idleCardLabel(ds);
+}
+
+/** The startup stage the live card shows right now: the turn is still starting
+ *  (or working before the provider's busy) and the stage belongs to it. */
+function activeRemoteStartupStage(ds: DaemonSession): DaemonSession['remoteStartupStage'] {
+  const startup = ds.remoteStartupStage;
+  if (!startup) return undefined;
+  if (ds.lastScreenStatus !== undefined && ds.lastScreenStatus !== 'starting' && ds.lastScreenStatus !== 'working') {
+    return undefined;
+  }
+  return !startup.turnId || !ds.currentTurnId || startup.turnId === ds.currentTurnId ? startup : undefined;
+}
+
+/** The accepted turn whose run time the live card shows: working, same turn,
+ *  and no startup stage or background-task label taking precedence. */
+function activeRemoteWorkingSince(ds: DaemonSession): DaemonSession['remoteWorkingSince'] {
+  const working = ds.remoteWorkingSince;
+  if (!working || ds.lastScreenStatus !== 'working') return undefined;
+  if (activeRemoteStartupStage(ds) || ds.backgroundTaskCount) return undefined;
+  return !working.turnId || !ds.currentTurnId || working.turnId === ds.currentTurnId ? working : undefined;
+}
+
+/** Forget the Remote Runner startup stage and its timers: a new turn, the turn
+ *  left working, or the worker generation that reported them is gone. */
+export function clearRemoteTurnTiming(ds: DaemonSession): void {
+  ds.remoteStartupStage = undefined;
+  ds.remoteWorkingSince = undefined;
+  ds.remoteElapsedPatchedAt = undefined;
+}
+
+// ─── Remote Runner: elapsed-time heartbeat on the live card ─────────────────
+// The startup stage and the busy acknowledgement are stamped with the daemon's
+// receipt time; a sweep re-renders the live card so its header keeps counting
+// (「启动中 · 正在初始化沙箱 · 12 秒」 / 「工作中 · 已运行 3 分 20 秒」). Startup
+// counts in coarse 5-second steps, a running turn every 30 seconds — never per
+// second, so a fleet of long turns stays far below the Lark API gate. A tick
+// only PATCHes when the visible text actually changes. Everything is in memory:
+// these PATCHes never touch the durable outbox.
+export const REMOTE_ELAPSED_SWEEP_MS = 5_000;
+const REMOTE_STARTUP_ELAPSED_TICK_MS = 5_000;
+const REMOTE_WORKING_ELAPSED_TICK_MS = 30_000;
+
+/** Re-render each Remote Runner live card whose startup / run timer is due. */
+export function refreshRemoteElapsedCards(now: number = Date.now()): void {
+  if (!activeSessionsRegistry) return;
+  for (const ds of new Set(activeSessionsRegistry.values())) {
+    try {
+      refreshRemoteElapsedCard(ds, now);
+    } catch (err) {
+      logger.debug(`[${tag(ds)}] Remote elapsed refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+function refreshRemoteElapsedCard(ds: DaemonSession, now: number): boolean {
+  if (!ds.remoteStartupStage && !ds.remoteWorkingSince) return false;
+  const startup = activeRemoteStartupStage(ds);
+  const timer = startup ?? activeRemoteWorkingSince(ds);
+  if (!timer) return false;
+  const w = ds.worker;
+  if (!w || w.killed || ds.session.status !== 'active' || !isRemoteBackendSession(ds)) return false;
+  if (timer.workerGeneration !== undefined && timer.workerGeneration !== ds.workerGeneration) return false;
+  if (isSessionTransferring(ds) || remoteRetirementAdmissionPhase(ds) !== null) return false;
+  if (ds.failedIdleTurnId || ds.usageLimit) return false;
+  const turnId = timer.turnId ?? ds.currentTurnId;
+  if (managedAuxUiSuppressedFor(ds, turnId, timer.dispatchAttempt)) return false;
+  if (streamingCardDisabled(ds, turnId) || ds.suppressRecoveryCard) return false;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || ds.streamCardPending) return false;
+  if (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce) return false;
+  const tick = startup ? REMOTE_STARTUP_ELAPSED_TICK_MS : REMOTE_WORKING_ELAPSED_TICK_MS;
+  const patchedAt = Math.max(ds.remoteElapsedPatchedAt ?? timer.since, timer.since);
+  if (now - patchedAt < tick) return false;
+  // Coarse buckets (minutes past 10 min, hours) repeat between ticks: skip a
+  // PATCH that would redraw the same header.
+  const locale = localeForBot(ds.larkAppId);
+  if (formatElapsed(now - timer.since, locale) === formatElapsed(patchedAt - timer.since, locale)) return false;
+  ds.remoteElapsedPatchedAt = now;
+  scheduleRemoteStartupStagePatch(ds, turnId);
+  return true;
 }
 
 const TURN_EXPLICIT_MENTION_MAX = 64;
@@ -15872,6 +15956,8 @@ function setupWorkerHandlers(
     if (ds.session.status !== 'active') return;
     card.failed = true;
     preReadyStartingCards.delete(ds);
+    // No later rebuild (heartbeat, usage, button) may repaint 启动中 over the failure.
+    clearRemoteTurnTiming(ds);
     const turnId = startupState.initTurnId;
     if (turnId) markFailedTurnIdle(ds, turnId);
     const cardJson = buildStreamingCard(
@@ -17247,6 +17333,9 @@ function setupWorkerHandlers(
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         if (ds.lastScreenStatus !== 'working') ds.remoteStartupStage = undefined;
+        // The turn settled: its run timer ends. Other non-working states
+        // (stalled, limited) only hide it, so a resumed turn keeps counting.
+        if (ds.lastScreenStatus === 'idle') clearRemoteTurnTiming(ds);
         ds.backgroundTaskCount = (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
@@ -18410,12 +18499,37 @@ function setupWorkerHandlers(
 
       case 'remote_startup_progress': {
         if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        // The card's timers count from the daemon's receipt of each stage (the
+        // provider reports no timestamps). Stamped before any card gate below,
+        // so a held or suppressed repaint still shows the right elapsed later.
+        const receivedAt = Date.now();
+        const timerOwner = {
+          ...(msg.turnId ? { turnId: msg.turnId } : {}),
+          ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+          ...(ds.workerGeneration !== undefined ? { workerGeneration: ds.workerGeneration } : {}),
+        };
         if (msg.stage === null) {
+          // Busy acknowledged: this turn's run time starts now. A repeated
+          // acknowledgement of the same turn (a steer) keeps the first one.
+          if (!ds.remoteWorkingSince || ds.remoteWorkingSince.turnId !== msg.turnId) {
+            ds.remoteWorkingSince = { ...timerOwner, since: receivedAt };
+          }
           if (!ds.remoteStartupStage) break;
           ds.remoteStartupStage = undefined;
         } else {
-          if (ds.remoteStartupStage?.stage === msg.stage && ds.remoteStartupStage.turnId === msg.turnId) break;
-          ds.remoteStartupStage = { stage: msg.stage, ...(msg.turnId ? { turnId: msg.turnId } : {}) };
+          const prior = ds.remoteStartupStage;
+          if (prior?.stage === msg.stage && prior.turnId === msg.turnId) break;
+          // Stages only precede the busy acknowledgement: a new one means the
+          // turn is being started again, so its run time restarts too.
+          ds.remoteWorkingSince = undefined;
+          ds.remoteStartupStage = {
+            ...timerOwner,
+            stage: msg.stage,
+            since: receivedAt,
+            ...(prior && prior.turnId === msg.turnId
+              ? { previous: { stage: prior.stage, ms: Math.max(0, receivedAt - prior.since) } }
+              : {}),
+          };
         }
         logger.info(`[${t}] Remote runner startup stage: ${msg.stage ?? 'turn accepted'}`);
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
@@ -18424,6 +18538,7 @@ function setupWorkerHandlers(
         // Keep it — the working screen_update that follows renders it.
         if (ds.lastScreenStatus !== undefined && ds.lastScreenStatus !== 'starting'
           && ds.lastScreenStatus !== 'working') break;
+        ds.remoteElapsedPatchedAt = receivedAt;
         scheduleRemoteStartupStagePatch(ds, msg.turnId ?? startupState.initTurnId);
         break;
       }
@@ -20208,6 +20323,9 @@ function setupWorkerHandlers(
       ds.workerPort = null;
       // A dead worker can no longer refresh its card/usage view.
       clearUsageRefreshTimer(ds);
+      // Its startup stage and run timer died with it: the elapsed heartbeat
+      // must not keep a crashed turn's card counting.
+      clearRemoteTurnTiming(ds);
       // A worker owns the terminal HTTP listener. Persisting its former port
       // after exit leaves the Dashboard proxy routing `/terminal/<session>` to
       // a dead socket until some later ready event overwrites it. Clear both
