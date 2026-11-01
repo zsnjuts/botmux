@@ -4,12 +4,18 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  truncateSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES } from '../src/adapters/backend/remote-runner-protocol.js';
+import {
+  MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES,
+  MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENT_BYTES,
+  MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENTS_TOTAL_BYTES,
+} from '../src/adapters/backend/remote-runner-protocol.js';
 import {
   remoteRunnerSessionToolArgs,
   runRemoteRunnerSessionTool,
@@ -258,6 +264,97 @@ process.stdout.write(JSON.stringify({
     expect(parsed.attachments[0].path).toBeUndefined();
     expect(parsed.attachments[0].transferLimitBytes).toBeLessThan(oversizedBytes);
     expect(parsed.attachments[1]).toMatchObject({ path: 'botmux-session-tool://attachment/0' });
+  });
+
+  it('hands a negotiated Runner a host-file description instead of inline bytes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-session-tool-host-file-test-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const attachmentDir = join(dataDir, 'attachments', 'cli_test', 'om_test');
+    mkdirSync(attachmentDir, { recursive: true });
+    const photo = join(attachmentDir, 'photo.jpg');
+    const bytes = Buffer.alloc(MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES + 1, 7);
+    writeFileSync(photo, bytes);
+    const fixture = join(root, 'fixture.mjs');
+    writeFileSync(fixture, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  attachments: [{ type: 'image', name: 'photo.jpg', path: ${JSON.stringify(photo)}, mimeType: 'image/jpeg' }],
+}) + '\\n');
+`);
+    chmodSync(fixture, 0o755);
+
+    const result = await runRemoteRunnerSessionTool({ tool: 'quoted', messageId: 'om_test' }, {
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      chatId: 'oc_current',
+      cliPath: fixture,
+      attachmentTransfer: 'host_file',
+      env: { PATH: process.env.PATH, SESSION_DATA_DIR: dataDir },
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      attachments: [{
+        placeholder: 'botmux-session-tool://attachment/0',
+        name: 'photo.jpg',
+        hostFile: {
+          path: 'cli_test/om_test/photo.jpg',
+          sizeBytes: bytes.length,
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+        },
+      }],
+    });
+    expect(result.outcome === 'completed' ? result.attachments?.[0] : undefined)
+      .not.toHaveProperty('dataBase64');
+    expect(result.outcome === 'completed' ? result.stdout : '').not.toContain(attachmentDir);
+  });
+
+  it('names the limit a host-file attachment actually exceeded', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-session-tool-host-file-limit-test-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const attachmentDir = join(dataDir, 'attachments', 'cli_test', 'om_test');
+    mkdirSync(attachmentDir, { recursive: true });
+    // Sparse files: each fits the per-file limit, the third overflows the total;
+    // the fourth exceeds the per-file limit on its own.
+    const fitting = Math.floor(MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENTS_TOTAL_BYTES * 0.4);
+    expect(fitting).toBeLessThan(MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENT_BYTES);
+    const sizes = [fitting, fitting, fitting, MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENT_BYTES + 1];
+    const paths = sizes.map((size, index) => {
+      const path = join(attachmentDir, `part-${index}.bin`);
+      writeFileSync(path, '');
+      truncateSync(path, size);
+      return path;
+    });
+    const fixture = join(root, 'fixture.mjs');
+    writeFileSync(fixture, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  attachments: ${JSON.stringify(paths)}.map((path, index) => ({ type: 'file', name: 'part-' + index + '.bin', path })),
+}) + '\\n');
+`);
+    chmodSync(fixture, 0o755);
+
+    const result = await runRemoteRunnerSessionTool({ tool: 'quoted', messageId: 'om_test' }, {
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      chatId: 'oc_current',
+      cliPath: fixture,
+      attachmentTransfer: 'host_file',
+      env: { PATH: process.env.PATH, SESSION_DATA_DIR: dataDir },
+    });
+
+    expect(result.outcome === 'completed' ? result.attachments?.length : undefined).toBe(2);
+    const parsed = JSON.parse(result.outcome === 'completed' ? result.stdout : '{}');
+    expect(parsed.attachments[2]).toMatchObject({
+      unavailable: 'exceeds_remote_transfer_limit',
+      sizeBytes: fitting,
+      transferLimitBytes: MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENTS_TOTAL_BYTES,
+    });
+    expect(parsed.attachments[3]).toMatchObject({
+      unavailable: 'exceeds_remote_transfer_limit',
+      sizeBytes: MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENT_BYTES + 1,
+      transferLimitBytes: MAX_REMOTE_RUNNER_SESSION_TOOL_FILE_ATTACHMENT_BYTES,
+    });
   });
 
   it('rejects quoted attachment paths outside the BotMux attachment root', async () => {

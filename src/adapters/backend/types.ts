@@ -3,6 +3,7 @@ import type {
   RemoteRunnerOrphanVerdict,
   RemoteRunnerOutboundMessage,
   RemoteRunnerOutboundMessageResult,
+  RemoteRunnerSessionToolHostCapabilities,
   RemoteRunnerSessionToolOperation,
   RemoteRunnerSessionToolResult,
   RemoteRunnerRecoveredTurn,
@@ -434,7 +435,10 @@ export interface SessionBackend {
    * executing anything on the host; schedule mutations still cross daemon
    * authorization. */
   onSessionTool?(
-    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+    cb: (
+      operation: RemoteRunnerSessionToolOperation,
+      host: RemoteRunnerSessionToolHostCapabilities,
+    ) => Promise<RemoteRunnerSessionToolResult>,
   ): void;
   /** A provider-owned turn survived the host/worker process and is now being
    * observed without resubmitting its prompt. */

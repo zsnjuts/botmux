@@ -503,7 +503,7 @@ describe('RemoteRunnerBackend', () => {
       turnId: 'turn-session-tool',
       generation: 1,
       request: { tool: 'history', limit: 20, scope: 'thread', withCardJson: true },
-    }));
+    }), { attachmentTransfer: 'inline' });
   });
 
   it.each([
@@ -591,7 +591,7 @@ describe('RemoteRunnerBackend', () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({
       controllerOpenId: 'ou_developer',
       request: { tool: 'schedule.add', schedule: '10m', prompt: 'check' },
-    }));
+    }), { attachmentTransfer: 'inline' });
   });
 
   it('accepts the negotiated schedule Actor on a structured mutation', async () => {
@@ -620,7 +620,7 @@ describe('RemoteRunnerBackend', () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({
       controllerOpenId: 'ou_developer',
       request: { tool: 'schedule.remove', taskId: 'a1b2c3d4' },
-    }));
+    }), { attachmentTransfer: 'inline' });
   });
 
   it('rejects a provider-selected schedule Actor when the host did not require it', async () => {
