@@ -25,7 +25,7 @@ import { join, dirname } from 'node:path';
 import { getBotClient } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
-import { larkGet, getMessageDetail } from './client.js';
+import { larkGet, getMessageDetail, type LarkRequestOptions } from './client.js';
 import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
 
 export type IdentityType = 'user' | 'bot' | 'app' | 'unknown';
@@ -357,13 +357,14 @@ export interface ResolvedSender {
 export async function resolveVerifiedUserIdentity(
   larkAppId: string,
   openId: string,
+  options?: LarkRequestOptions,
 ): Promise<{ openId: string; type: 'user'; name?: string; email?: string } | undefined> {
   if (!openId) return undefined;
   try {
     const c = getBotClient(larkAppId);
     const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
       user_id_type: 'open_id',
-    });
+    }, options);
     const user = res?.code === 0 ? res?.data?.user : undefined;
     if (!user) return undefined;
     const rawName: unknown = user.name;

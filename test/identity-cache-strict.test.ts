@@ -78,6 +78,7 @@ describe('resolveVerifiedUserIdentity', () => {
       { marker: true },
       '/open-apis/contact/v3/users/ou_current',
       { user_id_type: 'open_id' },
+      undefined,
     );
   });
 

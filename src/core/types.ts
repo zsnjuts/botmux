@@ -427,6 +427,11 @@ export interface DaemonSession {
    *  real CLI input (rememberLastCliInput) — the next turn posts a card normally.
    *  In-memory only. See core/restart-report.ts. */
   suppressRecoveryCard?: boolean;
+  /** The last startup failure posted to the topic (turn + reason). Explicit
+   *  inbox retries re-fork the worker for the same message, and without this
+   *  every retry posted the identical card until the failure budget ran out
+   *  (Mew #105). Cleared when a worker generation reaches ready. In-memory. */
+  startupFailureNotice?: string;
   /** Set by an `orphan-reconcile` provider that proved this Session is not an
    * orphan (remote alive, or dormant but resumable). In-memory only: it lets
    * the durable orphan control settle instead of retrying a proof that can

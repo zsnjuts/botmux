@@ -64,7 +64,7 @@ import {
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
-import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
+import { normalizeRemoteRunnerBackendState, type RemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
@@ -3645,6 +3645,35 @@ interface DurableActiveSessionTakeoverOptions {
   remoteResumeMode?: 'reattach' | 'close-control' | 'orphan-reconcile';
 }
 
+function ordinaryTakeover(opts: DurableActiveSessionTakeoverOptions): boolean {
+  return !opts.remoteResumeMode || opts.remoteResumeMode === 'reattach';
+}
+
+/**
+ * Generation-0 placeholder for an active Remote Runner Session whose canonical
+ * record never received any remote state: it was admitted before the worker's
+ * first state report, and its daemon stopped before persisting that report
+ * (Mew #73). The provider still holds the real binding (and maybe an
+ * in-flight turn) in its own durable state; an empty copy lets it resume from
+ * there and report the full lineage on ready. Only an ordinary takeover gets
+ * one — close-control and orphan proofs keep their existing handling.
+ */
+export function unrecordedRemoteResumeState(
+  session: Session,
+  opts: DurableActiveSessionTakeoverOptions = {},
+): RemoteRunnerBackendState | undefined {
+  if (session.remoteBackendState != null) return undefined;
+  if (!ordinaryTakeover(opts)) return undefined;
+  if (!session.larkAppId) return undefined;
+  let provider: string | undefined;
+  try {
+    provider = getBot(session.larkAppId).config.remoteRunner?.expectedProvider;
+  } catch {
+    return undefined;
+  }
+  return provider ? { version: 1, provider, generation: 0 } : undefined;
+}
+
 function activeCanonicalTakeoverUnsupportedReason(
   session: Session,
   opts: DurableActiveSessionTakeoverOptions = {},
@@ -3656,7 +3685,10 @@ function activeCanonicalTakeoverUnsupportedReason(
   }
   const remote = normalizeRemoteRunnerBackendState(session.remoteBackendState);
   if (!remote?.remoteSessionId) {
-    return 'canonical Session has no resumable Remote Runner state';
+    // The record may lag the provider by the first remote binding (Mew #73):
+    // an ordinary takeover lets the provider continue from its own state.
+    const lagging = remote ? ordinaryTakeover(opts) : !!unrecordedRemoteResumeState(session, opts);
+    if (!lagging) return 'canonical Session has no resumable Remote Runner state';
   }
   let requiredCapabilities: readonly string[] | undefined;
   try {
@@ -3779,6 +3811,7 @@ export async function takeOverDurableActiveRemoteSession(
     // Keep the logical workerGeneration so reserveWorkerGeneration advances
     // across takeover, but never import another Pod's process handles.
     const materialized = structuredClone(canonical);
+    materialized.remoteBackendState ??= unrecordedRemoteResumeState(canonical, opts);
     materialized.pid = undefined;
     materialized.webPort = undefined;
     materialized.previewTarget = undefined;

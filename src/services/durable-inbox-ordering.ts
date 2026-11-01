@@ -75,3 +75,24 @@ export function larkInboxOrderingKey(input: {
     ? anchor
     : undefined;
 }
+
+/**
+ * Ordering key for a newly ingested message, from this process's chat-topology
+ * cache. A missing topology leaves the row a whole-chat barrier, so a stale one
+ * is still used: a chat almost never switches between topic and flat mode,
+ * while every first message after a restart or a quiet spell used to become a
+ * barrier that a failing row could hold for its whole retry budget (Mew #104).
+ * A missing or stale entry is refreshed in the background for the next row.
+ */
+export function resolveLarkInboxOrderingKey(input: {
+  eventType?: DurableLarkMessageEventType;
+  data: unknown;
+  chatId: string | undefined;
+  lastKnownChatMode: (chatId: string) => { mode: ChatMode; fresh: boolean } | undefined;
+  refreshChatMode: (chatId: string) => void;
+}): string | undefined {
+  if (!input.chatId) return undefined;
+  const known = input.lastKnownChatMode(input.chatId);
+  if (!known?.fresh) input.refreshChatMode(input.chatId);
+  return larkInboxOrderingKey({ eventType: input.eventType, data: input.data, chatMode: known?.mode });
+}

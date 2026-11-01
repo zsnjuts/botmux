@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { larkInboxOrderingKey } from '../src/services/durable-inbox-ordering.js';
+import { larkInboxOrderingKey, resolveLarkInboxOrderingKey } from '../src/services/durable-inbox-ordering.js';
 import { durableLarkMessageEvent, parseDurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
 
 function event(message: Record<string, unknown>) {
@@ -33,6 +33,26 @@ describe('durable inbox ordering key (Mew #100)', () => {
       data: event({ chat_type: 'p2p', root_id: 'om_root', thread_id: 'omt_topic' }),
       chatMode: 'topic',
     })).toBeUndefined();
+  });
+
+  it('keys a row from a stale topology and refreshes it, instead of a chat-wide barrier (Mew #104)', () => {
+    const reply = event({ root_id: 'om_root', thread_id: 'omt_topic' });
+    const refreshed: string[] = [];
+    const resolve = (known: { mode: 'topic' | 'group'; fresh: boolean } | undefined) => resolveLarkInboxOrderingKey({
+      data: reply,
+      chatId: 'oc_topic_group',
+      lastKnownChatMode: () => known,
+      refreshChatMode: chatId => refreshed.push(chatId),
+    });
+
+    expect(resolve({ mode: 'topic', fresh: false })).toBe('om_root');
+    expect(refreshed).toEqual(['oc_topic_group']);
+    expect(resolve({ mode: 'topic', fresh: true })).toBe('om_root');
+    expect(refreshed).toEqual(['oc_topic_group']);
+    // 从没见过的群仍是屏障，只预热缓存；过期的普通群也照旧是屏障。
+    expect(resolve(undefined)).toBeUndefined();
+    expect(resolve({ mode: 'group', fresh: false })).toBeUndefined();
+    expect(refreshed).toHaveLength(3);
   });
 
   it('keeps slash commands, edits and unreadable messages as group-wide barriers', () => {

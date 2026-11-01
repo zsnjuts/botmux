@@ -818,6 +818,14 @@ import {
 } from './managed-origin-capability.js';
 import { truncateUtf16WellFormed } from '../utils/unicode.js';
 
+/** True when this turn's startup failure has not been posted yet (Mew #105). */
+function claimStartupFailureNotice(ds: DaemonSession, turnId: string | undefined, reason: string): boolean {
+  const key = `${turnId ?? ''}\u0000${reason}`;
+  if (ds.startupFailureNotice === key) return false;
+  ds.startupFailureNotice = key;
+  return true;
+}
+
 type WorkerStartupState = {
   ready: boolean;
   failureNotified: boolean;
@@ -9534,12 +9542,33 @@ export type CloseSessionResult =
  *
  * Returns the untouched result so a caller that DOES care can still branch.
  */
+/** Primary mode: commit a background close to the canonical Session record. */
+let backgroundSessionCloseObserver: ((sessionId: string, context: string) => Promise<void>) | undefined;
+
+export function setBackgroundSessionCloseObserver(
+  observer: ((sessionId: string, context: string) => Promise<void>) | undefined,
+): void {
+  backgroundSessionCloseObserver = observer;
+}
+
 export async function closeSessionForBackgroundCleanup(
   sessionId: string,
   context: string,
 ): Promise<CloseSessionResult> {
   const result = await closeSession(sessionId);
   const tagId = sessionId.slice(0, 8);
+  if (result.ok && backgroundSessionCloseObserver) {
+    // Without this the canonical record stays active and the next message in
+    // the topic tries to take over a runtime that no longer exists (Mew #73).
+    try {
+      await backgroundSessionCloseObserver(sessionId, context);
+    } catch (error) {
+      logger.warn(
+        `[${tagId}] ${context}: canonical close was not committed: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
   if (!result.ok) {
     logger.error(
       `[${tagId}] ${context}: close REFUSED (${result.error}); the row stays active `
@@ -14761,6 +14790,13 @@ export function forkWorker(
       );
       return;
     }
+    if (!claimStartupFailureNotice(ds, initAttributionTurnId, reason)) {
+      logger.warn(
+        `[${t}] Worker fork failure already posted for this turn; not repeating `
+        + `turn=${initAttributionTurnId?.slice(0, 12) ?? '-'}: ${reason}`,
+      );
+      return;
+    }
     const cliName = sessionCliDisplayName(ds, botCfg);
     const message = tr(workerStartFailedMessageKey(reason), { cliName, reason }, botLocale(botCfg));
     void cb.sessionReply(
@@ -15612,6 +15648,13 @@ function setupWorkerHandlers(
       );
       return;
     }
+    if (!claimStartupFailureNotice(ds, turnId, reason)) {
+      logger.warn(
+        `[${t}] Startup failure already posted for this turn; not repeating `
+        + `turn=${turnId?.slice(0, 12) ?? '-'}: ${reason}`,
+      );
+      return;
+    }
     startupState.failureSurfaced = true;
     const cliName = sessionCliDisplayName(ds, botCfg);
     const message = tr(workerStartFailedMessageKey(reason), { cliName, reason }, loc);
@@ -16280,6 +16323,7 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
+        ds.startupFailureNotice = undefined;
         // Past the pre-ready window: the ordinary ready-time card flow below
         // owns any card this generation has not published yet.
         preReadyStartingCardPosters.delete(worker);

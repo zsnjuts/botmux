@@ -139,7 +139,65 @@ describe('daemon current actor attestation', () => {
         turnId: 'om_turn',
       },
     });
-    expect(resolveIdentity).toHaveBeenCalledWith('cli_app', 'ou_current');
+    expect(resolveIdentity).toHaveBeenCalledWith('cli_app', 'ou_current', expect.anything());
+  });
+
+  it('waits briefly for a turn origin the worker has not published yet (Mew #70)', async () => {
+    // default 实测：runner 开轮 19 毫秒后来查身份，worker 报给 daemon 的本轮来源还没到，
+    // 直接判为未确认、整轮失败。现在同一校验在短窗口内重试，到了就照常放行。
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 101, 100, '2000');
+    const ds = activeSession();
+    let published = false;
+    setTimeout(() => { published = true; }, 120);
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '2000' },
+      findSession: () => (published ? ds : undefined),
+      resolveIdentity: async () => ({
+        openId: 'ou_current', type: 'user' as const, email: 'current.user@example.com',
+      }),
+      procRoot,
+    })).resolves.toMatchObject({ ok: true });
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '2000' },
+      findSession: () => undefined,
+      resolveIdentity: async () => ({
+        openId: 'ou_current', type: 'user' as const, email: 'current.user@example.com',
+      }),
+      procRoot,
+      attestationWaitMs: 100,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+  });
+
+  it('answers a slow contact lookup with a distinct timeout inside the budget', async () => {
+    // Mew #70：通讯录查询偶发慢过 Runner 的 5 秒，旧行为是 Runner 自己超时并误报「连不上
+    // daemon」。daemon 在预算内回一个可重试的错误码，请求本身的超时比预算长，避免被当成未知用户。
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 101, 100, '2000');
+    const ds = activeSession();
+    let requestTimeoutMs: number | undefined;
+    const resolveIdentity = vi.fn((_app: string, _openId: string, options?: { timeoutMs?: number }) => {
+      requestTimeoutMs = options?.timeoutMs;
+      return new Promise<undefined>(() => {});
+    });
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '2000' },
+      findSession: () => ds,
+      resolveIdentity,
+      procRoot,
+      lookupBudgetMs: 20,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_lookup_timeout' });
+    expect(requestTimeoutMs).toBeGreaterThan(20);
   });
 
   it('proves the exact scheduled turn against the live caller registry', async () => {

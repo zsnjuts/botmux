@@ -26,7 +26,7 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-import { getChatContext, getChatModeStrict, getChatMode } from '../src/im/lark/client.js';
+import { getCachedChatMode, getChatContext, getChatModeStrict, getChatMode, getLastKnownChatMode } from '../src/im/lark/client.js';
 
 const ok = (data: any) => ({ code: 0, msg: 'success', data });
 
@@ -132,5 +132,24 @@ describe('getChatContext', () => {
       mode: 'unknown',
       fetchStatus: 'ok',
     });
+  });
+});
+
+describe('getLastKnownChatMode', () => {
+  it('keeps answering with an expired topology and says it is stale (Mew #104)', async () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000_000);
+      mockRequest.mockResolvedValueOnce(ok({ chat_mode: 'group', group_message_type: 'thread' }));
+      expect(await getChatModeStrict('app', 'oc_known_topic')).toBe('topic');
+      expect(getLastKnownChatMode('app', 'oc_known_topic')).toEqual({ mode: 'topic', fresh: true });
+
+      now.mockReturnValue(1_000_000 + 24 * 60 * 60 * 1000);
+      expect(getCachedChatMode('app', 'oc_known_topic')).toBeUndefined();
+      expect(getLastKnownChatMode('app', 'oc_known_topic')).toEqual({ mode: 'topic', fresh: false });
+      expect(getLastKnownChatMode('app', 'oc_never_seen')).toBeUndefined();
+    } finally {
+      now.mockRestore();
+    }
   });
 });
