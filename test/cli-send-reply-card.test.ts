@@ -571,6 +571,48 @@ describe('real CLI send into a running reply card', () => {
       expect(String(blocked.stderr)).toContain('durable primary 当前只支持单条文本/卡片消息');
       expect(String(blocked.stdout)).not.toContain('CAPTURE_DURABLE=');
       expect(String(blocked.stdout)).not.toContain('CAPTURE_REPLY=');
+
+      // Images are uploaded first and embedded in the one card the durable
+      // outbox delivers, so primary mode must accept them (TAE outbound images).
+      const image = join(root, 'chart.png');
+      writeFileSync(image, Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+        'base64',
+      ));
+      const withImage = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--response-kind', 'auxiliary', '--images', image,
+        'Durable image',
+      ], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: {
+          PATH: process.env.PATH,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId,
+          BOTMUX_TURN_ID: key.turnId,
+          BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_COORDINATION_MODE: 'primary',
+          BOTMUX_DAEMON_IPC_PORT: '7951',
+          BOTMUX_TEST_DURABLE_SEND: '1',
+          BOTMUX_TEST_ALLOW_IMAGE_UPLOAD: '1',
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+      expect(withImage.status, String(withImage.stderr)).toBe(0);
+      expect(String(withImage.stdout)).not.toContain('CAPTURE_REPLY=');
+      const imageRequests = String(withImage.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      expect(imageRequests).toHaveLength(1);
+      expect(imageRequests[0]).toMatchObject({
+        method: 'POST',
+        path: `/api/sessions/${key.sessionId}/durable-send`,
+        body: { msgType: 'interactive', responseKind: 'auxiliary' },
+      });
+      expect(imageRequests[0].body.content).toContain('img_test_upload');
+      expect(imageRequests[0].body.content).toContain('Durable image');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

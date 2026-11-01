@@ -10619,9 +10619,11 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   const durableCoordinationPrimary = process.env.BOTMUX_COORDINATION_MODE === 'primary';
+  // Images stay allowed: they are uploaded first and embedded as image_key
+  // elements in the one card that the durable outbox delivers. Files, videos
+  // and voice are separate provider messages the outbox cannot carry yet.
   if (durableCoordinationPrimary && (
     asVoice
-    || images.length > 0
     || files.length > 0
     || videoAttachments.length > 0
     || attention.requested
@@ -10629,8 +10631,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     || !!vcMeetingManagedSendOrigin
   )) {
     console.error(
-      'botmux send: durable primary 当前只支持单条文本/卡片消息；'
-      + '语音、附件、attention、urgent 和 managed VC 输出尚未接入 durable outbox',
+      'botmux send: durable primary 当前只支持单条文本/卡片消息（可带 --images）；'
+      + '语音、文件、视频、attention、urgent 和 managed VC 输出尚未接入 durable outbox',
     );
     process.exit(2);
   }
